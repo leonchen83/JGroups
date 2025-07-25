@@ -3,14 +3,10 @@ package org.jgroups;
 
 
 import org.jgroups.util.ByteArray;
-
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.util.Arrays;
-import java.util.Iterator;
-import java.util.NoSuchElementException;
-import java.util.Objects;
+import java.util.*;
 import java.util.function.Supplier;
 
 /**
@@ -31,8 +27,6 @@ public class CompositeMessage extends BaseMessage implements Iterable<Message> {
     protected boolean   collapse; // send as a BytesMessage when true
 
 
-    protected static final MessageFactory mf=new DefaultMessageFactory();
-
     public CompositeMessage() {
     }
 
@@ -42,6 +36,11 @@ public class CompositeMessage extends BaseMessage implements Iterable<Message> {
     }
 
     public CompositeMessage(Address dest, Message ... messages) {
+        super(dest);
+        add(messages);
+    }
+
+    public CompositeMessage(Address dest, Collection<Message> messages) {
         super(dest);
         add(messages);
     }
@@ -86,6 +85,12 @@ public class CompositeMessage extends BaseMessage implements Iterable<Message> {
         return this;
     }
 
+    public CompositeMessage add(Collection<Message> messages) {
+        ensureCapacity(index + messages.size());
+        for(Message msg: messages)
+            msgs[index++]=Objects.requireNonNull(ensureSameDest(msg));
+        return this;
+    }
 
     public <T extends Message> T get(int index) {
         return (T)msgs[index];
@@ -112,11 +117,11 @@ public class CompositeMessage extends BaseMessage implements Iterable<Message> {
         return String.format("%s, %d message(s)", super.toString(), getNumberOfMessages());
     }
 
-    public int size() {
-        int retval=super.size() + Global.INT_SIZE; // length
+    @Override protected int payloadSize() {
+        int retval=Global.INT_SIZE; // count
         if(msgs != null) {
             for(int i=0; i < index; i++)
-                retval+=msgs[i].size() + Global.SHORT_SIZE; // type
+                retval+=msgs[i].sizeNoAddrs(getSrc()) + Global.SHORT_SIZE; // type
         }
         return retval;
     }
@@ -136,7 +141,7 @@ public class CompositeMessage extends BaseMessage implements Iterable<Message> {
             for(int i=0; i < index; i++) {
                 Message msg=msgs[i];
                 out.writeShort(msg.getType());
-                msg.writeTo(out);
+                msg.writeToNoAddrs(getSrc(), out);
             }
         }
     }
@@ -147,8 +152,11 @@ public class CompositeMessage extends BaseMessage implements Iterable<Message> {
             msgs=new Message[index]; // a bit of additional space should we add byte arrays
             for(int i=0; i < index; i++) {
                 short type=in.readShort();
-                msgs[i]=mf.create(type);
-                msgs[i].readFrom(in);
+                Message msg=MessageFactory.create(type).setDest(getDest());
+                if(msg.getSrc() == null)
+                    msg.setSrc(getSrc());
+                msg.readFrom(in);
+                msgs[i]=msg;
             }
         }
     }

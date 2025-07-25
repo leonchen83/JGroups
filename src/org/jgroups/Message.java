@@ -25,7 +25,8 @@ public interface Message extends SizeStreamable, Constructable<Message> {
       OBJ_MSG              = 3,
       LONG_MSG             = 4,
       COMPOSITE_MSG        = 5,
-      FRAG_MSG             = 6;
+      FRAG_MSG             = 6,
+      EARLYBATCH_MSG       = 7;
 
 
 
@@ -51,6 +52,9 @@ public interface Message extends SizeStreamable, Constructable<Message> {
     /** Adds a header to the message */
     Message              putHeader(short id, Header hdr);
 
+    /** Adds a header to a message if not present */
+    Message              putHeaderIfAbsent(short id, Header hdr);
+
     /** Gets a header from the message */
     <T extends Header> T getHeader(short id);
 
@@ -63,7 +67,10 @@ public interface Message extends SizeStreamable, Constructable<Message> {
     /** Returns a pretty-printed string of the headers */
     String               printHeaders();
 
-    /** Sets one or more flags */
+    /** Removes all headers: use carefully! */
+    Message              clearHeaders();
+
+    /** Sets one or more flags (xor-ing existing flags) */
     Message              setFlag(Flag... flags);
 
 
@@ -71,9 +78,18 @@ public interface Message extends SizeStreamable, Constructable<Message> {
      * @param flag The flag to be set (as a short). Overrides existing flags (no xor-ing)
      * @param transient_flags True if the flag is transient, false otherwise
      */
-    Message              setFlag(short flag, boolean transient_flags);
+    default Message      setFlag(short flag, boolean transient_flags) {
+        return setFlag(flag, transient_flags, false);
+    }
 
-    /** Sets one or more transient flags. Transient flags are not marshalled */
+    /** Sets the flags as a short; this way, multiple flags can be set in one operation
+     * @param flag The flag to be set (as a short). Overrides existing flags (no xor-ing)
+     * @param transient_flags True if the flag is transient, false otherwise
+     * @param xor When true, existing flags will be xor-ed with flag, otherwise not
+     */
+    Message              setFlag(short flag, boolean transient_flags, boolean xor);
+
+    /** Sets one or more transient flags (xor-ing). Transient flags are not marshalled */
     Message              setFlag(TransientFlag... flags);
 
     /** Atomically sets a transient flag if not set. Returns true if the flags was set, else false (already set) */
@@ -136,6 +152,7 @@ public interface Message extends SizeStreamable, Constructable<Message> {
      * ({@link #hasArray()} is false), then the serialized size may be returned, or an implementation may choose
      * to throw an exception */
     int                  getLength();
+    default int          length() {return getLength();}
 
     /**
      * Sets the byte array in a message.<br/>
@@ -181,15 +198,17 @@ public interface Message extends SizeStreamable, Constructable<Message> {
      */
     Message              setPayload(Object pl);
 
-
     /**
      * Returns the exact size of the marshalled message
      * @return The number of bytes for the marshalled message
      */
     int                  size();
 
-    /** Writes the message to an output stream excluding the destination (and possibly source) address, plus a number of headers */
-    void                 writeToNoAddrs(Address src, DataOutput out, short... excluded_headers) throws IOException;
+    /** Returns the exact size of the marshalled message without destination (and possibly source) address */
+    int                  sizeNoAddrs(Address src);
+
+    /** Writes the message to an output stream excluding the destination (and possibly source) address */
+    void                 writeToNoAddrs(Address src, DataOutput out) throws IOException;
 
     void                 writePayload(DataOutput out) throws IOException;
 
@@ -204,10 +223,10 @@ public interface Message extends SizeStreamable, Constructable<Message> {
         NO_RELIABILITY((short)(1 <<  4)),    // bypass UNICAST(2) and NAKACK
         NO_TOTAL_ORDER((short)(1 <<  5)),    // bypass total order (e.g. SEQUENCER)
         NO_RELAY(      (short)(1 <<  6)),    // bypass relaying (RELAY)
-        RSVP(          (short)(1 <<  7)),    // ack of a multicast (https://issues.jboss.org/browse/JGRP-1389)
+        RSVP(          (short)(1 <<  7)),    // ack of a multicast (https://issues.redhat.com/browse/JGRP-1389)
         RSVP_NB(       (short)(1 <<  8)),    // non blocking RSVP
-        INTERNAL(      (short)(1 <<  9)),    // for internal use by JGroups only, don't use !
-        SKIP_BARRIER(  (short)(1 << 10));    // passing messages through a closed BARRIER
+        SKIP_BARRIER(  (short)(1 << 10)),    // passing messages through a closed BARRIER
+        SERIALIZED(    (short)(1 << 11));    // used by BytesMessage/NioMessage/ObjectMessage (internal flag)
 
         final short value;
         Flag(short value) {this.value=value;}
@@ -219,7 +238,8 @@ public interface Message extends SizeStreamable, Constructable<Message> {
     // =========================== Transient flags ==============================
     enum TransientFlag {
         OOB_DELIVERED( (short)(1)),
-        DONT_LOOPBACK( (short)(1 << 1));   // don't loop back up if this flag is set and it is a multicast message
+        DONT_LOOPBACK( (short)(1 << 1)),   // don't loop back up if this flag is set, and it is a multicast message
+        DONT_BLOCK(    (short)(1 << 2));   // to prevent blocking on a full queue in TransferQueueBundler
 
         final short value;
         TransientFlag(short flag) {value=flag;}

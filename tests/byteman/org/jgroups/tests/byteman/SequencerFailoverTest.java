@@ -7,11 +7,13 @@ import org.jgroups.*;
 import org.jgroups.protocols.*;
 import org.jgroups.protocols.pbcast.GMS;
 import org.jgroups.stack.ProtocolStack;
+import org.jgroups.util.ResourceManager;
 import org.jgroups.util.Util;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
+import java.net.InetAddress;
 import java.util.*;
 
 
@@ -30,9 +32,10 @@ public class SequencerFailoverTest extends BMNGRunner {
 
     @BeforeMethod
     void setUp() throws Exception {
-        a=createChannel(props, "A", GROUP);
-        b=createChannel(props, "B", GROUP);
-        c=createChannel(props, "C", GROUP);
+        String mcast_addr=ResourceManager.getNextMulticastAddress();
+        a=createChannel(props, "A", mcast_addr).connect(GROUP);
+        b=createChannel(props, "B", mcast_addr).connect(GROUP);
+        c=createChannel(props, "C", mcast_addr).connect(GROUP);
         Util.waitUntilAllChannelsHaveSameView(10000, 1000, a, b, c);
     }
 
@@ -63,7 +66,7 @@ public class SequencerFailoverTest extends BMNGRunner {
     /**
      * Tests that resending of messages in the forward-queue on a view change and sending of new messages at the
      * same time doesn't lead to incorrect ordering (forward-queue messages need to be delivered before new msgs).
-     * https://issues.jboss.org/browse/JGRP-1449
+     * https://issues.redhat.com/browse/JGRP-1449
      */
     @BMScript(dir="scripts/SequencerFailoverTest", value="testResendingVersusNewMessages")
     public void testResendingVersusNewMessages() throws Exception {
@@ -141,7 +144,7 @@ public class SequencerFailoverTest extends BMNGRunner {
 
         // insert DISCARD into A
         DISCARD discard=new DISCARD();
-        discard.setLocalAddress(a.getAddress());
+        discard.setAddress(a.getAddress());
         discard.discardAll(true);
         ProtocolStack stack=a.getProtocolStack();
         TP transport=stack.getTransport();
@@ -210,7 +213,7 @@ public class SequencerFailoverTest extends BMNGRunner {
         b.setReceiver(rb); c.setReceiver(rc);
 
         new Thread(() -> {
-            Util.sleep(3000);
+            Util.sleep(500);
             System.out.println("** killing A");
             try {
                 Util.shutdown(a);
@@ -225,11 +228,11 @@ public class SequencerFailoverTest extends BMNGRunner {
 
         final Address sender=channel.getAddress();
         for(int i=1; i <= NUM_MSGS; i++) {
-            Util.sleep(300);
+            Util.sleep(50);
             channel.send(new BytesMessage(null, i));
             System.out.print("[" + sender + "] -- messages sent: " + i + "/" + NUM_MSGS + "\r");
         }
-        System.out.println("");
+        System.out.println();
         View v2=b.getView();
         View v3=c.getView();
         System.out.println("B's view: " + v2 + "\nC's view: " + v3);
@@ -315,11 +318,16 @@ public class SequencerFailoverTest extends BMNGRunner {
         }
     }
 
-
-    protected static JChannel createChannel(final String props, final String name, final String cluster_name) throws Exception {
-        JChannel retval=new JChannel(props);
-        retval.setName(name);
-        retval.connect(cluster_name);
-        return retval;
+    protected static JChannel createChannel(String props, String name, String mcast_addr) throws Exception {
+        JChannel ch=new JChannel(props).name(name);
+        TP tp=ch.getProtocolStack().getTransport();
+        if(tp instanceof UDP)
+            ((UDP)tp).setMulticastAddress(InetAddress.getByName(mcast_addr));
+        MPING mping=ch.getProtocolStack().findProtocol(MPING.class);
+        if(mping != null)
+            mping.setMulticastAddress(mcast_addr);
+        return ch;
     }
+
+
 }

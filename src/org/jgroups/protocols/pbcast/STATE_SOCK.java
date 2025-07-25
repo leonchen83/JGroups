@@ -99,7 +99,7 @@ public class STATE_SOCK extends StreamingStateTransfer {
     * --------------------------- Private Methods ------------------------------------------------
     */
 
-    protected StateProviderAcceptor createAcceptor() {
+    protected StateProviderAcceptor createAcceptor() throws Exception {
         StateProviderAcceptor retval=new StateProviderAcceptor(thread_pool,
                                                                Util.createServerSocket(getSocketFactory(),
                                                                                        "jgroups.streaming_state_transfer.srv_sock",
@@ -123,7 +123,7 @@ public class STATE_SOCK extends StreamingStateTransfer {
             socket=getSocketFactory().createSocket("jgroups.state_sock.sock");
             socket.bind(new InetSocketAddress(bind_addr, 0));
             socket.setReceiveBufferSize(buffer_size);
-            Util.connect(socket, new InetSocketAddress(address.getIpAddress(), address.getPort()), 0);
+            Util.connect(socket, address.getSocketAddress(), 0);
             log.debug("%s: connected to state provider %s:%d", local_addr, address.getIpAddress(), address.getPort());
             DataOutputStream out=new DataOutputStream(socket.getOutputStream());
             Util.writeAddress(local_addr, out);
@@ -142,7 +142,7 @@ public class STATE_SOCK extends StreamingStateTransfer {
             Util.close((Socket)resource);
     }
 
-    protected void handleStateReq(Address requester) {
+    protected void handleStateReq(Address requester) throws Exception {
         if(spawner == null || !spawner.isRunning())
             spawner=createAcceptor();
         super.handleStateReq(requester);

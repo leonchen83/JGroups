@@ -1,5 +1,6 @@
 package org.jgroups.util;
 
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 
 /**
@@ -29,9 +30,39 @@ public class ByteArrayDataOutputStream extends BaseDataOutputStream {
 
     public byte[]                    buffer()                     {return buf;}
     public ByteArray                 getBuffer()                  {return new ByteArray(buf, 0, pos);}
+    public ByteBuffer                byteBuffer()                 {return ByteBuffer.wrap(buf, 0, pos);}
+    public int                       capacity()                   {return buf.length;}
     public boolean                   growExponentially()          {return grow_exponentially;}
     public ByteArrayDataOutputStream growExponentially(boolean b) {grow_exponentially=b; return this;}
 
+    @Override
+    public void writeChar(int v) {
+        writeShort((short)v);
+    }
+
+    @Override
+    public void writeInt(int v) {
+        ensureCapacity(4);
+        Util.INT_ARRAY_VIEW.set(buf, pos, v);
+        pos += 4;
+    }
+
+    @Override
+    public void writeLong(long v) {
+        ensureCapacity(8);
+        Util.LONG_ARRAY_VIEW.set(buf, pos, v);
+        pos += 8;
+    }
+
+    @Override
+    public void writeShort(int v) {
+        ensureCapacity(2);
+        var array = buf;
+        var index = pos;
+        array[index] = (byte) ((v >> 8) & 0xFF);
+        array[index + 1] = (byte) (v & 0xFF);
+        pos += 2;
+    }
 
     public void write(int b) {
         ensureCapacity(1);

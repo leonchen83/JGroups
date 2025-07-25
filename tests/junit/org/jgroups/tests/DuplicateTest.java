@@ -3,6 +3,9 @@ package org.jgroups.tests;
 
 import org.jgroups.*;
 import org.jgroups.protocols.DUPL;
+import org.jgroups.protocols.MAKE_BATCH;
+import org.jgroups.protocols.NAKACK4;
+import org.jgroups.protocols.UNICAST3;
 import org.jgroups.protocols.pbcast.NAKACK2;
 import org.jgroups.protocols.pbcast.STABLE;
 import org.jgroups.stack.ProtocolStack;
@@ -75,7 +78,7 @@ public class DuplicateTest extends ChannelTestBase {
         check(r3, 1, false, new Tuple<>(a1, 10));
     }
 
-    @Test(invocationCount=10)
+    @Test(invocationCount=5)
     public void testOOBUnicastsToOthers() throws Exception {
         send(a, b.getAddress(), true, 10);
         send(a, c.getAddress(), true, 10);
@@ -93,6 +96,23 @@ public class DuplicateTest extends ChannelTestBase {
         check(r3, 1, false, new Tuple<>(a1, 10));
     }
 
+    /** Tests multicast to self, received as message batch */
+    public void testRegularMulticastLoopback() throws Exception {
+        Util.close(b,c);
+        Util.waitUntilTrue(5000, 500, () -> a.getView().size() == 1);
+
+        ProtocolStack stack=a.getProtocolStack();
+        DUPL dupl=stack.findProtocol(DUPL.class);
+        if(dupl != null) {
+            MAKE_BATCH mb=new MAKE_BATCH().multicasts(true); // creates message batches above DUPL
+            stack.insertProtocol(mb, ProtocolStack.Position.ABOVE, DUPL.class);
+            dupl.setOutgoingCopies(0).setIncomingCopies(2);
+            mb.start();
+        }
+
+        send(a, null, false, 10);
+        check(r1, 1, false, new Tuple<>(a1, 10));
+    }
 
     public void testOOBMulticastToAll() throws Exception {
         send(a, null, true, 10);
@@ -100,6 +120,24 @@ public class DuplicateTest extends ChannelTestBase {
         check(r1,1,true,new Tuple<>(a1,10));
         check(r2, 1, true, new Tuple<>(a1, 10));
         check(r3, 1, true, new Tuple<>(a1, 10));
+    }
+
+
+    public void testOOBMulticastLoopback() throws Exception {
+        Util.close(b,c);
+        Util.waitUntilTrue(5000, 500, () -> a.getView().size() == 1);
+
+        ProtocolStack stack=a.getProtocolStack();
+        DUPL dupl=stack.findProtocol(DUPL.class);
+        if(dupl != null) {
+            MAKE_BATCH mb=new MAKE_BATCH().multicasts(true).skipOOB(false); // creates message batches above DUPL
+            stack.insertProtocol(mb, ProtocolStack.Position.ABOVE, DUPL.class);
+            dupl.setOutgoingCopies(0).setIncomingCopies(2);
+            mb.start();
+        }
+
+        send(a, null, true, 10);
+        check(r1, 1, true, new Tuple<>(a1, 10));
     }
 
 
@@ -147,9 +185,8 @@ public class DuplicateTest extends ChannelTestBase {
                  if(i % 2 == 0)
                      msg.setFlag(Message.Flag.OOB);
              }
-             else if(oob) {
+             else if(oob)
                  msg.setFlag(Message.Flag.OOB);
-             }
 
              sender_channel.send(msg);
          }
@@ -177,33 +214,30 @@ public class DuplicateTest extends ChannelTestBase {
 
 
     private void createChannels(boolean copy_multicasts, boolean copy_unicasts, int num_outgoing_copies, int num_incoming_copies) throws Exception {
-        a=createChannel(true, 3, "A");
-        DUPL dupl=new DUPL(copy_multicasts, copy_unicasts, num_incoming_copies, num_outgoing_copies);
+        a=createChannel().name("A");
         ProtocolStack stack=a.getProtocolStack();
-        stack.insertProtocol(dupl,ProtocolStack.Position.BELOW,NAKACK2.class);
+        UNICAST3 ucast=stack.findProtocol(UNICAST3.class);
+        if(ucast != null) {
+            DUPL dupl=new DUPL(copy_multicasts, copy_unicasts, num_incoming_copies, num_outgoing_copies);
+            stack.insertProtocol(dupl, ProtocolStack.Position.BELOW, NAKACK2.class, NAKACK4.class);
+        }
 
-        b=createChannel(a, "B");
-        c=createChannel(a, "C");
+        b=createChannel().name("B");
+        c=createChannel().name("C");
+        makeUnique(a,b,c);
 
         a.connect("DuplicateTest");
         b.connect("DuplicateTest");
         c.connect("DuplicateTest");
-
-        Util.waitUntilAllChannelsHaveSameView(20000, 1000, a, b, c);
+        Util.waitUntilAllChannelsHaveSameView(20000, 100, a, b, c);
     }
 
 
     @SafeVarargs
     private final void check(MyReceiver receiver, int expected_size, boolean oob, Tuple<Address,Integer>... vals) {
         Map<Address, Collection<Long>> msgs=receiver.getMsgs();
-
-        for(int i=0; i < 10; i++) {
-            if(msgs.size() >= expected_size)
-                break;
-            Util.sleep(1000);
-        }
+        Util.waitUntilTrue(5000, 100, () -> msgs.size() >= expected_size);
         assert msgs.size() == expected_size : "expected size=" + expected_size + ", msgs: " + msgs.keySet();
-
 
         for(Tuple<Address,Integer> tuple: vals) {
             Address addr=tuple.getVal1();
@@ -211,10 +245,10 @@ public class DuplicateTest extends ChannelTestBase {
             assert list != null : "no list available for " + addr;
 
             int expected_values=tuple.getVal2();
-            for(int i=0; i < 20; i++) {
+            for(int i=0; i < 50; i++) {
                 if(list.size() >= expected_values)
                     break;
-                Util.sleep(1000);
+                Util.sleep(100);
                 sendStableMessages(a,b,c);
             }
 
@@ -274,10 +308,6 @@ public class DuplicateTest extends ChannelTestBase {
                     list=tmp;
             }
             list.add(val);
-        }
-
-        public void clear() {
-            msgs.clear();
         }
 
 

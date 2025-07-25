@@ -1,8 +1,9 @@
 package org.jgroups.tests;
 
-import org.jgroups.BytesMessage;
-import org.jgroups.Global;
-import org.jgroups.Message;
+import org.jgroups.*;
+import org.jgroups.conf.ClassConfigurator;
+import org.jgroups.protocols.pbcast.NAKACK2;
+import org.jgroups.protocols.pbcast.NakAckHeader2;
 import org.jgroups.util.*;
 import org.testng.annotations.Test;
 
@@ -12,9 +13,11 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.function.BiConsumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
+import java.util.stream.LongStream;
 
 /** Tests {@link org.jgroups.util.Table<Integer>}
  * @author Bela Ban
@@ -22,7 +25,17 @@ import java.util.stream.IntStream;
 @Test(groups=Global.FUNCTIONAL)
 public class TableTest {
 
-    protected static final Predicate<Message> dont_loopback_filter=msg -> msg != null && msg.isFlagSet(Message.TransientFlag.DONT_LOOPBACK);
+    protected static final Predicate<Message>     dont_loopback_filter=msg -> msg != null && msg.isFlagSet(Message.TransientFlag.DONT_LOOPBACK);
+    protected static final short                  NAKACK2_ID;
+    protected static final Function<Message,Long> SEQNO_GETTER;
+
+    static {
+        NAKACK2_ID=ClassConfigurator.getProtocolId(NAKACK2.class);
+        SEQNO_GETTER=m -> {
+            NakAckHeader2 hdr=m.getHeader(NAKACK2_ID);
+            return hdr == null? -1 : hdr.getSeqno();
+        };
+    }
 
 
     public static void testCreation() {
@@ -51,6 +64,16 @@ public class TableTest {
         assert buf.size() == 2;
     }
 
+    public void testAddMessageBatch() {
+        Table<Message> buf=new Table<>(3, 10, 0);
+        MessageBatch mb=createMessageBatch(1, 2);
+        boolean rc=buf.add(mb, SEQNO_GETTER);
+        System.out.println("buf = " + buf);
+        assert rc;
+        assert buf.size() == 2;
+    }
+
+
     public void testAddListWithConstValue() {
         Table<Integer> buf=new Table<>(3, 10, 0);
         List<LongTuple<Integer>> msgs=createList(1,2,3,4,5,6,7,8,9,10);
@@ -64,6 +87,21 @@ public class TableTest {
         assert list.size() == 10;
         for(int num: list)
             assert num == DUMMY;
+    }
+
+    public void testAddMessageBatchWithConstValue() {
+        Table<Message> buf=new Table<>(3, 10, 0);
+        MessageBatch mb=createMessageBatch(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+        final Message DUMMY=new EmptyMessage();
+        boolean rc=buf.add(mb, SEQNO_GETTER, false, DUMMY);
+        System.out.println("buf = " + buf);
+        assert rc;
+        assert buf.size() == 10;
+        List<Message> list=buf.removeMany(true, 0, element -> element.hashCode() == DUMMY.hashCode());
+        System.out.println("list = " + list);
+        assert list.size() == 10;
+        for(Message msg: list)
+            assert msg == DUMMY;
     }
 
     public void testAddListWithRemoval() {
@@ -90,6 +128,31 @@ public class TableTest {
         assert msgs.size() == 5;
     }
 
+    public void testAddMessageBatchWithRemoval() {
+        Table<Message> buf=new Table<>(3, 10, 0);
+        MessageBatch mb=createMessageBatch(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+        int size=mb.size();
+        boolean added=buf.add(mb, SEQNO_GETTER);
+        System.out.println("buf = " + buf);
+        assert added;
+        assert mb.size() == size;
+
+        mb=createMessageBatch(1,3,5,7);
+        size=mb.size();
+        added=buf.add(mb, SEQNO_GETTER, true, null);
+        System.out.println("buf = " + buf);
+        assert !added;
+        assert mb.isEmpty();
+
+        mb=createMessageBatch(1,3,5,7,9,10,11,12,13,14,15);
+        size=mb.size();
+        added=buf.add(mb, SEQNO_GETTER, true, null);
+        System.out.println("buf = " + buf);
+        assert added;
+        assert mb.isEmpty();
+    }
+
+
     public void testAddition() {
         Table<Integer> table=new Table<>(3, 10, 0);
         assert !table.add(0, 0);
@@ -104,7 +167,7 @@ public class TableTest {
     }
 
 
-    public static void testAdditionList() {
+    public void testAdditionList() {
         Table<Integer> table=new Table<>(3, 10, 0);
         List<LongTuple<Integer>> msgs=createList(0);
         assert !table.add(msgs);
@@ -114,6 +177,25 @@ public class TableTest {
         System.out.println("table: " + table.dump());
         for(long seqno: seqnos)
             assert table.get(seqno) == seqno;
+        assert table.size() == 8;
+        int size=table.computeSize();
+        assert size == 8;
+        assert table.size() == table.computeSize();
+        assertCapacity(table.capacity(), 3, 10);
+        assertIndices(table, 0, 0, 29);
+    }
+
+    public void testAdditionMessageBatch() {
+        Table<Message> table=new Table<>(3, 10, 0);
+        MessageBatch mb=createMessageBatch(0);
+        assert !table.add(mb, SEQNO_GETTER);
+        long[] seqnos={1,5,9,10,11,19,20,29};
+        mb=createMessageBatch(seqnos);
+        assert table.add(mb, SEQNO_GETTER);
+        for(long seqno: seqnos) {
+            Message m=table.get(seqno);
+            assert SEQNO_GETTER.apply(m) == seqno;
+        }
         assert table.size() == 8;
         int size=table.computeSize();
         assert size == 8;
@@ -146,7 +228,21 @@ public class TableTest {
     }
 
 
-    public static void testAddListWithResizing() {
+    public void testAdditionMessageBatchWithOffset() {
+        Table<Message> table=new Table<>(3, 10, 100);
+        long[] seqnos={101,105,109,110,111,119,120,129};
+        MessageBatch mb=createMessageBatch(seqnos);
+        System.out.println("table: " + table.dump());
+        assert table.add(mb, SEQNO_GETTER);
+        assert table.size() == 8;
+        for(long seqno: seqnos)
+            assert SEQNO_GETTER.apply(table.get(seqno)) == seqno;
+        assertCapacity(table.capacity(), 3, 10);
+        assertIndices(table, 100, 100, 129);
+    }
+
+
+    public void testAddListWithResizing() {
         Table<Integer> table=new Table<>(3, 5, 0);
         List<LongTuple<Integer>> msgs=new ArrayList<>();
         for(int i=1; i < 100; i++)
@@ -157,6 +253,18 @@ public class TableTest {
         System.out.println("num_resizes = " + num_resizes);
         assert num_resizes == 1 : "number of resizings=" + num_resizes + " (expected 1)";
     }
+
+    public void testAddMessageBatchWithResizing() {
+        Table<Message> table=new Table<>(3, 5, 0);
+        long[] seqnos=LongStream.rangeClosed(1, 99).toArray();
+        MessageBatch mb=createMessageBatch(seqnos);
+        table.add(mb, SEQNO_GETTER);
+        System.out.println("table = " + table);
+        int num_resizes=table.getNumResizes();
+        System.out.println("num_resizes = " + num_resizes);
+        assert num_resizes == 1 : "number of resizings=" + num_resizes + " (expected 1)";
+    }
+
 
     public static void testAddListWithResizingNegativeSeqnos() {
         long seqno=Long.MAX_VALUE-50;
@@ -675,7 +783,7 @@ public class TableTest {
         assert table.isEmpty();
     }
 
-    public static void testRemoveManyWithFilterAcceptNone() {
+    public void testRemoveManyWithFilterAcceptNone() {
         Table<Integer> table=new Table<>(3, 10, 0);
         for(int i=1; i <= 10; i++)
             table.add(i, i);
@@ -686,13 +794,12 @@ public class TableTest {
         assert table.isEmpty();
     }
 
-    public static void testRemoveManyWithFilterAcceptNone2() {
+    public void testRemoveManyWithFilterAcceptNone2() {
         Table<Integer> table=new Table<>(3, 10, 0);
         for(int i=1; i <= 10; i++)
             table.add(i, i);
         List<Integer> list=table.removeMany(true, 3, new Predicate<>() {
             int cnt=0;
-
             public boolean test(Integer element) {
                 return ++cnt <= 2;
             }
@@ -743,10 +850,22 @@ public class TableTest {
         assert result == null;
     }
 
+    public void testRemoveManyWithMaxBatchSize() {
+        Table<Message> table=new Table<>();
+        IntStream.rangeClosed(1, 1024).forEach(n -> table.add(n,new ObjectMessage(null, "hello-" + n)));
+        assert table.size() == 1024;
+        assert table.getNumMissing() == 0;
+
+        MessageBatch batch=new MessageBatch(128);
+        Supplier<MessageBatch> batch_creator=() -> batch;
+        BiConsumer<MessageBatch,Message> accumulator=MessageBatch::add;
+        table.removeMany(true, 512, null, batch_creator, accumulator);
+        assert table.size() == 512;
+    }
 
     public void testForEach() {
         class MyVisitor<T> implements Table.Visitor<T> {
-            List<int[]> list=new ArrayList<>(20);
+            final List<int[]> list=new ArrayList<>(20);
             public boolean visit(long seqno, T element, int row, int column) {
                 System.out.println("#" + seqno + ": " + element + ", row=" + row + ", column=" + column);
                 list.add(new int[]{row,column});
@@ -1411,7 +1530,7 @@ public class TableTest {
     }
 
     // Tests purge(40) followed by purge(20) - the second purge() should be ignored
-    // https://issues.jboss.org/browse/JGRP-1872
+    // https://issues.redhat.com/browse/JGRP-1872
     public void testPurgeLower() {
         Table<Integer> table=new Table<>(3, 10, 0);
         for(int i=1; i <= 30; i++)
@@ -1497,8 +1616,8 @@ public class TableTest {
     }
 
 
-    protected Message msg(int num) {return new BytesMessage(null, num);}
-    protected Message msg(int num, boolean set_dont_loopback) {
+    protected static Message msg(int num) {return new BytesMessage(null, num);}
+    protected static Message msg(int num, boolean set_dont_loopback) {
         Message msg=msg(num);
         if(set_dont_loopback)
             msg.setFlag(Message.TransientFlag.DONT_LOOPBACK);
@@ -1529,6 +1648,17 @@ public class TableTest {
         for(long seqno: seqnos)
             msgs.add(new LongTuple<>(seqno, (int)seqno));
         return msgs;
+    }
+
+    protected static MessageBatch createMessageBatch(long ... seqnos) {
+        if(seqnos == null)
+            return null;
+        MessageBatch mb=new MessageBatch(seqnos.length);
+        for(long seqno: seqnos) {
+            Message m=new EmptyMessage().putHeader(NAKACK2_ID, NakAckHeader2.createMessageHeader(seqno));
+            mb.add(m);
+        }
+        return mb;
     }
 
     protected static <T> void assertIndices(Table<T> table, long low, long hd, long hr) {

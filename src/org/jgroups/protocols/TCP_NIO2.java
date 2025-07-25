@@ -85,7 +85,6 @@ public class TCP_NIO2 extends BasicTCP {
         server.readerIdleTime(t);
     }
 
-
     public void send(Address dest, byte[] data, int offset, int length) throws Exception {
         if(server != null) {
             try {
@@ -93,7 +92,7 @@ public class TCP_NIO2 extends BasicTCP {
             }
             catch(ClosedChannelException | CancelledKeyException ignored) {}
             catch(Throwable ex) {
-                log.warn("%s: failed sending message to %s: %s", local_addr, dest, ex);
+                log.trace("%s: failed sending message to %s: %s", local_addr, dest, ex);
             }
         }
     }
@@ -110,9 +109,10 @@ public class TCP_NIO2 extends BasicTCP {
           .socketConnectionTimeout(sock_conn_timeout)
           .tcpNodelay(tcp_nodelay).linger(linger)
           .clientBindAddress(client_bind_addr).clientBindPort(client_bind_port).deferClientBinding(defer_client_bind_addr)
-          .log(this.log);
+          .log(this.log).logDetails(log_details);
         server.maxSendBuffers(max_send_buffers).usePeerConnections(true);
-        server.copyOnPartialWrite(this.copy_on_partial_write).readerIdleTime(this.reader_idle_time);
+        server.copyOnPartialWrite(this.copy_on_partial_write).readerIdleTime(this.reader_idle_time)
+          .addConnectionListener(this);
 
         if(send_buf_size > 0)
             server.sendBufferSize(send_buf_size);
@@ -130,6 +130,9 @@ public class TCP_NIO2 extends BasicTCP {
             }
             server.connExpireTimeout(conn_expire_time).reaperInterval(reaper_interval);
         }
+
+        if(max_length > 0)
+            server.setMaxLength(max_length);
 
         super.start();
     }

@@ -12,11 +12,11 @@ import org.testng.annotations.Test;
 /**
  * Tests graceful leaving of the coordinator and second-in-line in a 10 node cluster with ASYM_ENCRYPT configured.
  * <br/>
- * Reproducer for https://issues.jboss.org/browse/JGRP-2297
+ * Reproducer for https://issues.redhat.com/browse/JGRP-2297
  * @author Bela Ban
  * @since  4.0.12
  */
-@Test(groups={Global.FUNCTIONAL,Global.ENCRYPT},singleThreaded=true)
+@Test(groups=Global.ENCRYPT,singleThreaded=true)
 public class ASYM_ENCRYPT_LeaveTest extends BaseLeaveTest {
     protected static final String      KEYSTORE="keystore.jks";
     protected static final String      KEYSTORE_PWD="password";

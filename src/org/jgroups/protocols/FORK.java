@@ -5,6 +5,7 @@ import org.jgroups.annotations.*;
 import org.jgroups.conf.ClassConfigurator;
 import org.jgroups.conf.ConfiguratorFactory;
 import org.jgroups.conf.ProtocolConfiguration;
+import org.jgroups.conf.XmlNode;
 import org.jgroups.fork.ForkConfig;
 import org.jgroups.fork.ForkProtocol;
 import org.jgroups.fork.ForkProtocolStack;
@@ -14,28 +15,24 @@ import org.jgroups.stack.Protocol;
 import org.jgroups.stack.ProtocolStack;
 import org.jgroups.util.Bits;
 import org.jgroups.util.*;
-import org.w3c.dom.Node;
 
 import java.io.*;
 import java.net.MalformedURLException;
-import java.net.URL;
-import java.security.AccessControlException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.net.URI;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
- * The FORK protocol; multiplexes messages to different forks in a stack (https://issues.jboss.org/browse/JGRP-1613).
+ * The FORK protocol; multiplexes messages to different forks in a stack (https://issues.redhat.com/browse/JGRP-1613).
  * See doc/design/FORK.txt for details
  * @author Bela Ban
  * @since  3.4
  */
-@XmlInclude(schema="fork-stacks.xsd",type=XmlInclude.Type.IMPORT,namespace="fork",alias="fork")
-@XmlElement(name="fork-stacks",type="fork:ForkStacksType")
+@XmlInclude(schema="fork-stacks.xsd",type=XmlInclude.Type.EMBED,namespace="fork",alias="fork")
+@XmlElement(name="fork-stacks",type="tns:ForkStacksType")
 @MBean(description="Implementation of FORK protocol")
 public class FORK extends Protocol {
     public static short ID=ClassConfigurator.getProtocolId(FORK.class);
@@ -64,7 +61,7 @@ public class FORK extends Protocol {
     // mappings between fork-stack-ids and fork-stacks (bottom-most protocol)
     protected final ConcurrentMap<String,Protocol> fork_stacks=new ConcurrentHashMap<>();
 
-    protected Address local_addr;
+    protected static final Function<? super String, ? extends List<Message>> FUNC=k -> new ArrayList<>();
 
     public FORK setUnknownForkHandler(UnknownForkHandler unknownForkHandler) {
         this.unknownForkHandler = unknownForkHandler;
@@ -98,25 +95,31 @@ public class FORK extends Protocol {
         return prot instanceof ForkProtocolStack? (ForkProtocolStack)prot : null;
     }
 
+    public <T extends Protocol> T setAddress(Address addr) {
+        super.setAddress(addr);
+
+        for(Protocol prot: fork_stacks.values()) {
+            if(prot instanceof ForkProtocol) {
+                ForkProtocol fp=(ForkProtocol)prot;
+                ProtocolStack st=fp.getProtocolStack();
+                for(Protocol p: st.getProtocols())
+                    p.setAddress(local_addr);
+            }
+        }
+        return (T)this;
+    }
+
     public void init() throws Exception {
         super.init();
         if(config != null)
             createForkStacks(config);
     }
 
-    public Object down(Event evt) {
-        switch(evt.getType()) {
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                break;
-        }
-        return down_prot.down(evt);
-    }
-
     public Object up(Event evt) {
         switch(evt.getType()) {
             case Event.VIEW_CHANGE:
             case Event.SITE_UNREACHABLE:
+            case Event.MBR_UNREACHABLE:
                 for(Protocol bottom: fork_stacks.values())
                     bottom.up(evt);
                 break;
@@ -149,13 +152,13 @@ public class FORK extends Protocol {
     public void up(MessageBatch batch) {
         // Sort fork messages by fork-stack-id
         Map<String,List<Message>> map=new HashMap<>();
-        MessageIterator it=batch.iterator();
+        Iterator<Message> it=batch.iterator();
         while(it.hasNext()) {
             Message msg=it.next();
             ForkHeader hdr=msg.getHeader(id);
             if(hdr != null) {
                 it.remove();
-                List<Message> list=map.computeIfAbsent(hdr.fork_stack_id, k -> new ArrayList<>());
+                List<Message> list=map.computeIfAbsent(hdr.fork_stack_id, FUNC);
                 list.add(msg);
             }
         }
@@ -209,7 +212,7 @@ public class FORK extends Protocol {
 
 
     protected void getStateFrom(JChannel channel, Protocol prot, String stack, String ch, DataOutputStream out) throws Exception {
-        ByteArrayDataOutputStream output=new ByteArrayDataOutputStream(1024);
+        ByteArrayDataOutputStream output=new ByteArrayDataOutputStream(1024, true);
         OutputStreamAdapter out_ad=new OutputStreamAdapter(output);
         Event evt=new Event(Event.STATE_TRANSFER_OUTPUTSTREAM, out_ad);
         if(channel != null)
@@ -281,7 +284,8 @@ public class FORK extends Protocol {
         }
     }
 
-    public void parse(Node node) throws Exception {
+    @Override
+    public void parse(XmlNode node) throws Exception {
         Map<String,List<ProtocolConfiguration>> protocols=ForkConfig.parse(node);
         createForkStacks(protocols);
     }
@@ -326,15 +330,15 @@ public class FORK extends Protocol {
         try {
             configStream=new FileInputStream(config);
         }
-        catch(FileNotFoundException | AccessControlException fnfe) { // catching ACE fixes http://jira.jboss.com/jira/browse/JGRP-94
+        catch(FileNotFoundException fnfe) { // catching ACE fixes https://issues.redhat.com/browse/JGRP-94
         }
 
         // Check to see if the properties string is a URL.
         if(configStream == null) {
             try {
-                configStream=new URL(config).openStream();
+                configStream=URI.create(config).toURL().openStream();
             }
-            catch (MalformedURLException ignored) {
+            catch (IllegalArgumentException | MalformedURLException ignored) {
             }
         }
 

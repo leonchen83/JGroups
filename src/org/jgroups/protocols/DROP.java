@@ -6,6 +6,7 @@ import org.jgroups.stack.Protocol;
 import org.jgroups.util.MessageBatch;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.function.Predicate;
 
@@ -40,6 +41,7 @@ public class DROP extends Protocol {
 
     public DROP clearUpFilters()   {up_filters.clear(); return this;}
     public DROP clearDownFilters() {down_filters.clear(); return this;}
+    public DROP clearAllFilters()  {clearUpFilters(); return clearDownFilters();}
 
 
     public Object down(Message msg) {
@@ -61,11 +63,12 @@ public class DROP extends Protocol {
     }
 
     public void up(MessageBatch batch) {
-        for(Message msg: batch) {
+        for(Iterator<Message> it=batch.iterator(); it.hasNext();) {
+            Message msg=it.next();
             for(Predicate<Message> pred: up_filters) {
                 if(pred.test(msg)) {
                     dropped(msg, false);
-                    batch.remove(msg);
+                    it.remove();
                     break;
                 }
             }
@@ -74,8 +77,8 @@ public class DROP extends Protocol {
             up_prot.up(batch);
     }
 
-    protected void dropped(Message msg, boolean down) {
-
-        log.trace("dropped msg %s hdrs: %s\n", down? "to " + msg.getDest() : "from " + msg.getSrc(), msg.printHeaders());
+    protected void dropped(Message m, boolean down) {
+        log.trace("%s: dropped %s msg from %s to %s, hdrs: %s", local_addr, down? "down" : "up",
+                  m.src(), m.dest() == null? "all" : m.dest(), m.printHeaders());
     }
 }

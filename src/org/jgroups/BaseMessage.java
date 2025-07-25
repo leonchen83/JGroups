@@ -2,7 +2,6 @@
 package org.jgroups;
 
 
-import org.jgroups.conf.ClassConfigurator;
 import org.jgroups.util.Headers;
 import org.jgroups.util.Util;
 
@@ -43,14 +42,15 @@ public abstract class BaseMessage implements Message {
     }
 
 
-    public Address               getDest()                 {return dest;}
-    public Message               setDest(Address new_dest) {dest=new_dest; return this;}
-    public Address               getSrc()                  {return sender;}
-    public Message               setSrc(Address new_src)   {sender=new_src; return this;}
-    public int                   getNumHeaders()           {return Headers.size(this.headers);}
-    public Map<Short,Header>     getHeaders()              {return Headers.getHeaders(this.headers);}
-    public String                printHeaders()            {return Headers.printHeaders(this.headers);}
-
+    public Address           getDest()                         {return dest;}
+    public Message           setDest(Address new_dest)         {dest=new_dest; return this;}
+    public Address           getSrc()                          {return sender;}
+    public Message           setSrc(Address new_src)           {sender=new_src; return this;}
+    public int               getNumHeaders()                   {return Headers.size(this.headers);}
+    public Map<Short,Header> getHeaders()                      {return Headers.getHeaders(this.headers);}
+    public Header[]          headers()                         {return headers;} // don't modify!
+    public Message           headers(Header[] hdrs)            {this.headers=hdrs; return this;}  // use with caution!
+    public String            printHeaders()                    {return Headers.printHeaders(this.headers);}
 
     /**
      * Sets a number of flags in a message
@@ -60,7 +60,7 @@ public abstract class BaseMessage implements Message {
     public Message setFlag(Flag... flags) {
         if(flags != null) {
             short tmp=this.flags;
-            for(Flag flag : flags) {
+            for(Flag flag: flags) {
                 if(flag != null)
                     tmp|=flag.value();
             }
@@ -84,14 +84,24 @@ public abstract class BaseMessage implements Message {
         return this;
     }
 
-
-    public Message setFlag(short flag, boolean transient_flags) {
-        short tmp=transient_flags? this.transient_flags : this.flags;
-        tmp|=flag;
-        if(transient_flags)
-            this.transient_flags=(byte)tmp;
-        else
-            this.flags=tmp;
+    @Override
+    public Message setFlag(short flag, boolean transient_flags, boolean xor) {
+        if(transient_flags) {
+            if(xor) {
+                byte tmp=this.transient_flags;
+                this.transient_flags=(byte)(tmp | (byte)flag);
+            }
+            else
+                this.transient_flags=(byte)flag;
+        }
+        else {
+            if(xor) {
+                short tmp=this.flags;
+                this.flags=(short)(tmp | flag);
+            }
+            else
+                this.flags=flag;
+        }
         return this;
     }
 
@@ -113,7 +123,7 @@ public abstract class BaseMessage implements Message {
             short tmp=this.flags;
             for(Flag flag : flags)
                 if(flag != null)
-                    tmp&=~flag.value();
+                    tmp=(short)(tmp & ~flag.value());
             this.flags=tmp;
         }
         return this;
@@ -124,7 +134,7 @@ public abstract class BaseMessage implements Message {
             short tmp=this.transient_flags;
             for(TransientFlag flag : flags)
                 if(flag != null)
-                    tmp&=~flag.value();
+                    tmp=(short)(tmp & ~flag.value());
             this.transient_flags=(byte)tmp;
         }
         return this;
@@ -133,7 +143,7 @@ public abstract class BaseMessage implements Message {
     /**
      * Checks if a given flag is set
      * @param flag The flag
-     * @return Whether or not the flag is currently set
+     * @return Whether the flag is currently set
      */
     public boolean isFlagSet(Flag flag) {
         return Util.isFlagSet(flags, flag);
@@ -181,27 +191,27 @@ public abstract class BaseMessage implements Message {
 
     /** Puts a header given an ID into the hashmap. Overwrites potential existing entry. */
     public Message putHeader(short id, Header hdr) {
-        if(id < 0)
-            throw new IllegalArgumentException("An ID of " + id + " is invalid");
-        if(hdr != null)
-            hdr.setProtId(id);
-        synchronized(this) {
-            if(this.headers == null)
-                this.headers=createHeaders(Util.DEFAULT_HEADERS);
-            Header[] resized_array=Headers.putHeader(this.headers, id, hdr, true);
-            if(resized_array != null)
-                this.headers=resized_array;
-        }
-        return this;
+        return putHeader(id, hdr, true);
     }
 
-
+    @Override
+    public Message putHeaderIfAbsent(short id, Header hdr) {
+        return putHeader(id, hdr, false);
+    }
 
     public <T extends Header> T getHeader(short id) {
         if(id <= 0)
             throw new IllegalArgumentException("An ID of " + id + " is invalid. Add the protocol which calls " +
                                                  "getHeader() to jg-protocol-ids.xml");
         return Headers.getHeader(this.headers, id);
+    }
+
+    /** Removes all headers: use carefully! */
+    public Message clearHeaders() {
+        synchronized(this) {
+            headers=createHeaders(Util.DEFAULT_HEADERS);
+        }
+        return this;
     }
 
     public <T> T   getPayload() {return getObject();}
@@ -213,6 +223,8 @@ public abstract class BaseMessage implements Message {
                              getLength(), flags > 0? ", flags=" + Util.flagsToString(flags) : "",
                              transient_flags > 0? ", transient_flags=" + Util.transientFlagsToString(transient_flags) : "");
     }
+
+    protected abstract int payloadSize();
 
     public int serializedSize() {
         return size();
@@ -228,6 +240,19 @@ public abstract class BaseMessage implements Message {
 
         retval+=Global.SHORT_SIZE;  // number of headers
         retval+=Headers.marshalledSize(this.headers);
+        retval+=payloadSize();
+        return retval;
+    }
+
+    public int sizeNoAddrs(Address src) {
+        int retval=Global.BYTE_SIZE // leading byte
+          + Global.SHORT_SIZE;      // flags
+        if(sender != null && !sender.equals(src))
+            retval+=Util.size(sender);
+
+        retval+=Global.SHORT_SIZE;  // number of headers
+        retval+=Headers.marshalledSize(this.headers);
+        retval+=payloadSize();
         return retval;
     }
 
@@ -255,16 +280,16 @@ public abstract class BaseMessage implements Message {
             Util.writeAddress(sender, out);
 
         // write the headers
-        writeHeaders(this.headers, out, (short[])null);
+        Headers.writeHeaders(this.headers, out);
 
         // finally write the payload
         writePayload(out);
     }
 
-    public void writeToNoAddrs(Address src, DataOutput out, short... excluded_headers) throws IOException {
+    public void writeToNoAddrs(Address src, DataOutput out) throws IOException {
         byte leading=0;
 
-        boolean write_src_addr=src == null || sender != null && !sender.equals(src);
+        boolean write_src_addr=sender != null && !sender.equals(src);
 
         if(write_src_addr)
             leading=Util.setFlag(leading, SRC_SET);
@@ -280,7 +305,7 @@ public abstract class BaseMessage implements Message {
             Util.writeAddress(sender, out);
 
         // write the headers
-        writeHeaders(this.headers, out, excluded_headers);
+        Headers.writeHeaders(this.headers, out);
 
         // finally write the payload
         writePayload(out);
@@ -303,55 +328,31 @@ public abstract class BaseMessage implements Message {
             sender=Util.readAddress(in);
 
         // 5. headers
-        int len=in.readShort();
-        if(this.headers == null || len > this.headers.length)
-            this.headers=createHeaders(len);
-        for(int i=0; i < len; i++) {
-            short id=in.readShort();
-            Header hdr=readHeader(in).setProtId(id);
-            this.headers[i]=hdr;
-        }
+        this.headers=Headers.readHeaders(in);
         readPayload(in);
     }
 
+    protected Message putHeader(short id, Header hdr, boolean replace_if_present) {
+        if(id < 0)
+            throw new IllegalArgumentException("An ID of " + id + " is invalid");
+        if(hdr != null)
+            hdr.setProtId(id);
+        synchronized(this) {
+            if(this.headers == null)
+                this.headers=createHeaders(Util.DEFAULT_HEADERS);
+            Header[] resized_array=Headers.putHeader(this.headers, id, hdr, replace_if_present);
+            if(resized_array != null)
+                this.headers=resized_array;
+        }
+        return this;
+    }
 
     /** Copies the payload */
     protected Message copyPayload(Message copy) {
         return copy;
     }
 
-    protected static void writeHeaders(Header[] hdrs, DataOutput out, short ... excluded_headers) throws IOException {
-        int size=Headers.size(hdrs, excluded_headers);
-        out.writeShort(size);
-        if(size > 0) {
-            for(Header hdr : hdrs) {
-                if(hdr == null)
-                    break;
-                short id=hdr.getProtId();
-                if(Util.containsId(id, excluded_headers))
-                    continue;
-                out.writeShort(id);
-                writeHeader(hdr, out);
-            }
-        }
-    }
-
-    protected static void writeHeader(Header hdr, DataOutput out) throws IOException {
-        short magic_number=hdr.getMagicId();
-        out.writeShort(magic_number);
-        hdr.writeTo(out);
-    }
-
-    protected static Header readHeader(DataInput in) throws IOException, ClassNotFoundException {
-        short magic_number=in.readShort();
-        Header hdr=ClassConfigurator.create(magic_number);
-        hdr.readFrom(in);
-        return hdr;
-    }
-
     protected static Header[] createHeaders(int size) {
-        return size > 0? new Header[size] : new Header[3];
+        return size > 0? new Header[size] : new Header[Util.DEFAULT_HEADERS];
     }
-
-
 }

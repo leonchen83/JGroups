@@ -5,11 +5,9 @@ import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.annotations.ManagedOperation;
 import org.jgroups.util.*;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Predicate;
@@ -45,10 +43,9 @@ public class FRAG2 extends Fragmentation {
     protected final Predicate<Message> HAS_FRAG_HEADER=msg -> msg.getHeader(id) != null;
 
     /** Used to assign fragmentation-specific sequence IDs (monotonically increasing) */
-    protected int                 curr_id=1;
+    protected final AtomicLong    curr_id=new AtomicLong(1);
 
     protected final List<Address> members=new ArrayList<>(11);
-    protected MessageFactory      msg_factory;
 
     protected final AverageMinMax avg_size_down=new AverageMinMax();
     protected final AverageMinMax avg_size_up=new AverageMinMax();
@@ -59,8 +56,8 @@ public class FRAG2 extends Fragmentation {
     @ManagedAttribute(description="min/avg/max size (in bytes) of messages re-assembled from fragments")
     public String getAvgSizeUp()   {return avg_size_up.toString();}
 
-    synchronized int getNextId() {
-        return curr_id++;
+    protected long getNextId() {
+        return curr_id.getAndIncrement();
     }  
 
     public void init() throws Exception {
@@ -72,12 +69,11 @@ public class FRAG2 extends Fragmentation {
 
         TP transport=getTransport();
         if(transport != null) {
-            int max_bundle_size=transport.getMaxBundleSize();
+            int max_bundle_size=transport.getBundler().getMaxSize();
             if(frag_size >= max_bundle_size)
                 throw new IllegalArgumentException("frag_size (" + frag_size + ") has to be < TP.max_bundle_size (" +
                                                      max_bundle_size + ")");
         }
-        msg_factory=transport.getMessageFactory();
         Map<String,Object> info=new HashMap<>(1);
         info.put("frag_size", frag_size);
         down_prot.down(new Event(Event.CONFIG, info));
@@ -142,13 +138,15 @@ public class FRAG2 extends Fragmentation {
     }
 
     public void up(MessageBatch batch) {
-        MessageIterator it=batch.iteratorWithFilter(HAS_FRAG_HEADER);
+        FastArray<Message>.FastIterator it=(FastArray<Message>.FastIterator)batch.iterator();
         while(it.hasNext()) {
             Message msg=it.next();
             FragHeader hdr=msg.getHeader(this.id);
+            if(hdr == null)
+                continue;
             Message assembled_msg=unfragment(msg, hdr);
             if(assembled_msg != null) {
-                // the reassembled msg has to be add in the right place (https://issues.jboss.org/browse/JGRP-1648),
+                // the reassembled msg has to be add in the right place (https://issues.redhat.com/browse/JGRP-1648),
                 // and cannot be added to the tail of the batch!
                 assembled_msg.setSrc(batch.sender());
                 it.replace(assembled_msg);
@@ -221,7 +219,9 @@ public class FRAG2 extends Fragmentation {
                 // don't copy the buffer, only src, dest and headers. Only copy the headers one time !
                 Message frag_msg=null;
                 if(serialize)
-                    frag_msg=new BytesMessage(msg.getDest());
+                    frag_msg=new BytesMessage(msg.getDest())
+                      .setFlag(msg.getFlags(true), true)
+                      .setFlag(msg.getFlags(false), false);
                 else
                     frag_msg=msg.copy(false, i == 0);
 
@@ -259,7 +259,7 @@ public class FRAG2 extends Fragmentation {
 
         FragEntry entry=frag_table.get(hdr.id);
         if(entry == null) {
-            entry=new FragEntry(hdr.num_frags, hdr.needs_deserialization, msg_factory);
+            entry=new FragEntry(hdr.num_frags, hdr.needs_deserialization);
             FragEntry tmp=frag_table.putIfAbsent(hdr.id, entry);
             if(tmp != null)
                 entry=tmp;
@@ -312,7 +312,7 @@ public class FRAG2 extends Fragmentation {
             index+=length;
         }
         if(needs_deserialization)
-            retval=Util.messageFromBuffer(combined_buffer, 0, combined_buffer.length, msg_factory);
+            retval=Util.messageFromBuffer(combined_buffer, 0, combined_buffer.length);
         else
             retval.setArray(combined_buffer, 0, combined_buffer.length);
         return retval;
@@ -330,7 +330,6 @@ public class FRAG2 extends Fragmentation {
         protected final Message[]      fragments;
         protected int                  number_of_frags_recvd;
         protected final boolean        needs_deserialization;
-        protected final MessageFactory msg_factory;
         protected final Lock           lock=new ReentrantLock();
 
 
@@ -338,10 +337,9 @@ public class FRAG2 extends Fragmentation {
          * Creates a new entry
          * @param tot_frags the number of fragments to expect for this message
          */
-        protected FragEntry(int tot_frags, boolean needs_deserialization, MessageFactory mf) {
+        protected FragEntry(int tot_frags, boolean needs_deserialization) {
             fragments=new Message[tot_frags];
             this.needs_deserialization=needs_deserialization;
-            this.msg_factory=mf;
         }
 
 

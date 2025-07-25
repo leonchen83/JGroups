@@ -1,8 +1,10 @@
 package org.jgroups.demos;
 
 import org.jgroups.*;
+import org.jgroups.util.Util;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 
 public class Chat implements Receiver {
@@ -28,28 +30,39 @@ public class Chat implements Receiver {
     }
 
     private void start(String props, String name, boolean nohup) throws Exception {
-        channel=new JChannel(props);
-        if(name != null)
-            channel.name(name);
-        channel.setReceiver(this);
-        channel.connect(CLUSTER);
+        try {
+            channel=new JChannel(props).name(name);
+            channel.setReceiver(this);
+            channel.connect(CLUSTER);
+        }
+        catch(Exception ex) {
+            Util.close(channel);
+            throw ex;
+        }
+
         if(!nohup) {
             eventLoop();
             channel.close();
         }
     }
 
+
     private void eventLoop() {
         BufferedReader in=new BufferedReader(new InputStreamReader(System.in));
         while(true) {
             try {
                 System.out.print("> "); System.out.flush();
-                String line=in.readLine().toLowerCase();
-                if(line.startsWith("quit") || line.startsWith("exit")) {
+                String line=in.readLine();
+                line=line != null? line.toLowerCase() : null;
+                if(line == null)
+                    continue;
+                if(line.startsWith("quit") || line.startsWith("exit"))
                     break;
-                }
                 Message msg=new ObjectMessage(null, line);
                 channel.send(msg);
+            }
+            catch(IOException | IllegalArgumentException io_ex) {
+                break;
             }
             catch(Exception ex) {
                 ex.printStackTrace();
@@ -80,10 +93,13 @@ public class Chat implements Receiver {
             return;
         }
 
-        new Chat().start(props, name, nohup);
+        Chat ch=new Chat();
+        ch.start(props, name, nohup);
     }
 
     protected static void help() {
         System.out.println("Chat [-props XML config] [-name name] [-nohup]");
     }
+
+
 }

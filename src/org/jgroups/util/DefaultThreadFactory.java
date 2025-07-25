@@ -2,6 +2,8 @@ package org.jgroups.util;
 
 import org.jgroups.logging.Log;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 /**
  * Thread factory mainly responsible for naming of threads. Can be replaced by
  * user. If use_numbering is set, a thread THREAD will be called THREAD-1,
@@ -15,24 +17,24 @@ import org.jgroups.logging.Log;
  * @author Bela Ban
  */
 public class DefaultThreadFactory implements ThreadFactory {
-    protected final String    baseName;
-    protected final boolean   createDaemons;
-    protected final boolean   use_numbering;
-    protected short           counter; // if numbering is enabled
-    protected boolean         includeClusterName;
-    protected String          clusterName;
-    protected boolean         includeLocalAddress;
-    protected String          address;
-    protected boolean         use_fibers; // use fibers instead of threads (requires Java 15)
-    protected Log             log;
+    protected final String        baseName;
+    protected final boolean       createDaemons;
+    protected final boolean       use_numbering;
+    protected final AtomicInteger counter=new AtomicInteger(); // if numbering is enabled
+    protected boolean             includeClusterName;
+    protected String              clusterName;
+    protected boolean             includeLocalAddress;
+    protected String              address;
+    protected boolean             use_vthreads; // use fibers instead of threads (requires Java 15)
+    protected Log                 log;
 
 
-    public DefaultThreadFactory(String baseName, boolean createDaemons) {
-        this(baseName, createDaemons, false);
+    public DefaultThreadFactory(String base_name, boolean createDaemons) {
+        this(base_name, createDaemons, false);
     }
 
-    public DefaultThreadFactory(String baseName, boolean createDaemons, boolean use_numbering) {
-        this.baseName=baseName;
+    public DefaultThreadFactory(String base_name, boolean createDaemons, boolean use_numbering) {
+        this.baseName=base_name;
         this.createDaemons=createDaemons;
         this.use_numbering=use_numbering;
     }
@@ -56,10 +58,14 @@ public class DefaultThreadFactory implements ThreadFactory {
         this.address=address;
     }
 
-    public boolean                            useFibers()          {return use_fibers;}
-    public <T extends DefaultThreadFactory> T useFibers(boolean f) {this.use_fibers=f; return (T)this;}
-
-    public <T extends DefaultThreadFactory> T log(Log l)           {this.log=l; return (T)this;}
+    @Deprecated(forRemoval=true)
+    public boolean                            useFibers()                  {return useVirtualThreads();}
+    @Deprecated(forRemoval=true)
+    public <T extends DefaultThreadFactory> T useFibers(boolean f)         {return useVirtualThreads(f);}
+    @Override
+    public boolean                            useVirtualThreads()          {return use_vthreads;}
+    public <T extends DefaultThreadFactory> T useVirtualThreads(boolean f) {this.use_vthreads=f; return (T)this;}
+    public <T extends DefaultThreadFactory> T log(Log l)                   {this.log=l; return (T)this;}
 
     public Thread newThread(Runnable r, String name) {
         return newThread(r, name, null, null);
@@ -71,9 +77,7 @@ public class DefaultThreadFactory implements ThreadFactory {
 
     protected Thread newThread(Runnable r, String name, String addr, String cluster_name) {
         String thread_name=getNewThreadName(name, addr, cluster_name);
-        Thread retval=use_fibers? Util.createFiber(r, name) : new Thread(r, thread_name);
-        retval.setDaemon(createDaemons);
-        return retval;
+        return ThreadCreator.createThread(r, thread_name, createDaemons, use_vthreads);
     }
 
     public void renameThread(String base_name, Thread thread) {
@@ -105,10 +109,7 @@ public class DefaultThreadFactory implements ThreadFactory {
             return null;
         StringBuilder sb=new StringBuilder(base_name != null? base_name : thread.getName());
         if(use_numbering) {
-            short id;
-            synchronized(this) {
-                id=++counter;
-            }
+            int id=counter.incrementAndGet();
             sb.append("-").append(id);
         }
 
@@ -117,10 +118,8 @@ public class DefaultThreadFactory implements ThreadFactory {
         if(addr == null)
             addr=this.address;
 
-        if(!includeClusterName && !includeLocalAddress && cluster_name != null) {
-            sb.append(",shared=").append(cluster_name);
+        if(!includeClusterName && !includeLocalAddress)
             return sb.toString();
-        }
 
         if(includeClusterName)
             sb.append(',').append(cluster_name);
@@ -136,10 +135,7 @@ public class DefaultThreadFactory implements ThreadFactory {
     protected String getNewThreadName(String base_name, String addr, String cluster_name) {
         StringBuilder sb=new StringBuilder(base_name != null? base_name : "thread");
         if(use_numbering) {
-            short id;
-            synchronized(this) {
-                id=++counter;
-            }
+            int id=counter.incrementAndGet();
             sb.append("-").append(id);
         }
 
@@ -148,10 +144,8 @@ public class DefaultThreadFactory implements ThreadFactory {
         if(addr == null)
             addr=this.address;
 
-        if(!includeClusterName && !includeLocalAddress && cluster_name != null) {
-            sb.append(",shared=").append(cluster_name);
+        if(!includeClusterName && !includeLocalAddress)
             return sb.toString();
-        }
 
         if(includeClusterName)
             sb.append(',').append(cluster_name);

@@ -1,27 +1,38 @@
 package org.jgroups.protocols;
 
 
-import org.jgroups.*;
-import org.jgroups.util.RingBuffer;
-import org.jgroups.util.Runner;
-import org.jgroups.util.Util;
+import org.jgroups.Address;
+import org.jgroups.Global;
+import org.jgroups.Message;
+import org.jgroups.PhysicalAddress;
+import org.jgroups.annotations.Experimental;
+import org.jgroups.annotations.Property;
+import org.jgroups.util.*;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BiConsumer;
+
+import static org.jgroups.Message.TransientFlag.DONT_LOOPBACK;
+import static org.jgroups.util.MessageBatch.Mode.OOB;
+import static org.jgroups.util.MessageBatch.Mode.REG;
 
 /**
  * Bundler which uses {@link RingBuffer} to store messages. The difference to {@link TransferQueueBundler} is that
  * RingBuffer uses a wait strategy (to for example spinning) before blocking. Also, the hashmap of the superclass is not
  * used, but the array of the RingBuffer is used directly to bundle and send messages, minimizing memory allocation.
  */
+@Experimental
 public class RingBufferBundler extends BaseBundler {
     protected RingBuffer<Message>         rb;
     protected Runner                      bundler_thread;
+
+    @Property(description="Number of spins before a real lock is acquired")
     protected int                         num_spins=40; // number of times we call Thread.yield before acquiring the lock (0 disables)
     protected static final String         THREAD_NAME="RingBufferBundler";
     protected BiConsumer<Integer,Integer> wait_strategy=SPIN_PARK;
-    protected int                         capacity;
     protected final Runnable              run_function=this::readMessages;
 
     protected static final BiConsumer<Integer,Integer> SPIN=(it,spins) -> {;};
@@ -52,19 +63,21 @@ public class RingBufferBundler extends BaseBundler {
     }
 
     public RingBuffer<Message> buf()                     {return rb;}
-    public Thread              getThread()               {return bundler_thread.getThread();}
     public int                 size()                    {return rb.size();}
     public int                 getQueueSize()            {return rb.size();}
     public int                 numSpins()                {return num_spins;}
     public RingBufferBundler   numSpins(int n)           {num_spins=n; return this;}
+
+    @Property(description="The wait strategy: spin, yield, park, spin-park, spin-yield",writable=false)
     public String              waitStrategy()            {return print(wait_strategy);}
+    @Property
     public RingBufferBundler   waitStrategy(String st)   {wait_strategy=createWaitStrategy(st, YIELD); return this;}
 
 
     public void init(TP transport) {
         super.init(transport);
         if(rb == null) {
-            rb=new RingBuffer<>(Message.class, assertPositive(transport.getBundlerCapacity(), "bundler capacity cannot be " + transport.getBundlerCapacity()));
+            rb=new RingBuffer<>(Message.class, assertPositive(capacity, "bundler capacity cannot be " + capacity));
             this.capacity=rb.capacity();
         }
         bundler_thread=new Runner(transport.getThreadFactory(), THREAD_NAME, run_function, () -> rb.clear());
@@ -78,14 +91,16 @@ public class RingBufferBundler extends BaseBundler {
         bundler_thread.stop();
     }
 
+    public void renameThread() {
+        transport.getThreadFactory().renameThread(THREAD_NAME, bundler_thread.getThread());
+    }
+
     public void send(Message msg) throws Exception {
         rb.put(msg);
     }
 
-
     /** Read and send messages in range [read-index .. read-index+available_msgs-1] */
     public void sendBundledMessages(final Message[] buf, final int read_index, final int available_msgs) {
-        int       max_bundle_size=transport.getMaxBundleSize();
         byte[]    cluster_name=transport.cluster_name.chars();
         int       start=read_index;
         final int end=index(start + available_msgs-1); // index of the last message to be read
@@ -98,50 +113,107 @@ public class RingBufferBundler extends BaseBundler {
                 start=advance(start);
                 continue;
             }
-
             Address dest=msg.getDest();
-            try {
-                output.position(0);
-                Util.writeMessageListHeader(dest, msg.getSrc(), cluster_name, 1, output, dest == null);
-
-                // remember the position at which the number of messages (an int) was written, so we can later set the
-                // correct value (when we know the correct number of messages)
-                int size_pos=output.position() - Global.INT_SIZE;
-                int num_msgs=marshalMessagesToSameDestination(dest, buf, start, end, max_bundle_size);
-                if(num_msgs > 1) {
-                    int current_pos=output.position();
-                    output.position(size_pos);
-                    output.writeInt(num_msgs);
-                    output.position(current_pos);
-                }
-                transport.doSend(output.buffer(), 0, output.position(), dest);
-                if(transport.statsEnabled())
-                    transport.incrBatchesSent(num_msgs);
+            if(dest == null) { // multicast
+                List<Message> list=new ArrayList<>();
+                _send(dest, msg, cluster_name, buf, start, end, list);
+                loopback(dest, transport.getAddress(), list, list.size());
             }
-            catch(Exception ex) {
-                log.error("failed to send message(s) to %s: %s", dest == null? "group" : dest, ex.getMessage());
+            else {            // unicast
+                boolean send_to_self=Objects.equals(transport.getAddress(), dest)
+                  || dest instanceof PhysicalAddress && dest.equals(transport.localPhysicalAddress());
+                if(send_to_self)
+                    _loopback(dest, transport.getAddress(), buf, start, end);
+                else
+                    _send(dest, msg, cluster_name, buf, start, end, null);
             }
-
             if(start == end)
                 break;
             start=advance(start);
         }
     }
 
+    protected void _loopback(Address dest, Address sender, Message[] buf, int start_index, final int end_index) {
+        MessageBatch reg=null, oob=null;
+        AsciiString cluster_name=transport.getClusterNameAscii();
+        for(;;) {
+            Message msg=buf[start_index];
+            if(msg != null && Objects.equals(dest, msg.getDest())) {
+                if(msg.isFlagSet(DONT_LOOPBACK))
+                    continue;
+                if(msg.isFlagSet(Message.Flag.OOB)) {
+                    // we cannot reuse message batches (like in ReliableMulticast.removeAndDeliver()), because batches are
+                    // submitted to a thread pool and new calls of this method might change them while they're being passed up
+                    if(oob == null)
+                        oob=new MessageBatch(dest, sender, cluster_name, dest == null, OOB, 128);
+                    oob.add(msg);
+                }
+                else {
+                    if(reg == null)
+                        reg=new MessageBatch(dest, sender, cluster_name, dest == null, REG, 128);
+                    reg.add(msg);
+                }
+                buf[start_index]=null;
+            }
+            if(start_index == end_index)
+                break;
+            start_index=advance(start_index);
+        }
+
+        if(reg != null) {
+            msg_stats.received(reg);
+            msg_processing_policy.loopback(reg, false);
+        }
+        if(oob != null) {
+            msg_stats.received(oob);
+            msg_processing_policy.loopback(oob, true);
+        }
+    }
+
+    protected void _send(Address dest, Message msg, byte[] cluster_name, Message[] buf, int start, int end,
+                         List<Message> list) {
+        try {
+            if(list != null)
+                list.add(msg);
+            output.position(0);
+            Util.writeMessageListHeader(dest, msg.getSrc(), cluster_name, 1, output, dest == null);
+
+            // remember the position at which the number of messages (an int) was written, so we can later set the
+            // correct value (when we know the correct number of messages)
+            int size_pos=output.position() - Global.INT_SIZE;
+            int num_msgs=marshalMessagesToSameDestination(dest, buf, start, end, max_size, list);
+            if(num_msgs > 1) {
+                int current_pos=output.position();
+                output.position(size_pos);
+                output.writeInt(num_msgs);
+                output.position(current_pos);
+            }
+            transport.doSend(output.buffer(), 0, output.position(), dest);
+            transport.getMessageStats().incrNumBatchesSent(num_msgs);
+        }
+        catch(Exception ex) {
+            log.trace("failed to send message(s) to %s: %s", dest == null? "group" : dest, ex.getMessage());
+        }
+    }
+
+
     // Iterate through the following messages and find messages to the same destination (dest) and write them to output
-    protected int marshalMessagesToSameDestination(Address dest, Message[] buf,
-                                                   int start_index, final int end_index, int max_bundle_size) throws Exception {
+    protected int marshalMessagesToSameDestination(Address dest, Message[] buf, int start_index, final int end_index,
+                                                   int max_bundle_size, List<Message> list) throws Exception {
         int num_msgs=0, bytes=0;
         for(;;) {
             Message msg=buf[start_index];
             if(msg != null && Objects.equals(dest, msg.getDest())) {
-                int size=msg.size();
+                if(list != null)
+                    list.add(msg);
+                int size=msg.sizeNoAddrs(msg.getSrc()) + Global.SHORT_SIZE;
                 if(bytes + size > max_bundle_size)
                     break;
                 bytes+=size;
                 num_msgs++;
                 buf[start_index]=null;
-                msg.writeToNoAddrs(msg.getSrc(), output, transport.getId());
+                output.writeShort(msg.getType());
+                msg.writeToNoAddrs(msg.getSrc(), output);
             }
             if(start_index == end_index)
                 break;

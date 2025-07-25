@@ -19,11 +19,14 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.Map.Entry;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
 
 /**
  * Abstract class for a server handling sending, receiving and connection management.
@@ -33,12 +36,11 @@ import java.util.concurrent.locks.ReentrantLock;
 public abstract class BaseServer implements Closeable, ConnectionListener {
     protected Address                         local_addr; // typically the address of the server socket or channel
     protected final List<ConnectionListener>  conn_listeners=new CopyOnWriteArrayList<>();
-    protected final Map<Address,Connection>   conns=new HashMap<>();
-    protected final Lock                      sock_creation_lock=new ReentrantLock(true); // syncs socket establishment
+    protected final Map<Address,Connection>   conns=new ConcurrentHashMap<>();
     protected final ThreadFactory             factory;
     protected SocketFactory                   socket_factory=new DefaultSocketFactory();
     protected long                            reaperInterval;
-    protected Reaper                          reaper;
+    protected Reaper reaper;
     protected Receiver                        receiver;
     protected final AtomicBoolean             running=new AtomicBoolean(false);
     protected Log                             log=LogFactory.getLog(getClass());
@@ -53,12 +55,26 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
     @ManagedAttribute(description="Size (bytes) of the send channel/socket",writable=true,type=AttributeType.BYTES)
     protected int                             send_buf_size;
 
+    @ManagedAttribute(description="The max number of bytes a message can have. If greater, an exception will be " +
+      "thrown. 0 disables this",
+      writable=true,type=AttributeType.BYTES)
+    protected int                             max_length;
+
     @ManagedAttribute(description="When A connects to B, B reuses the same TCP connection to send data to A")
     protected boolean                         use_peer_connections;
+    @ManagedAttribute(description="Wait for an ack from the server when a connection is established, and retry " +
+      "connection establishment until a valid connection has been established, or the connection to the peer cannot " +
+      "be established (https://issues.redhat.com/browse/JGRP-2684)",writable=true)
+    @Deprecated(since="5.4.4",forRemoval=true)
+    protected boolean                         use_acks;
+    @ManagedAttribute(description="Log a stack trace when a connection is closed")
+    protected boolean                         log_details=true;
     protected int                             sock_conn_timeout=1000;      // max time in millis to wait for Socket.connect() to return
     protected boolean                         tcp_nodelay=false;
     protected int                             linger=-1;
     protected TimeService                     time_service;
+    // to access the connection map, 1 lock / destination
+    protected final Map<Address,Lock>         locks=new ConcurrentHashMap<>();
 
 
     protected BaseServer(ThreadFactory f, SocketFactory sf, int recv_buf_size) {
@@ -67,7 +83,6 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
         if(sf != null)
             this.socket_factory=sf;
     }
-
 
 
     public Receiver         receiver()                              {return receiver;}
@@ -87,6 +102,10 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
     public BaseServer       socketFactory(SocketFactory factory)    {this.socket_factory=factory; return this;}
     public boolean          usePeerConnections()                    {return use_peer_connections;}
     public BaseServer       usePeerConnections(boolean flag)        {this.use_peer_connections=flag; return this;}
+    public static boolean   useAcks()                               {return false;}
+    public BaseServer       useAcks(boolean ignored)                {return this;}
+    public boolean          logDetails()                            {return log_details;}
+    public BaseServer       logDetails(boolean l)                   {log_details=l; return this;}
     public int              socketConnectionTimeout()               {return sock_conn_timeout;}
     public BaseServer       socketConnectionTimeout(int timeout)    {this.sock_conn_timeout = timeout; return this;}
     public long             connExpireTime()                        {return conn_expire_time;}
@@ -97,6 +116,8 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
     public BaseServer       receiveBufferSize(int recv_buf_size)    {this.recv_buf_size = recv_buf_size; return this;}
     public int              sendBufferSize()                        {return send_buf_size;}
     public BaseServer       sendBufferSize(int send_buf_size)       {this.send_buf_size = send_buf_size; return this;}
+    public int              getMaxLength()                          {return max_length;}
+    public BaseServer       setMaxLength(int len)                   {max_length=len; return this;}
     public int              linger()                                {return linger;}
     public BaseServer       linger(int linger)                      {this.linger=linger; return this;}
     public boolean          tcpNodelay()                            {return tcp_nodelay;}
@@ -106,19 +127,18 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
 
 
     @ManagedAttribute(description="Number of connections")
-    public synchronized int getNumConnections() {
+    public int getNumConnections() {
         return conns.size();
     }
 
     @ManagedAttribute(description="Number of currently open connections")
-    public synchronized int getNumOpenConnections() {
+    public int getNumOpenConnections() {
         int retval=0;
         for(Connection conn: conns.values())
-            if(conn.isOpen())
+            if(!conn.isClosed())
                 retval++;
         return retval;
     }
-
 
     /**
      * Starts accepting connections. Typically, socket handler or selectors thread are started here.
@@ -137,12 +157,10 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
     public void stop() {
         Util.close(reaper);
         reaper=null;
-
-        synchronized(this) {
-            for(Map.Entry<Address,Connection> entry: conns.entrySet())
-                Util.close(entry.getValue());
-            conns.clear();
-        }
+        for(Connection c: conns.values())
+            Util.close(c);
+        conns.clear();
+        locks.clear();
         conn_listeners.clear();
     }
 
@@ -150,6 +168,18 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
         stop();
     }
 
+    public void flush(Address dest) {
+        if(dest != null) {
+            Connection conn=conns.get(dest);
+            if(conn != null)
+                conn.flush();
+        }
+    }
+
+    public void flushAll() {
+        for(Connection c: conns.values())
+            c.flush();
+    }
 
     /**
      * Called by a {@link Connection} implementation when a message has been received. Note that data might be a
@@ -170,15 +200,19 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
     }
 
     public void receive(Address sender, DataInput in, int len) throws Exception {
+        // https://issues.redhat.com/browse/JGRP-2523: check if max_length has been exceeded
+        if(max_length > 0 && len > max_length)
+            throw new IllegalStateException(String.format("the length of a message (%s) from %s is bigger than the " +
+                                                            "max accepted length (%s): discarding the message",
+                                                          Util.printBytes(len), sender, Util.printBytes(max_length)));
         if(this.receiver != null)
-            this.receiver.receive(sender, in);
+            this.receiver.receive(sender, in, len);
         else {
             // discard len bytes (in.skip() is not guaranteed to discard *all* len bytes)
             byte[] buf=new byte[len];
             in.readFully(buf, 0, len);
         }
     }
-
 
     public void send(Address dest, byte[] data, int offset, int length) throws Exception {
         if(!validateArgs(dest, data))
@@ -197,7 +231,7 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
         // Get a connection (or create one if not yet existent) and send the data
         Connection conn=null;
         try {
-            conn=getConnection(dest);
+            conn=getConnection(dest); // dest is guaranteed not to be null
             conn.send(data, offset, length);
         }
         catch(Exception ex) {
@@ -205,7 +239,6 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
             throw ex;
         }
     }
-
 
     public void send(Address dest, ByteBuffer data) throws Exception {
         if(!validateArgs(dest, data))
@@ -233,7 +266,6 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
         }
     }
 
-
     @Override
     public void connectionClosed(Connection conn) {
         removeConnectionIfPresent(conn.peerAddress(), conn);
@@ -247,41 +279,31 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
     /** Creates a new connection object to target dest, but doesn't yet connect it */
     protected abstract Connection createConnection(Address dest) throws Exception;
 
-    public synchronized boolean hasConnection(Address address) {
+    public boolean hasConnection(Address address) {
         return conns.containsKey(address);
     }
 
-    public synchronized boolean connectionEstablishedTo(Address address) {
-        Connection conn=conns.get(address);
-        return conn != null && conn.isConnected();
+    public boolean connectionEstablishedTo(Address address) {
+        return connected(conns.get(address));
     }
 
     /** Creates a new connection to dest, or returns an existing one */
     public Connection getConnection(Address dest) throws Exception {
         Connection conn;
-        synchronized(this) {
-            if((conn=conns.get(dest)) != null
-              && (conn.isConnected() || conn.isConnectionPending())) // keep FAST path on the most common case
-                return conn;
-        }
+        // keep FAST path on the most common case
+        if(connected(conn=conns.get(dest)))
+            return conn;
 
-        Exception connect_exception=null; // set if connect() throws an exception
-        sock_creation_lock.lockInterruptibly();
+        // we acquire a separate lock for each destination, so that connection/send attempts to destination D2
+        // are not blocked by connection/send attempts to destination D1 (https://issues.redhat.com/browse/JGRP-2905)
+        Lock lock=getLock(dest);
+        lock.lock();
         try {
-            // lock / release, create new conn under sock_creation_lock, it can be skipped but then it takes
-            // extra check in conn map and closing the new connection, w/ sock_creation_lock it looks much simpler
-            // (slow path, so not important)
-            synchronized(this) {
-                conn=conns.get(dest); // check again after obtaining sock_creation_lock
-                if(conn != null && (conn.isConnected() || conn.isConnectionPending()))
-                    return conn;
+            if(connected(conn=conns.get(dest)))
+                return conn;
+            conn=createConnection(dest);
+            replaceConnection(dest, conn);
 
-                // create conn stub
-                conn=createConnection(dest);
-                replaceConnection(dest, conn);
-            }
-
-            // now connect to dest:
             try {
                 log.trace("%s: connecting to %s", local_addr, dest);
                 conn.connect(dest);
@@ -289,118 +311,137 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
                 conn.start();
             }
             catch(Exception connect_ex) {
-                connect_exception=connect_ex;
-            }
-
-            synchronized(this) {
-                Connection existing_conn=conns.get(dest); // check again after obtaining sock_creation_lock
-                // added by a successful accept()
-                if(existing_conn != null && (existing_conn.isConnected() || existing_conn.isConnectionPending())
-                  && existing_conn != conn) {
-                    log.trace("%s: found existing connection to %s, using it and deleting own conn-stub", local_addr, dest);
-                    Util.close(conn); // close our connection; not really needed as conn was closed by accept()
-                    return existing_conn;
-                }
-
-                if(connect_exception != null) {
-                    log.trace("%s: failed connecting to %s: %s", local_addr, dest, connect_exception);
-                    removeConnectionIfPresent(dest, conn); // removes and closes the conn
-                    throw connect_exception;
-                }
-                return conn;
+                removeConnectionIfPresent(dest, conn); // removes and closes the conn
+                throw connect_ex;
             }
         }
         finally {
-            sock_creation_lock.unlock();
+            lock.unlock();
         }
+        return conn;
     }
 
     @GuardedBy("this")
     public void replaceConnection(Address address, Connection conn) {
         Connection previous=conns.put(address, conn);
-        Util.close(previous); // closes previous connection (if present)
+        if(previous != null) {
+            previous.flush();
+            Util.close(previous);
+        }
     }
 
     public void closeConnection(Connection conn) {
+        closeConnection(conn, true);
+    }
+
+    public void closeConnection(Connection conn, boolean notify) {
+        boolean closed=conn.isClosed();
         Util.close(conn);
-        notifyConnectionClosed(conn);
+        if(notify && !closed)
+            notifyConnectionClosed(conn);
         removeConnectionIfPresent(conn != null? conn.peerAddress() : null, conn);
     }
 
+    public boolean closeConnection(Address addr) {
+        return closeConnection(addr, true);
+    }
 
-    public synchronized void addConnection(Address peer_addr, Connection conn) throws Exception {
-        boolean conn_exists=hasConnection(peer_addr),
-          replace=conn_exists && local_addr.compareTo(peer_addr) < 0; // bigger conn wins
-
-        if(!conn_exists || replace) {
-            replaceConnection(peer_addr, conn); // closes old conn
-            conn.start();
+    public boolean closeConnection(Address addr, boolean notify) {
+        Connection c;
+        if(addr != null && (c=conns.get(addr)) != null) {
+            closeConnection(c, notify);
+            return true;
         }
-        else {
-            log.trace("%s: rejected connection from %s %s", local_addr, peer_addr, explanation(conn_exists, replace));
-            Util.close(conn); // keep our existing conn, reject accept() and close client_sock
+        return false;
+    }
+
+    public void addConnection(Address peer_addr, Connection conn) throws Exception {
+        Lock lock=getLock(peer_addr);
+        lock.lock();
+        try {
+            boolean conn_exists=hasConnection(peer_addr),
+              replace=conn_exists && local_addr.compareTo(peer_addr) < 0; // bigger conn wins
+
+            if(!conn_exists || replace) {
+                replaceConnection(peer_addr, conn); // closes old conn
+                conn.start();
+            }
+            else {
+                log.trace("%s: rejected connection from %s %s", local_addr, peer_addr, explanation(conn_exists, replace));
+                Util.close(conn); // keep our existing conn, reject accept() and close client_sock
+            }
+        }
+        finally {
+            lock.unlock();
         }
     }
 
-
-    public synchronized void addConnectionListener(ConnectionListener cml) {
-        if(cml != null && !conn_listeners.contains(cml))
-            conn_listeners.add(cml);
+    public BaseServer addConnectionListener(ConnectionListener cl) {
+        if(cl == null)
+            return this;
+        synchronized(conn_listeners) {
+            if(!conn_listeners.contains(cl))
+                conn_listeners.add(cl);
+        }
+        return this;
     }
 
-    public synchronized void removeConnectionListener(ConnectionListener cml) {
-        if(cml != null)
-            conn_listeners.remove(cml);
+    public BaseServer removeConnectionListener(ConnectionListener cl) {
+        if(cl == null)
+            return this;
+        synchronized(conn_listeners) {
+            conn_listeners.remove(cl);
+        }
+        return this;
     }
     
-
     @ManagedOperation(description="Prints all connections")
     public String printConnections() {
         StringBuilder sb=new StringBuilder("\n");
-        synchronized(this) {
-            for(Map.Entry<Address,Connection> entry: conns.entrySet())
-                sb.append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
-        }
+        for(Map.Entry<Address,Connection> entry: conns.entrySet())
+            sb.append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
         return sb.toString();
     }
-
 
     /** Only removes the connection if conns.get(address) == conn */
     public void removeConnectionIfPresent(Address address, Connection conn) {
         if(address == null || conn == null)
             return;
         Connection tmp=null;
-        synchronized(this) {
+        Lock lock=getLock(address);
+        lock.lock();
+        try {
             Connection existing=conns.get(address);
-            if(conn == existing) {
+            if(conn == existing)
                 tmp=conns.remove(address);
-            }
+        } finally {
+            lock.unlock();
         }
-        if(tmp != null) { // Moved conn close outside of sync block (https://issues.jboss.org/browse/JGRP-2053)
+        if(tmp != null) { // Moved conn close outside of sync block (https://issues.redhat.com/browse/JGRP-2053)
             log.trace("%s: removed connection to %s", local_addr, address);
             Util.close(tmp);
         }
     }
 
     /** Used only for testing ! */
-    public synchronized void clearConnections() {
+    public void clearConnections() {
         conns.values().forEach(Util::close);
         conns.clear();
+    }
+
+    public void forAllConnections(BiConsumer<Address,Connection> c) {
+        conns.forEach(c);
     }
 
     /** Removes all connections which are not in current_mbrs */
     public void retainAll(Collection<Address> current_mbrs) {
         if(current_mbrs == null)
             return;
-
-        Map<Address,Connection> copy=null;
-        synchronized(this) {
-            copy=new HashMap<>(conns);
-            conns.keySet().retainAll(current_mbrs);
-        }
+        Map<Address,Connection> copy=new HashMap<>(conns);
+        conns.keySet().retainAll(current_mbrs);
+        locks.keySet().retainAll(current_mbrs);
         copy.keySet().removeAll(current_mbrs);
-        for(Map.Entry<Address,Connection> entry: copy.entrySet())
-            Util.close(entry.getValue());
+        copy.values().forEach(Util::close);
         copy.clear();
     }
 
@@ -426,14 +467,20 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
         }
     }
 
-
     public String toString() {
-        return new StringBuilder(getClass().getSimpleName()).append(": local_addr=").append(local_addr).append("\n")
-          .append("connections (" + conns.size() + "):\n").append(super.toString()).append('\n').toString();
+        return toString(false);
     }
 
+    public String toString(boolean details) {
+        String s=String.format("%s (%s, %d conns)", getClass().getSimpleName(), local_addr, conns.size());
+        if(details && !conns.isEmpty()) {
+            String tmp=conns.entrySet().stream().map(e -> String.format("%s: %s", e.getKey(), e.getValue())).collect(Collectors.joining("\n"));
+            return String.format("%s:\n%s", s, tmp);
+        }
+        return s;
+    }
 
-    protected void sendToAll(byte[] data, int offset, int length) {
+    public void sendToAll(byte[] data, int offset, int length) {
         for(Map.Entry<Address,Connection> entry: conns.entrySet()) {
             Connection conn=entry.getValue();
             try {
@@ -447,8 +494,7 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
         }
     }
 
-
-    protected void sendToAll(ByteBuffer data) {
+    public void sendToAll(ByteBuffer data) {
         for(Map.Entry<Address,Connection> entry: conns.entrySet()) {
             Connection conn=entry.getValue();
             try {
@@ -462,6 +508,14 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
         }
     }
 
+    protected Lock getLock(Address dest) {
+        Lock l=locks.get(dest);
+        return l != null? l : locks.computeIfAbsent(dest, __ -> new ReentrantLock());
+    }
+
+    protected static boolean connected(Connection c) {
+        return c != null && !c.isClosed() && (c.isConnected() || c.isConnectionPending());
+    }
 
     protected static org.jgroups.Address localAddress(InetAddress bind_addr, int local_port, InetAddress external_addr, int external_port) {
         if(external_addr != null)
@@ -527,14 +581,12 @@ public abstract class BaseServer implements Closeable, ConnectionListener {
 
         public void run() {
             while(!Thread.currentThread().isInterrupted()) {
-                synchronized(BaseServer.this) {
-                    for(Iterator<Entry<Address,Connection>> it=conns.entrySet().iterator();it.hasNext();) {
-                        Entry<Address,Connection> entry=it.next();
-                        Connection c=entry.getValue();
-                        if(c.isExpired(System.nanoTime())) {
-                            Util.close(c);
-                            it.remove();                           
-                        }
+                for(Iterator<Entry<Address,Connection>> it=conns.entrySet().iterator();it.hasNext();) {
+                    Entry<Address,Connection> entry=it.next();
+                    Connection c=entry.getValue();
+                    if(c.isExpired(System.nanoTime())) {
+                        Util.close(c);
+                        it.remove();
                     }
                 }
                 Util.sleep(reaperInterval);

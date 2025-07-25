@@ -4,6 +4,7 @@ import org.jgroups.Address;
 import org.jgroups.BytesMessage;
 import org.jgroups.FragmentedMessage;
 import org.jgroups.Message;
+import org.jgroups.MessageFactory;
 import org.jgroups.util.ByteArrayDataInputStream;
 import org.jgroups.util.Range;
 import org.jgroups.util.Util;
@@ -59,6 +60,8 @@ public class FRAG4 extends FRAG2 {
                   msg.copy(false, i == 0).setArray(msg.getArray(), (int)r.low, (int)r.high)
                     .putHeader(this.id, new FragHeader(frag_id, i, num_frags))
                   : new FragmentedMessage(msg, (int)r.low, (int)r.high).setDest(msg.getDest()).setSrc(msg.getSrc())
+                  .setFlag(msg.getFlags(true), true)
+                  .setFlag(msg.getFlags(false), false)
                   .putHeader(this.id, new FragHeader(frag_id, i, num_frags).setOriginalType(msg.getType()));
                 down_prot.down(frag_msg);
             }
@@ -79,7 +82,7 @@ public class FRAG4 extends FRAG2 {
                                                                                                      m.getOffset(),
                                                                                                      m.getLength())));
             DataInput in=new DataInputStream(seq);
-            Message retval=msg_factory.create(hdr.getOriginalType());
+            Message retval=MessageFactory.create(hdr.getOriginalType());
             retval.readFrom(in);
             return retval;
         }

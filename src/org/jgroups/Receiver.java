@@ -31,7 +31,7 @@ public interface Receiver {
             try {
                 receive(msg);
             }
-            catch(Throwable t) {
+            catch(Throwable ignored) {
             }
         }
     }
@@ -49,35 +49,15 @@ public interface Receiver {
 
 
     /**
-     * Called (usually by the {@link org.jgroups.protocols.pbcast.FLUSH} protocol), as an indication that the member
-     * should stop sending messages. Any messages sent after returning from this callback might get blocked by the FLUSH
-     * protocol. When the FLUSH protocol is done, and messages can be sent again, the FLUSH protocol
-     * will simply unblock all pending messages. If a callback for unblocking is desired, implement
-     * {@link org.jgroups.Receiver#unblock()}.
-     */
-    default void block() {}
-
-    /**
-     * Called <em>after</em> the FLUSH protocol has unblocked previously blocked senders, and
-     * messages can be sent again.
-     * <br/>
-     * Note that during new view installation we provide guarantee that unblock invocation strictly
-     * follows view installation at some node A belonging to that view. However, some other message
-     * M may squeeze in between view and unblock callbacks.<br/>
-     * For more details see https://jira.jboss.org/jira/browse/JGRP-986
-     */
-    default void unblock() {}
-
-    /**
      * Allows an application to write the state to an OutputStream. After the state has
      * been written, the OutputStream doesn't need to be closed as stream closing is automatically
      * done when a calling thread returns from this callback.
      *
-     * @param output The OutputStream
+     * @param out The OutputStream
      * @throws Exception If the streaming fails, any exceptions should be thrown so that the state requester
      *                   can re-throw them and let the caller know what happened
      */
-    default void getState(OutputStream output) throws Exception {
+    default void getState(OutputStream out) throws Exception {
         throw new UnsupportedOperationException("getState() needs to be overridden by applications");
     }
 
@@ -86,11 +66,11 @@ public interface Receiver {
      * read, the InputStream doesn't need to be closed as stream closing is automatically done when a
      * calling thread returns from this callback.
      *
-     * @param input The InputStream
+     * @param in The InputStream
      * @throws Exception If the streaming fails, any exceptions should be thrown so that the state requester
      *                   can catch them and thus know what happened
      */
-    default void setState(InputStream input) throws Exception {
+    default void setState(InputStream in) throws Exception {
         throw new UnsupportedOperationException("setState() needs to be overridden by applications");
     }
 }

@@ -79,8 +79,8 @@ public class MFC extends FlowControl {
         return credits.getNumBlockings();
     }
 
-    @ManagedAttribute(description="Average time blocked (in ms) in flow control when trying to send a message",
-      type=AttributeType.TIME)
+    @ManagedAttribute(description="Average time blocked (in ns) in flow control when trying to send a message",
+      type=AttributeType.TIME,unit=TimeUnit.NANOSECONDS)
     public double getAverageTimeBlocked() {
         return credits.getAverageBlockTime();
     }
@@ -110,25 +110,27 @@ public class MFC extends FlowControl {
     }
 
     @Override
-    protected Object handleDownMessage(final Message msg) {
+    protected Object handleDownMessage(final Message msg, int length) {
         Address dest=msg.getDest();
         if(dest != null) // 2nd line of defense, not really needed
             return down_prot.down(msg);
 
-        int length=msg.getLength();
-        long block_time=max_block_times != null? getMaxBlockTime(length) : max_block_time;
+        boolean dont_block=msg.isFlagSet(Message.TransientFlag.DONT_BLOCK);
         while(running) {
-            boolean rc=credits.decrement(msg, length, block_time);
-            if(rc || max_block_times != null || !running)
+            long timeout=dont_block? 0 : max_block_time; // timeout == 0 won't block the decrement() below
+            boolean rc=credits.decrement(msg, length, timeout);
+            if(rc || !running)
                 break;
-
             if(needToSendCreditRequest()) {
                 List<Tuple<Address,Long>> targets=credits.getMembersWithCreditsLessThan(min_credits);
                 for(Tuple<Address,Long> tuple: targets)
                     sendCreditRequest(tuple.getVal1(), Math.min(max_credits, max_credits - tuple.getVal2()));
             }
+            if(dont_block) {
+                num_msgs_dropped++;
+                return null;
+            }
         }
-        
         // send message - either after regular processing, or after blocking (when enough credits are available again)
         return down_prot.down(msg);
     }
@@ -136,14 +138,16 @@ public class MFC extends FlowControl {
 
 
 
-    protected synchronized boolean needToSendCreditRequest() {
+    protected boolean needToSendCreditRequest() {
         long current_time=System.nanoTime();
-        // will most likely send a request the first time (last_credit_request is 0), unless nanoTime() is negative
-        if(current_time - last_credit_request >= TimeUnit.NANOSECONDS.convert(max_block_time, TimeUnit.MILLISECONDS)) {
-            last_credit_request=current_time;
-            return true;
+        synchronized(this) {
+            // will most likely send a request the first time (last_credit_request is 0), unless nanoTime() is negative
+            if(current_time - last_credit_request >= TimeUnit.NANOSECONDS.convert(max_block_time, TimeUnit.MILLISECONDS)) {
+                last_credit_request=current_time;
+                return true;
+            }
+            return false;
         }
-        return false;
     }
   
 

@@ -1,5 +1,6 @@
 package org.jgroups.tests;
 
+import org.jgroups.Global;
 import org.jgroups.util.ByteArray;
 import org.jgroups.util.DefaultThreadFactory;
 import org.jgroups.util.StackType;
@@ -26,8 +27,6 @@ public class Probe {
     protected final Set<String>     senders=new HashSet<>();
     protected boolean               weed_out_duplicates;
     protected String                match;
-    protected static final String   DEFAULT_DIAG_ADDR="224.0.75.75";
-    protected static final String   DEFAULT_DIAG_ADDR_IPv6="ff0e::0:75:75";
     protected static final int      DEFAULT_DIAG_PORT=7500;
     protected static final String   MEMBER_ADDRS="member-addrs";
     protected ExecutorService       thread_pool;
@@ -276,7 +275,7 @@ public class Probe {
             if(addrs.isEmpty()) {
                 if(udp) {
                     InetAddress mcast_addr=InetAddress.getByName(ip_version == StackType.IPv6?
-                                                                   DEFAULT_DIAG_ADDR_IPv6 : DEFAULT_DIAG_ADDR);
+                                                                   Global.DEFAULT_DIAG_ADDR_IPv6 : Global.DEFAULT_DIAG_ADDR);
                     if(!addrs.contains(mcast_addr))
                         addrs.add(mcast_addr);
                 }
@@ -304,8 +303,7 @@ public class Probe {
                              "probe.sh keys // dumps all valid commands\n" +
                              "probe.sh jmx=NAKACK // dumps JMX info about all NAKACK protocols\n" +
                              "probe.sh op=STABLE.runMessageGarbageCollection // invokes the method in all STABLE protocols\n" +
-                             "probe.sh jmx=UDP.oob,thread_pool // dumps all attrs of UDP starting with oob* or thread_pool*\n" +
-                             "probe.sh jmx=FLUSH.bypass=true\n");
+                             "probe.sh jmx=UDP.oob,thread_pool // dumps all attrs of UDP starting with oob* or thread_pool*\n");
     }
 
 

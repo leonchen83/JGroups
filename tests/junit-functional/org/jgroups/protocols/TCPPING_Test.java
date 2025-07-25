@@ -22,11 +22,11 @@ public class TCPPING_Test {
 
     @AfterMethod protected void destroy() {Util.close(ch);}
 
-    /** Tests https://issues.jboss.org/browse/JGRP-2168 */
+    /** Tests https://issues.redhat.com/browse/JGRP-2168 */
     public void testSettingInitialHostsProgrammatically() throws Exception {
         TCP transport=new TCP();
         transport.setBindAddress(InetAddress.getLoopbackAddress());
-        transport.setBindPort(9600);
+        transport.setBindPort(9800);
         TCPPING ping=new TCPPING();
         TCPGOSSIP gossip=new TCPGOSSIP();
         List<InetSocketAddress> gossip_router=Collections.singletonList(new InetSocketAddress(InetAddress.getLoopbackAddress(), 12000));

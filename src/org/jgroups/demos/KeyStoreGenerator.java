@@ -12,10 +12,10 @@ import java.security.NoSuchAlgorithmException;
  * Generates a keystore file that has a SecretKey in it. It is not possible to
  * use keytool to achieve this. This is a simple way to generate a
  * JCEKS format keystore and SecretKey.
- * 
+ * <br/>
  * Usage is --alg ALGNAME --size ALGSIZE --storeName FILENAME --storePass
  * PASSWORD --alias KEYALIAS
- * 
+ * <br/>
  * Any of args are optional and will default to
  * <ul>
  * <li>ALGNAME = Blowfish
@@ -34,7 +34,7 @@ public final class KeyStoreGenerator {
     static String keyStoreName="defaultStore.keystore";
     static String storePass="changeit";
     static String alias="myKey";
-    static String storeType="JCEKS";
+    static String storeType="pkcs12";
 
 	private KeyStoreGenerator() {
 		throw new InstantiationError( "Must not instantiate this class" );
@@ -103,12 +103,5 @@ public final class KeyStoreGenerator {
         KeyGenerator keyGen=KeyGenerator.getInstance(sym_alg);
         keyGen.init(key_size);
         return keyGen.generateKey();
-    }
-
-    private static String getAlgorithm(String s) {
-        int index=s.indexOf('/');
-        if(index == -1)
-            return s;
-        return s.substring(0, index);
     }
 }

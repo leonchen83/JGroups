@@ -27,6 +27,10 @@ public class ByteArrayDataInputStream extends InputStream implements DataInput {
         this.pos=checkBounds(offset);
     }
 
+    public ByteArrayDataInputStream(ByteArray buf) {
+        this(buf.getArray(), buf.getOffset(), buf.getLength());
+    }
+
     public ByteArrayDataInputStream(ByteBuffer buffer) {
         int offset=buffer.hasArray()? buffer.arrayOffset() + buffer.position() : buffer.position(),
           len=buffer.remaining();
@@ -48,9 +52,25 @@ public class ByteArrayDataInputStream extends InputStream implements DataInput {
         this.pos=checkBounds(pos); return this;
     }
 
-    public int position() {return pos;}
-    public int limit()    {return limit;}
-    public int capacity() {return buf.length;}
+    public byte[]     buffer()     {return buf;}
+    public ByteArray  getBuffer()  {return new ByteArray(buf, pos, limit-pos);}
+    public ByteBuffer byteBuffer() {return ByteBuffer.wrap(buf, pos, limit-pos);}
+    public int        position()   {return pos;}
+    public int        limit()      {return limit;}
+    public int        capacity()   {return buf.length;}
+
+    /**
+     * Advances the current position without reading any bytes. This can be useful to skip bytes if necessary or if
+     * the byte[] is read externally from this InputStream.
+     * @param amount the amount to move the position forward
+     * @throws IndexOutOfBoundsException if the amount to move and the current position is larger than the limit
+     */
+    public ByteArrayDataInputStream advance(int amount) {
+        if(pos + amount > limit)
+            throw new IndexOutOfBoundsException();
+        pos += amount;
+        return this;
+    }
 
 
 
@@ -148,48 +168,36 @@ public class ByteArrayDataInputStream extends InputStream implements DataInput {
     }
 
     public short readShort() throws IOException {
-        int ch1=read();
-        int ch2=read();
-        if ((ch1 | ch2) < 0)
-            throw new EOFException();
-        return (short)((ch1 << 8) + (ch2 << 0));
+        return (short)readUnsignedShort();
     }
 
     public int readUnsignedShort() throws IOException {
-        int ch1=read();
-        int ch2=read();
-        if ((ch1 | ch2) < 0)
-            throw new EOFException();
-        return (ch1 << 8) + (ch2 << 0);
+        var index=pos;
+        var array=buf;
+        if(index + 2 > limit)
+            throw new IOException();
+        pos += 2;
+        return ((array[index] & 0xFF) << 8) + (array[index + 1] & 0xFF);
     }
 
     public char readChar() throws IOException {
-        int ch1=read();
-        int ch2=read();
-        if ((ch1 | ch2) < 0)
-            throw new EOFException();
-        return (char)((ch1 << 8) + (ch2 << 0));
+        return (char)readUnsignedShort();
     }
 
     public int readInt() throws IOException {
-        int ch1=read();
-        int ch2=read();
-        int ch3=read();
-        int ch4=read();
-        if ((ch1 | ch2 | ch3 | ch4) < 0)
-            throw new EOFException();
-        return ((ch1 << 24) + (ch2 << 16) + (ch3 << 8) + (ch4 << 0));
+        var index=pos;
+        if(index + 4 > limit)
+            throw new IOException();
+        pos += 4;
+        return (int)Util.INT_ARRAY_VIEW.get(buf, index);
     }
 
     public long readLong() throws IOException {
-        return (((long)read() << 56) +
-          ((long)(read() & 0xff) << 48) +
-          ((long)(read() & 0xff) << 40) +
-          ((long)(read() & 0xff) << 32) +
-          ((long)(read() & 0xff) << 24) +
-          ((read() & 0xff) << 16) +
-          ((read() & 0xff) <<  8) +
-          ((read() & 0xff) <<  0));
+        var index=pos;
+        if(index + 8 > limit)
+            throw new IOException();
+        pos += 8;
+        return (long)Util.LONG_ARRAY_VIEW.get(buf, index);
     }
 
     public float readFloat() throws IOException {

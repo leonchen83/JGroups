@@ -32,13 +32,11 @@ packets is preferred to costly retransmission).
 === Transport protocols
 
 A _transport protocol_ refers to the protocol at the bottom of the protocol stack which is
-            responsible for sending messages to and receiving messages from the network. There are a number of transport
-            protocols in JGroups. They are discussed in the following sections.
+responsible for sending messages to and receiving messages from the network. There are a number of transport
+protocols in JGroups. They are discussed in the following sections.
         
 
 A typical protocol stack configuration using UDP is:
-        
-
 
 [source,xml]
 ----
@@ -163,7 +161,6 @@ then send no more messages, then a message batch of 10 will be sent immediately 
 
 If we send 1000 messages of 100 bytes each, then - after exceeding 64'000 bytes (after ca. 64 messages) - we'll
 send the message batch, and this might have taken only 3 ms.
-            
 
 NOTE: Since 3.x, message bundling is the default, and it cannot be enabled or disabled anymore (the config
       is ignored). However, a message can set the `DONT_BUNDLE` flag to skip message bundling. This is only recognized
@@ -185,7 +182,8 @@ If max_bundle_size exceeded, or no more message -> send message batch
                 
 When the message send rate is high and/or many large messages are sent, latency is more or less the time to fill
 `max_bundle_size`. This should be sufficient for a lot of applications. If not, flags `OOB` and `DONT_BUNDLE` can be
-used to bypass bundling.
+used to bypass bundling. Alternatively, `max_bundle_size` can be reduced, so that smaller batches are accumulated
+and sent (it takes less time to fill smaller batches).
 
 
 
@@ -202,14 +200,13 @@ be the address and port number of the _unicast_ socket.
 
 ===== Using UDP and plain IP multicasting
 
-A protocol stack with UDP as transport protocol is typically used with clusters whose members run on
-                    the same host or are distributed across a LAN. Note that before running instances
-                    _in different subnets_, an admin has to make sure that IP multicast is enabled
-                    across subnets. It is often the case that IP multicast is not enabled across subnets.
-                    Refer to section <<ItDoesntWork>> for running a test program that determines whether
-                    members can reach each other via IP multicast. If this does not work, the protocol stack cannot use
-                    UDP with IP multicast as transport. In this case, the stack has to either use UDP without IP
-                    multicasting, or use a different transport such as TCP.
+A protocol stack with UDP as transport protocol is typically used with clusters whose members run on the same host or
+are distributed across a LAN. Note that before running instances _in different subnets_, an admin has to make sure
+that IP multicast is enabled across subnets. It is often the case that IP multicast is not enabled across subnets.
+
+Refer to section <<ItDoesntWork>> for running a test program that determines whether members can reach each other
+via IP multicast. If this does not work, the protocol stack cannot use UDP with IP multicast as transport. In this
+case, the stack has to either use UDP without IP multicasting, or use a different transport such as TCP.
                 
 
 [[IpNoMulticast]]
@@ -371,27 +368,27 @@ Note that the GossipRouter should be started before any of the members.
 ==== TUNNEL
 
 Firewalls are usually placed at the connection to the internet. They shield local networks from outside
-                attacks by screening incoming traffic and rejecting connection attempts to host inside the firewalls by
-                outside machines. Most firewall systems allow hosts inside the firewall to connect to hosts outside it
-                (outgoing traffic), however, incoming traffic is most often disabled entirely.
+attacks by screening incoming traffic and rejecting connection attempts to host inside the firewalls by
+outside machines. Most firewall systems allow hosts inside the firewall to connect to hosts outside it
+(outgoing traffic), however, incoming traffic is most often disabled entirely.
             
 
 _Tunnels_ are host protocols which encapsulate other protocols by multiplexing them
-                at one end and demultiplexing them at the other end. Any protocol can be tunneled by a tunnel protocol.
+at one end and demultiplexing them at the other end. Any protocol can be tunneled by a tunnel protocol.
             
 
 The most restrictive setups of firewalls usually disable _all_ incoming traffic, and
-                only enable a few selected ports for outgoing traffic. In the solution below, it is
-                assumed that one TCP port is enabled for outgoing connections to the GossipRouter.
+only enable a few selected ports for outgoing traffic. In the solution below, it is
+assumed that one TCP port is enabled for outgoing connections to the GossipRouter.
             
 
 JGroups has a mechanism that allows a programmer to tunnel a firewall. The solution involves a
-                GossipRouter, which has to be outside of the firewall, so other members (possibly also behind firewalls)
-                can access it.
+GossipRouter, which has to be outside of the firewall, so other members (possibly also behind firewalls)
+can access it.
             
 
 The solution works as follows. A channel inside a firewall has to use protocol TUNNEL instead of UDP or
-                TCP as transport. The recommended discovery protocol is PING. Here's a configuration:
+TCP as transport. The recommended discovery protocol is PING. Here's a configuration:
             
 
 
@@ -404,26 +401,26 @@ The solution works as follows. A channel inside a firewall has to use protocol T
 ----
 
 TUNNEL uses a GossipRouter (outside the firewall) running on HostA at port
-                +12001+ for tunneling. Note that it is not recommended to use TCPGOSSIP for discovery if
-                TUNNEL is used (use PING instead). TUNNEL accepts one or multiple GossipRouters tor tunneling;
-                they can be listed as a comma delimited list of host[port] elements specified in property
-                gossip_router_hosts.
+`12001` for tunneling. Note that it is not recommended to use TCPGOSSIP for discovery if
+TUNNEL is used (use PING instead). TUNNEL accepts one or multiple GossipRouters tor tunneling;
+they can be listed as a comma delimited list of `host[port]` elements specified in property
+`gossip_router_hosts`.
             
 
 TUNNEL establishes a TCP connection to the _GossipRouter_
-                process (outside the firewall) that accepts messages from members and passes them on to other
-                members. This connection is initiated by the host inside the firewall and persists as long as the channel
-                is connected to a group. A GossipRouter will use the _same connection_
-                to send incoming messages to the channel that initiated the connection. This is perfectly legal, as TCP
-                connections are fully duplex. Note that, if GossipRouter tried to establish its own TCP connection to the
-                channel behind the firewall, it would fail. But it is okay to reuse the existing TCP connection,
-                established by the channel.
+process (outside the firewall) that accepts messages from members and passes them on to other
+members. This connection is initiated by the host inside the firewall and persists as long as the channel
+is connected to a group. A GossipRouter will use the _same connection_
+to send incoming messages to the channel that initiated the connection. This is perfectly legal, as TCP
+connections are fully duplex. Note that, if GossipRouter tried to establish its own TCP connection to the
+channel behind the firewall, it would fail. But it is okay to reuse the existing TCP connection,
+established by the channel.
             
 
 Note that TUNNEL has to be given the hostname and port of the GossipRouter process.
-                This example assumes a GossipRouter is running on HostA at port++12001++.
-                TUNNEL accepts one or multiple router hosts as a comma delimited list of host[port] elements specified in
-                property gossip_router_hosts.
+This example assumes a GossipRouter is running on HostA at port++12001++.
+TUNNEL accepts one or multiple router hosts as a comma delimited list of host[port] elements specified in
+property gossip_router_hosts.
             
 
 Any time a message has to be sent, TUNNEL forwards the message to GossipRouter, which distributes it to
@@ -436,19 +433,19 @@ NOTE: To do so, GossipRouter maintains a mapping between cluster names and membe
 
 
 A GossipRouter is not a single point of failure. In a setup with multiple gossip routers, the routers do
-                not communicate among themselves, and a single point of failure is avoided by having each channel simply
-                connect to multiple available routers. In case one or more routers go down, the cluster members are still
-                able to exchange messages through any of the remaining available router instances, if there are any.
+not communicate among themselves, and a single point of failure is avoided by having each channel simply
+connect to multiple available routers. In case one or more routers go down, the cluster members are still
+able to exchange messages through any of the remaining available router instances, if there are any.
             
 
 For each send invocation, a channel goes through a list of available connections to routers and attempts
-                to send the message on each connection until it succeeds. If a message can not be sent on any of the
-                connections, an exception is raised. The default policy for connection selection is random. However, we
-                provide an plug-in interface for other policies as well.
+to send the message on each connection until it succeeds. If a message can not be sent on any of the
+connections, an exception is raised. The default policy for connection selection is random. However, we
+provide an plug-in interface for other policies as well.
             
 
 The GossipRouter configuration is static and is not updated for the lifetime of the channel. A list of
-                available routers has to be provided in the channel's configuration file.
+available routers has to be provided in the channel's configuration file.
             
 
 To tunnel a firewall using JGroups, the following steps have to be taken:
@@ -494,6 +491,20 @@ connection might use up resources in the host system (e.g. in the GossipRouter),
 problems, second, this scheme is inappropriate when only a few channels are located behind firewalls, and
 the vast majority can indeed use IP multicast to communicate, and finally, it is not always possible to
 enable outgoing traffic on 2 ports in a firewall, e.g. when a user does not 'own' the firewall.
+
+==== Health checks
+A TUNNEL detects *crashes* of GosspRouters quickly: when the TCP connection to a GossipRouter is closed, TUNNEL
+will add the crashed GossipRouter to a reconnect list, and periodically (`reconnect_interval`) try to
+re-establish a connection.
+
+However, when a GossipRouter *hangs*, e.g. due to a blocked port in the firewall, or due to a failed switch, then
+the TCP connection will not be closed and traffic will continue to be sent to that router. This can potentially
+even block the client on a full TCP send-window.
+
+To be able to close connections to unresponding GossipRouters, a health check has been added to TUNNEL. It can be
+activated by setting `heartbeat_interval` (ms) to a positive value (`0` disables health checking). This means that
+TUNNEL sends a heartbeat to each GossipRouter it is connected to. When no response has been received for
+`heartbeat_timeout` ms, then the connection to that GossipRouter will be closed.
             
 
 
@@ -585,8 +596,8 @@ message 5. Alternatively, the application might receive a message batch containi
 through that batch, message 4 will be consumed before message 5.
 
 Regular messages from different senders P and Q are delivered in parallel. E.g if P sends 4 and 5 and Q sends 56 and 57,
-then the `receive()` callback might get invoked in parallel for P4 and Q57. Therefore the `receive()` callbacks
-have to be thread-safe.
+then the `receive()` callback might get invoked in parallel for P4 and Q57. Therefore the `receive()` callback
+has to be thread-safe.
 
 In contrast, OOB messages are delivered in an undefined order, e.g. messages P4 and P5 might get delivered as P4 -> P5
 (P4 followed by P5) in some receivers and P5 -> P4 in others. It is also possible that P4 is delivered in parallel with
@@ -594,6 +605,54 @@ P5, each message getting delivered by a different thread.
 
 The only guarantee for both regular and OOB messages is that a message will get delivered exactly once. Dropped messages
 are retransmitted and duplicate messages are dropped.
+
+[[MessageProcessingPolicy]]
+==== Message processing policy
+
+When a message or message batch is received, it is forwarded to an implementation of `MessageProcessingPolicy`. The
+policy defines how to deliver a message / batch. A number of predefined policies are provided, but custom policies
+can be used: to do this, `message_processing_policy` can be set to the fully qualified name of a class implementing
+`MessageProcessingPolicy`.
+
+The following policies are provided:
+
+.MessageProcessingPolicy implementations
+[options="header",cols="2,10"]
+|===============
+|Name|Description
+
+| `submit` | `SubmitToThreadPool`. Messages and batches are handed to the thread pool for delivery. E.g. if we receive
+`A:7`, `B:22`, `A:8` and a batch `B:23-30`, then we'll use 4 threads from the thread pool to deliver the 3 messages and
+the batch. Contrast this to `max`, which uses 2 threads (see below). +
+This is the default for OOB messages/batches, as they can be delivered in any order. Can be used for regular messages /
+batches, too, but not very efficient as they will get reordered in `NAKACK-X` / `UNICAST-X` again. +
+The main advantage of `submit` is that independent messages/batches can be processed *concurrently* by the application;
+in a message batch, messages are processed one-by-one, delaying messages at the tail of the batch by the time it
+takes to process messages ahead of them.
+
+| `max` | `MaxOneThreadPerSender`, subclass of `SubmitToThreadPool`. Default policy. OOB messages/batches are passed to
+the superclass (`SubmitToThreadPool`). +
+Regular messages/batches are queued: one queue exists for each sender. When a message/batch is received, it is added
+to the corresponding queue. If no thread is processing that queue, a new thread from the pool is started to process
+all messages from that queue, until empty, then the thread terminates. +
+This ensures that at max one thread is delivering messages/batches from a given sender. In the example above, we'd have
+2 threads delivering messages/batches: one for `A:7-8` and the other for `B22-30`. +
+
+| `unbatch` | `UnbatchOOBBatches`, subclass of `MaxOneThreadPerSender`. This policy passes message batches up to
+`max_size` up to the `SubmitToThreadPool` policy. When `max_size` is exceeded, then all messages in the batch are
+passed to the thread pool one by one. +
+Example with `max_size=5`: an OOB batch of 4 is passed up to `submit`. An OOB batch of 6 is not passed up, but the 6
+messages are each passed up by a separate thread from the pool (6 threads). +
+The idea of `unbatch` is that when the average processing time per message is large, then the messages toward the tail
+of the batch are disadvantaged; processing all messages in separate threads is faster. See <<MessageBatch>> for
+details. +
+The max size can be defined in the configuration as follows:
+`<TCP message_processing_policy="unbatch" msg_processing_policy.max_size="5">`
+
+| `direct` | `PassRegularMessagesUpDirectly`, subclass of `SubmitToThreadPool`. OOB messages/batches are handled by
+`SubmitToThreadPool`. Regular messages/batches are passed up on the same thread (the one that read from the network). +
+Experimental, used to measure performance. Might get removed soon.
+|===============
 
 
 [[OOB]]
@@ -889,40 +948,6 @@ Of course, the above mechanism requires that at least 3 nodes are up at any give
                 better than shutting the entire cluster down. 
             
 
-[[Flushing]]
-
-
-=== Flushing: making sure every node in the cluster received a message
-
-To change this, we can turn on virtual synchrony (by adding `FLUSH` to the top of the stack), which guarantees that
-            
-* A message M sent in V1 will be delivered in V1. So, in the example above, M1 would get delivered in
-  view V1; by A, B and C, but not by D.
-* The set of messages seen by members in V1 is the same for all members before a new view V2 is installed.
-  This is important, as it ensures that all members in a given view see the same messages. For example,
-  in a group {A,B,C}, C sends 5 messages. A receives all 5 messages, but B doesn't. Now C crashes before
-  it can retransmit the messages to B. FLUSH will now ensure, that before installing V2={A,B} (excluding
-  C), B gets C's 5 messages. This is done through the flush protocol, which has all members reconcile
-  their messages before a new view is installed. In this case, A will send C's 5 messages to B.
-                
-
-Sometimes it is important to know that every node in the cluster received all messages up to a certain point,
-even if there is no new view being installed. To do this (initiate a manual flush), an application programmer
-can call `JChannel.startFlush()` to start a flush and `JChannel.stopFlush()` to terminate it.
-        
-
-`JChannel.startFlush()` flushes all pending messages out of the system. This stops all senders (calling
-`JChannel.down()` during a flush will block until the flush has completed)footnote:[Note that block()
-will be called in a Receiver when the flush is about to start and unblock() will be called when it ends].
-When `startFlush()` returns, the caller knows that (a) no messages will get sent anymore until `stopFlush()` is
-called and (b) all members have received all messages sent before `startFlush()` was called.
-
-`JChannel.stopFlush()` terminates the flush protocol, no blocked senders can resume sending messages.
-        
-Note that the `FLUSH` protocol has to be present on top of the stack, or else the flush will fail.
-        
-
-
 
 === Large clusters
 
@@ -1065,18 +1090,15 @@ next-in-line (B) takes over and starts relaying.
 Relaying is done via the RELAY2 protocol added to the top of the stack. The bridge is configured with
 the bridge_props property, e.g. bridge_props="/home/bela/tcp.xml". This creates a JChannel inside RELAY2.
 
-
-Note that property "site" must be set in both subclusters. In the example above, we could set site="nyc"
-for the NYC subcluster and site="sfo" for the SFO subcluster.
-
+Note that property `site` must be set in both subclusters. In the example above, we could set `site="nyc"`
+for the NYC subcluster and `site="sfo"` for the SFO subcluster.
 
 The design is described in detail in JGroups/doc/design/RELAY2.txt (part of the source distribution). In
 a nutshell, multicast messages received in a local cluster are wrapped and forwarded to the remote cluster
 by a relay (= the coordinator of a local cluster). When a remote cluster receives such a message, it is
 unwrapped and put onto the local cluster.
 
-
-JGroups uses subclasses of UUID (PayloadUUID) to ship the site name with an address. When we see an address
+JGroups uses subclasses of UUID to ship the site name with an address. When we see an address
 with site="nyc" on the SFO side, then RELAY2 will forward the message to the SFO subcluster, and vice versa.
 
 When C multicasts a message in the NYC cluster, A will forward it to D, which will re-broadcast the message on
@@ -1107,7 +1129,6 @@ To use RELAY2, it has to be placed at the top of the configuration, e.g.:
 
 [source,xml]
 ----
-
 <relay.RELAY2 site="LON" config="/home/bela/relay2.xml"
               relay_multicasts="true" />
 ----
@@ -1116,7 +1137,7 @@ The above configuration has a site name which will be used to route messages bet
             contain the site-ID, so we always know which site the address is from. E.g. an address A1:LON in the SFO site
             is not local, but will be routed to the remote site LON.
 
-The relay_multicasts property determines whether or not multicast messages (with dest = null) are relayed to
+The `relay_multicasts` property determines whether or not multicast messages (with dest = null) are relayed to
             the other sites, or not. When we have a site LON, connected to sites SFO and NYC, if a multicast message is
             sent in site LON, and relay_multicasts is true, then all members of sites SFO and NYC will receive the message.
         
@@ -1232,7 +1253,6 @@ Invoking RPCs across sites is more or less transparent, except for the case when
 
 [source,java]
 ----
-
 List<Address> dests=new ArrayList<Address>(view.getMembers());
 dests.add(new SiteMaster("SFO"));
 RspList<Object> rsps;
@@ -1244,7 +1264,6 @@ for(Rsp rsp: rsps.values()) {
     else
         System.out.println("<< " + rsp.getValue() + " from " + rsp.getSender());
 }
-            
 ----
 
 First, we add the members (A1 and A2) of the current (local) view to the destination set. Then we add the
@@ -1317,7 +1336,260 @@ mcast lon sfo nyc
 
 to invoke RPCs on all local members and site masters SFO, NYC and LON. If one of the sites is down,
 you'll get a message stating the site is unreachable.
-            
+
+[[Relay3Advanced]]
+=== Hierarchical/asymmetric routing with RELAY3
+
+`RELAY3` is the successor to `RELAY2`. It has been refactored to concentrate the entire routing logic in a single place,
+and it provides _asymmetric (hierarchical) routing_. Contrary to RELAY2, this means that sites are not necessarily
+connected to all other sites.
+
+CAUTION: RELAY2 and RELAY3 are *not compatible*, and can therefore not be used in the same network.
+
+For example, in <<AsymmetricRouting>>, we have sites `HF`, `NET1`, `NET2` and `NET3`:
+
+[[AsymmetricRouting]]
+.Asymmetric routing with RELAY3
+image::./images/network.png[RELAY3,width="100%"]
+
+HF is connected to NET1, which in turn is connected to NET2, and NET2 is connected to NET3.
+
+When a member in HF wants to send a message to a member in site NET3, it first needs to send it to the _gateway site_
+NET1. The site master in NET1 sees that the target site is not local, and therefore forwards the message according to
+forwarding rules (discussed below). This means that the message is sent to site NET2, which forwards it to the final
+destination NET3. There, the site master sees that the target site is local and sends the message to the corresponding
+member in site NET3.
+
+==== Forwarding rules
+A forwarding rules defines how to process messages whose target site is not local and not a directly connected site.
+E.g.:
+
+[source,xml]
+----
+<bridges>
+    <bridge name="bridge-net1-net2" config="/Users/bela/bridge-net1-net2.xml"/>
+    <bridge name="bridge-net1-hf"   config="/Users/bela/bridge-net1-hf.xml"/>
+</bridges>
+<forwards>
+    <forward to="net3" gateway="net2"/> <1>
+</forwards>
+----
+
+The snippet above is from NET1. It defines 2 bridges, namely one to site NET2 and one to HF. This means that site NET1
+is directly connected to sites HF and NET2 (see <<AsymmetricRouting>> above).
+
+The new part is the `<forwards/>` section, which defines a rule how to send messages from the local site (NET1) to
+site NET3. Because messages from NET1 can reach NET3 only through _gateway site_ NET2, the forwarding rule as shown
+in (1) is added. This means that all messages to site "net3" have to be forwarded to (gateway) site "net2".
+
+It is also possible to use wildcards in forwarding rules:
+[source,xml]
+----
+<forwards>
+    <forward to=".*" gateway="net2"/>
+</forwards>
+----
+
+This is from NET3 and defines that all messages that are not local should be forwarded via gateway site NET2.
+
+==== Sending a message to all site masters
+The `SiteMaster(String site)` can be used to send a message to the site master of `site`. RELAY3 now allows for `site` to be null: this means that a message is sent to *all* site masters.
+
+==== Getting information about the topology
+RELAY3 added functionality to fetch the topology, ie. information about all sites and their members across an
+entire network. In addition, callbacks can be registered when a member join or leaves *anywhere* in the network, ie.
+in any site, or when a site goes down or comes up.
+
+To fetch the current topology, the following code can be used:
+[source,java]
+----
+JChannel ch;
+RELAY r=ch.getProtocolStack().findProtocol(RELAY.class);
+Topology topo=r.topo();
+Map<String,View> m=topo.cache(); // all sites and their views
+// alternatively:
+System.out.printf("sites:\n%s\n", topo.print());
+----
+
+To get notified when a member joins or leaves, a view handler can be registered with `Topology`:
+[source,java]
+----
+topo.setViewHandler((s,v) -> System.out.printf("site %s: new view: %s\n", s, v));
+----
+
+To register when a site goes down or comes up, `RELAY.setRouteStatusListener(RouteStatusListener l)` can be used.
+
+There's an additional callback in `RELAY3` to register when a member becomes site master, or ceases to be
+site master: `setSiteMasterListener(Consumer<Boolean> l)`. The argument is `true` when the member just became
+site master, and `false` otherwise.
+
+==== Samples
+The definition of the network described above (<<AsymmetricRouting>>) is defined in 4 configuration files in
+link:$$https://github.com/belaban/JGroups/tree/master/conf/relay/$$[]: `hf.xml`, `net1.xml`, `net2.xml` and `net3.xml`.
+
+The 3 bridges are defined in the 3 `bridge-*.xml` files.
+
+To use the config files to run a demo (e.g. `RelayDemo`), the IP addresses of the files have to be changed.
+
+A sample config (e.g. net1.xml) looks as follows (edited for brevity):
+[[ReliableRELAY3]]
+[source,xml]
+----
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xmlns="urn:org:jgroups"
+        xsi:schemaLocation="urn:org:jgroups http://www.jgroups.org/schema/jgroups.xsd">
+    <UDP
+         bind_addr="192.168.2.2"
+         bind_port="7000"
+         mcast_addr="225.0.0.1" />
+
+    <PING />
+    <pbcast.NAKACK2 xmit_interval="500"
+                    discard_delivered_msgs="true" />
+    <relay.RELAY3 site="net1"
+                 max_site_masters="1"
+                 can_become_site_master="true">
+        <RelayConfiguration xmlns="urn:jgroups:relay:1.0"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                    xsi:schemaLocation="urn:jgroups:relay:1.0 relay.xsd">
+            <sites>
+                <site name="net1">
+                    <bridges>
+                        <bridge name="bridge-net1-net2" config="/Users/bela/bridge-net1-net2.xml"/>
+                        <bridge name="bridge-net1-hf"   config="/Users/bela/bridge-net1-hf.xml"/>
+                    </bridges>
+                    <forwards>
+                        <forward to="net3" gateway="net2"/>
+                    </forwards>
+                </site>
+            </sites>
+        </RelayConfiguration>
+    </relay.RELAY3>
+    <UNICAST3 xmit_interval="500" />
+    <pbcast.STABLE desired_avg_gossip="50000"
+                   max_bytes="8m"/>
+    <pbcast.GMS print_local_addr="true" join_timeout="1000" />
+</config>
+----
+
+NOTE: The above configuration requires modifications; `bind_addr`, `mcast_addr` and the location of the bridge files
+(e.g. `/Users/bela/bridge-net1-net2.xml`) need to be changed.
+
+==== Reliability of messages across sites
+
+A downside of `RELAY2` has always been that messages between sites can be dropped, e.g. in the following scenario:
+
+[ditaa]
+----
+              LON                                             NYC
+
+       +----+     +----+       bridge LON to NYC      +----+      +----+
+       |  B |     |  A | ---------------------------> |  D |      |  E |
+       +----+     +----+                              +----+      +----+
+                     ^                                   |
+                     |                                   |
+          +--+--+    |                                   |    +----+
+          |  C  |----+                                   +--> |  F |
+          +-----+                                             +----+
+----
+
+* Sites LON with members {A,B,C} and NYC with {D,E,F}; A and D are site masters
+* C:lon sends a message M to F:nyc
+** This means C:lon sends M to A:lon, which forwards it to D:nyc, which then forwards it to F:nyc
+* Before F:nyc receives M, the following can happen:
+** Site master A crashes. Although B will become site master a few milliseconds later -> M is lost
+** Site master D:nyc crashes. Before E:nyc can take over -> M is lost
+
+Applications would typically either use blocking RPCs or some ack to know that a message was received by the target
+in a different site.
+
+The reason for the potential loss of M is that *M is not retransmitted across sites*, unlike in the local cluster.
+
+Enter `RELAY3`: the configuration in <<ReliableRELAY3>> above has `UNICAST3` *above* `RELAY3`, so unicasts will be
+retransmitted, regardless of whether the destination is in the local cluster or in a remote site. This looks as follows:
+
+[ditaa]
+----
+          LON                                                                 NYC
+
+     +----------+                                                        +----------+
+     |    GMS   |                                                        |   GMS    |
+     +----------|                                                        +----------+
+     | UNICAST3 |                  bridge LON  to NYC                    |          |
+     +----------+                                                        +----------+
+     |  RELAY3  | <---> +----------+               +------------+ <----> |  RELAY3  |
+     +----------+       |   GMS    |               |    GMS     |        +----------+
+     | NAKACK2  |       +----------+               +------------+        |  NAKACK2 |
+     +----------+       | UNICAST3 |               |  UNICAST3  |        +----------+
+     |   ...    |       +----------+               +------------|        |    ...   |
+     +----------+       |  NAKACK2 |               |  NAKACK2   |        +----------+
+     |   UDP    |       +----------+               +------------+        |   UDP    |
+     +----------+       |    ...   |               |     ...    |        +----------+
+                        +----------+               +------------+
+                        |    TCP   | <-----------> |     TCP    |
+                        +----------+               +------------+
+----
+
+NOTE: Reliability currently applies only to unicast messages, not to multicast messages! Reliable multicast messages
+will be investigated in https://issues.redhat.com/browse/JGRP-2738.
+
+Of course, `RELAY3` can still be on top of the stack, above `UNICAST3`, but then unicast messages wold not get
+retransmitted, resulting in the same behavior as with `RELAY2`.
+
+However, the above configuration is recommended for `RELAY3`. If a specific messages doesn't need to be retransmitted
+across sites, flag `NO_RELIABILITY` can be set. This allows a user to define on a per-message basis whether or not to
+enable or disable retransmission across sites.
+
+In the example above, the following would happen:
+
+* Site master A crashes:
+** M is retransmitted
+** B becomes site master -> retransmission ensures that B will eventually receive M
+* Site master D:nyc crashes
+** M is retransmitted
+** New site master E:nyc receives and forwards M to F:nyc
+
+
+===== Stopping of retransmission to dead members / sites
+In the above example, retransmission of M ensures that M will eventually be received. However, what happens when F:nyc
+crashes, or the entire site "nyc" crashes?
+
+When F:nyc crashes, the site master of "nyc" (either D or E) sends a MBR-UNREACHABLE message back to the sender
+of M (C:lon). This triggers 2 actions:
+
+* C's `RouteStatusListener.memberUnreachable(Address m)` method (in `RELAY3`) will be invoked
+* In `UNICAST3` of C, the sender entry for F:nyc will be removed, stopping retransmission of M
+
+When members D, E and F of site "nyc" crash, then a SITE-UNREACHABLE message will be sent to C:lon. This causes 2 actions:
+
+ * C's `RouteStatusListener.siteUnreachable()` method (in `RELAY3`) will be invoked
+ * In `UNICAST3` of C, the sender entry for F:nyc will be removed, stopping retransmission of M
+
+
+==== Multiple site masters with RELAY3
+When we have multiple site masters (e.g. `RELAY3.max_site_masters="2"`), then messages between sites can be routed
+through a different site master every time when the `SiteMasterPicker` uses a load balancing strategy.
+
+This is fine when the target is a unicast destination, e.g. F:nyc in the example above.
+
+However, when the destination is a site master (e.g. `SiteMaster("nyc"`), then the following issue exists:
+
+* C:lon sends 5 unicast messages to `SiteMaster("nyc")"`
+* For messages 1-3, site master A:lon picks D:nyc
+* For messages 4-5, A:lon picks E:nyc
+* C:lon get acks for messages 1-2 from D:nyc, and removes these messages from its send table
+* E:nyc sees message 4-5 from C:lon, and asks C:lon for the first message
+* C:lon sends message 3 as its first message to E:nyc
+
+So D:nyc received messages 1-3, and E:nyc received messages 3-5 -> message 3 was received by both site masters. Even
+worse, depending on when A:lon gets the ack from D:nyc (for example, later), it might resend messages 1-3 to E:nyc.
+
+To avoid these duplicate messages, the site master picker in RELAY3 is by default set to `StickySiteMasterPicker`. This
+implementation caches the site master it picked for a given sender, and picks a random site master if not yet cached.
+In the above example, site master A:lon would therefore either pick D:nyc or E:nyc, but stick with the selected
+site master once it has picked one. It would therefore send all 5 messages to either D:nyc or E:nyc, and continue to
+do so until the selected site master crashed, and then select a new one.
+
 
 [[DaisyChaining]]
 === Daisychaining
@@ -1466,14 +1738,11 @@ Message msg=new BytesMessage().setFlag(Message.Flag.OOB, Message.Flag.NO_FC);
 ----
 
 Here we tag the message to be OOB (out of band) and to bypass flow control.
-        
 
-The advantage of tagging messages is that we don't need to change the configuration, but instead
-            can override it on a per-message basis.
-        
+The advantage of tagging messages is that we don't need to change the configuration, but instead can override it
+on a per-message basis.
 
 The available flags are:
-        
 
 Message.OOB:: This tags a message as out-of-band, which will get it processed by the out-of-band thread
               pool at the receiver's side. Note that an OOB message does not provide any ordering guarantees,
@@ -1529,6 +1798,10 @@ Message.DONT_LOOPBACK:: If this flag is set and the message is a multicast messa
                     
 NOTE: Note that `DONT_LOOPBACK` does not make any sense for _unicast_ messages,
       as the sender of a message sent to itself will never receive it.
+
+Message.DONT_BLOCK::
+If set, the message will be dropped if the TransferQueueBundler's queue is full, rather than the sender thread
+blocking. This means, the message will not block on the send in the transport.
 
 
 [[PerformanceTests]]
@@ -1794,20 +2067,20 @@ The way probe works is that every stack has an additional multicast socket that 
 [options="header",cols="3,10"]
 |===============
 |Name|Description
-|enable_diagnostics|
-                            Whether or not to enable diagnostics (default: true). When enabled, this will create
-                            a MulticastSocket and we have one additional thread listening for probe requests. When
-                            disabled, we'll have neither the thread nor the socket created.
-|diag_enable_udp|Use a multicast socket to listen for probe requests
+|diag.enabled|
+              Whether or not to enable diagnostics (default: true). When enabled, this will create
+              a MulticastSocket and we have one additional thread listening for probe requests. When
+              disabled, we'll have neither the thread nor the socket created.
+|diag.enable_udp|Use a multicast socket to listen for probe requests
 
-|diag_enable_tcp|Use a TCP socket to listen for probe requests (ignored if `enable_diagnostics` is false)
+|diag.enable_tcp|Use a TCP socket to listen for probe requests (ignored if `enable_diagnostics` is false)
 
-|diagnostics_addr| The multicast address which the MulticastSocket should join. The default is
-                   `224.0.75.75` for IPv4 and `ff0e::0:75:75` for IPv6.
+|diag.mcast_addr| The multicast address which the MulticastSocket should join. The default is
+                  `224.0.75.75` for IPv4 and `ff0e::0:75:75` for IPv6.
 
-|diagnostics_bind_addr|Bind address for diagnostic probing. Used when diag_enable_tcp is true")
+|diag.bind_addr|Bind address for diagnostic probing. Used when diag_enable_tcp is true")
 
-|diagnostics_port|The port on which the MulticastSocket should listen. The default is `7500`.
+|diag.port|The port on which the MulticastSocket should listen. The default is `7500`.
 |===============
 
 
@@ -1866,7 +2139,7 @@ However, we can also JMX information from a specific protocol, e.g. FRAG2 (sligh
 
 ----
 
-[linux]/home/bela$ probe.sh  jmx=FRAG2
+[linux]/home/bela$ probe.sh FRAG2
 
 -- send probe on /224.0.75.75:7500
 
@@ -1909,7 +2182,7 @@ We can also get information about specific properties in a given protocol:
 
 ----
 
-[belasmac] /Users/bela$ probe.sh  jmx=NAKACK2.xmit
+[belasmac] /Users/bela$ probe.sh NAKACK2.xmit
 
 -- sending probe on /224.0.75.75:7500
 
@@ -1936,7 +2209,7 @@ all cluster members. We can also pass a list of attributes:
 
 
 ----
-[belasmac] /Users/bela$ probe.sh jmx=NAKACK2.xmit,num
+[belasmac] /Users/bela$ probe.sh NAKACK2.xmit,num
 
 -- sending probe on /224.0.75.75:7500
 
@@ -1959,13 +2232,11 @@ This returns all attributes of NAKACK2 that start with `"xmit"` or `"num"`.
         
 
 To invoke an operation, e.g. to set the logging level in all UDP protocols from "warn" to "trace", we
-can use `probe.sh op=UPD.setLevel["trace"]`. This raises the logging level in all
+can use `probe.sh UPD.setLevel["trace"]`. This raises the logging level in all
 UDP protocols of all cluster members, which is useful to diagnose a running system.
-        
 
 Operation invocation uses reflection, so any method defined in any protocol can be invoked. This is
 a powerful tool to get diagnostics information from a running cluster.
-        
 
 For further information, refer to the command line options of probe (`probe.sh -h`).
 
@@ -2062,8 +2333,8 @@ The example output shows stats for members C, A, B and D. When looking at the ou
 To reset the numbers, `probe.sh rpcs-reset` can be called.
 
 ==== Using probe with TCP
-Probe uses IP multicasting by default. To enable TCP, `diag_enable_tcp` has to be set to true in the transport
-(and optionally `diag_enable_udp` to false).
+Probe uses IP multicasting by default. To enable TCP, `diag.enable_tcp` has to be set to true in the transport
+(and optionally `diag.enable_udp` to false).
 
 Probe can then be started by pointing it to the address of one member,
 using the `-addr` argument, e.g.: `probe.sh -addr 192.168.1.105 -port 7500` (note that port 7500 can be omitted, as
@@ -2094,7 +2365,7 @@ binding to the loopback (127.0.0.1) device and ports starting from 7800, the fol
 <config>
     <UDP
          bind_addr="127.0.0.1" bind_port="7800"
-         mcast_addr="228.2.2.2"
+         mcast_addr="239.2.2.2"
          mcast_port="${jgroups.udp.mcast_port:45588}">
     ...
 </config>
@@ -2110,37 +2381,37 @@ like this (edited):
 
 ----
 [belasmac] /Users/bela$ jt ParseMessages -file bela.dump6
-1: [B to 192.168.1.105:7800, 33 bytes, flags=OOB|DONT_BUNDLE|INTERNAL], hdrs: TCPPING: [GET_MBRS_REQ cluster=draw initial_discovery=true], TP: [cluster=draw]
-2: [A to B, 33 bytes, flags=OOB|DONT_BUNDLE|INTERNAL], hdrs: TCPPING: [GET_MBRS_RSP cluster=null initial_discovery=false], TP: [cluster=draw]
-3: [B to A, 0 bytes, flags=OOB|INTERNAL], hdrs: GMS: GmsHeader[JOIN_REQ]: mbr=B, UNICAST3: DATA, seqno=1, first, TP: [cluster=draw]
-4: [A to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_SOCK: I_HAVE_SOCK, mbr=A, sock_addr=192.168.1.105:9000, TP: [cluster=draw]
+1: [B to 192.168.1.105:7800, 33 bytes, flags=OOB|DONT_BUNDLE], hdrs: TCPPING: [GET_MBRS_REQ cluster=draw initial_discovery=true], TP: [cluster=draw]
+2: [A to B, 33 bytes, flags=OOB|DONT_BUNDLE], hdrs: TCPPING: [GET_MBRS_RSP cluster=null initial_discovery=false], TP: [cluster=draw]
+3: [B to A, 0 bytes, flags=OOB], hdrs: GMS: GmsHeader[JOIN_REQ]: mbr=B, UNICAST3: DATA, seqno=1, first, TP: [cluster=draw]
+4: [A to <all>, 0 bytes, hdrs: FD_SOCK: I_HAVE_SOCK, mbr=A, sock_addr=192.168.1.105:9000, TP: [cluster=draw]
 5: batch to B from A (1 messages):
-    1: [33 bytes, flags=OOB|DONT_BUNDLE|INTERNAL], hdrs: TCPPING: [GET_MBRS_RSP cluster=null initial_discovery=false]
+    1: [33 bytes, flags=OOB|DONT_BUNDLE], hdrs: TCPPING: [GET_MBRS_RSP cluster=null initial_discovery=false]
 6: batch to B from A (1 messages):
-    1: [0 bytes, flags=INTERNAL], hdrs: FD_SOCK: WHO_HAS_SOCK, mbr=B
+    1: [0 bytes, hdrs: FD_SOCK: WHO_HAS_SOCK, mbr=B
 7: [A to <all>, 57 bytes], hdrs: GMS: GmsHeader[VIEW], NAKACK2: [MSG, seqno=1], TP: [cluster=draw]
-8: [A to B, 61 bytes, flags=INTERNAL], hdrs: GMS: GmsHeader[JOIN_RSP], UNICAST3: DATA, seqno=1, first, TP: [cluster=draw]
-9: [B to A, 0 bytes, flags=INTERNAL], hdrs: FD_SOCK: I_HAVE_SOCK, mbr=B, sock_addr=192.168.1.105:9001, TP: [cluster=draw]
-10: [B to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_SOCK: I_HAVE_SOCK, mbr=B, sock_addr=192.168.1.105:9001, TP: [cluster=draw]
-11: [B to A, 0 bytes, flags=INTERNAL], hdrs: FD_SOCK: GET_CACHE, TP: [cluster=draw]
-12: [A to B, 54 bytes, flags=INTERNAL], hdrs: FD_SOCK: GET_CACHE_RSP, TP: [cluster=draw]
-13: [B to A, 0 bytes, flags=OOB|INTERNAL], hdrs: GMS: GmsHeader[VIEW_ACK], UNICAST3: DATA, seqno=2, TP: [cluster=draw]
-14: [A to B, 0 bytes, flags=INTERNAL], hdrs: UNICAST3: ACK, seqno=2, ts=1, TP: [cluster=draw]
-15: [B to A, 0 bytes, flags=INTERNAL], hdrs: UNICAST3: ACK, seqno=1, ts=1, TP: [cluster=draw]
-16: [A to <all>, 0 bytes, flags=OOB|INTERNAL], hdrs: NAKACK2: [HIGHEST_SEQNO, seqno=1], TP: [cluster=draw]
-17: [A to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
-18: [B to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+8: [A to B, 61 bytes], hdrs: GMS: GmsHeader[JOIN_RSP], UNICAST3: DATA, seqno=1, first, TP: [cluster=draw]
+9: [B to A, 0 bytes], hdrs: FD_SOCK: I_HAVE_SOCK, mbr=B, sock_addr=192.168.1.105:9001, TP: [cluster=draw]
+10: [B to <all>, 0 bytes], hdrs: FD_SOCK: I_HAVE_SOCK, mbr=B, sock_addr=192.168.1.105:9001, TP: [cluster=draw]
+11: [B to A, 0 bytes], hdrs: FD_SOCK: GET_CACHE, TP: [cluster=draw]
+12: [A to B, 54 bytes], hdrs: FD_SOCK: GET_CACHE_RSP, TP: [cluster=draw]
+13: [B to A, 0 bytes, flags=OOB], hdrs: GMS: GmsHeader[VIEW_ACK], UNICAST3: DATA, seqno=2, TP: [cluster=draw]
+14: [A to B, 0 bytes], hdrs: UNICAST3: ACK, seqno=2, ts=1, TP: [cluster=draw]
+15: [B to A, 0 bytes], hdrs: UNICAST3: ACK, seqno=1, ts=1, TP: [cluster=draw]
+16: [A to <all>, 0 bytes, flags=OOB], hdrs: NAKACK2: [HIGHEST_SEQNO, seqno=1], TP: [cluster=draw]
+17: [A to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+18: [B to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
 19: [B to <all>, 13 bytes], hdrs: NAKACK2: [MSG, seqno=1], TP: [cluster=draw]
 ...
 45: [B to <all>, 13 bytes], hdrs: NAKACK2: [MSG, seqno=27], TP: [cluster=draw]
 46: [A to <all>, 13 bytes], hdrs: NAKACK2: [MSG, seqno=2], TP: [cluster=draw]
 ...
 70: [A to <all>, 13 bytes], hdrs: NAKACK2: [MSG, seqno=25], TP: [cluster=draw]
-71: [A to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
-72: [B to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
-73: [A to <all>, 0 bytes, flags=OOB|INTERNAL], hdrs: NAKACK2: [HIGHEST_SEQNO, seqno=25], TP: [cluster=draw]
+71: [A to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+72: [B to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+73: [A to <all>, 0 bytes, flags=OOB], hdrs: NAKACK2: [HIGHEST_SEQNO, seqno=25], TP: [cluster=draw]
 74: [B to A, 0 bytes, flags=OOB], hdrs: GMS: GmsHeader[LEAVE_REQ]: mbr=B, UNICAST3: DATA, seqno=3, TP: [cluster=draw]
-75: [A to B, 0 bytes, flags=OOB|NO_RELIABILITY|INTERNAL], hdrs: GMS: GmsHeader[LEAVE_RSP], TP: [cluster=draw]
+75: [A to B, 0 bytes, flags=OOB|NO_RELIABILITY], hdrs: GMS: GmsHeader[LEAVE_RSP], TP: [cluster=draw]
 ----
 
 This shows a typical conversation between A (coordinator) and B: B sends a discovery request, finds A and asks it to join
@@ -2174,9 +2445,9 @@ To parse this file and extract only the data sections, `tshark` can be used:
 1: [21e26d56-2928-7008-1168-0fcf2d2f2b9d to <all>, 13 bytes], hdrs: NAKACK2: [MSG, seqno=118], TP: [cluster=draw]
 ...
 32: [21e26d56-2928-7008-1168-0fcf2d2f2b9d to <all>, 13 bytes], hdrs: NAKACK2: [MSG, seqno=149], TP: [cluster=draw]
-33: [21e26d56-2928-7008-1168-0fcf2d2f2b9d to <all>, 0 bytes, flags=OOB|INTERNAL], hdrs: NAKACK2: [HIGHEST_SEQNO, seqno=149], TP: [cluster=draw]
-34: [21e26d56-2928-7008-1168-0fcf2d2f2b9d to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
-35: [89a4b2f9-c15e-d276-88a5-a01f8cbde58a to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+33: [21e26d56-2928-7008-1168-0fcf2d2f2b9d to <all>, 0 bytes, flags=OOB], hdrs: NAKACK2: [HIGHEST_SEQNO, seqno=149], TP: [cluster=draw]
+34: [21e26d56-2928-7008-1168-0fcf2d2f2b9d to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+35: [89a4b2f9-c15e-d276-88a5-a01f8cbde58a to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
 ----
 
 The `-r` options reads packets from the given input file and the `-Tfields -edata` options extract the data portion
@@ -2193,17 +2464,17 @@ In the example below (edited), however, we're piping (options `-U` `-w -`) the c
 ----
 [belasmac] /Users/bela$ sudo tcpdump -n -U -i lo0 -w -  tcp and portrange 7800-7801 |tshark -l -r - -Tfields -edata|jt ParseMessages -tcp
 tcpdump: listening on lo0, link-type NULL (BSD loopback), capture size 262144 bytes
-1: [c0b6a011-16f9-699d-dd8c-68f6cc880ddd to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
-2: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+1: [c0b6a011-16f9-699d-dd8c-68f6cc880ddd to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+2: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
 3: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 13 bytes], hdrs: NAKACK2: [MSG, seqno=426], TP: [cluster=draw]
-4: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 0 bytes, flags=OOB|INTERNAL], hdrs: NAKACK2: [HIGHEST_SEQNO, seqno=426], TP: [cluster=draw]
-9: [c0b6a011-16f9-699d-dd8c-68f6cc880ddd to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
-10: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+4: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 0 bytes, flags=OOB], hdrs: NAKACK2: [HIGHEST_SEQNO, seqno=426], TP: [cluster=draw]
+9: [c0b6a011-16f9-699d-dd8c-68f6cc880ddd to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+10: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
 11: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 13 bytes], hdrs: NAKACK2: [MSG, seqno=427], TP: [cluster=draw]
-12: [c0b6a011-16f9-699d-dd8c-68f6cc880ddd to 43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c, 44 bytes, flags=OOB|NO_RELIABILITY|INTERNAL], hdrs: STABLE: [STABLE_GOSSIP] view-id= [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c|1], TP: [cluster=draw]
-13: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 0 bytes, flags=OOB|INTERNAL], hdrs: NAKACK2: [HIGHEST_SEQNO, seqno=427], TP: [cluster=draw]
-14: [c0b6a011-16f9-699d-dd8c-68f6cc880ddd to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
-15: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 0 bytes, flags=INTERNAL], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+12: [c0b6a011-16f9-699d-dd8c-68f6cc880ddd to 43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c, 44 bytes, flags=OOB|NO_RELIABILITY], hdrs: STABLE: [STABLE_GOSSIP] view-id= [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c|1], TP: [cluster=draw]
+13: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 0 bytes, flags=OOB], hdrs: NAKACK2: [HIGHEST_SEQNO, seqno=427], TP: [cluster=draw]
+14: [c0b6a011-16f9-699d-dd8c-68f6cc880ddd to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
+15: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 0 bytes], hdrs: FD_ALL: heartbeat, TP: [cluster=draw]
 16: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 13 bytes], hdrs: NAKACK2: [MSG, seqno=428], TP: [cluster=draw]
 17: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 13 bytes], hdrs: NAKACK2: [MSG, seqno=429], TP: [cluster=draw]
 18: [43c0d32e-a9ee-cb3d-578d-4af5fcd5c72c to <all>, 13 bytes], hdrs: NAKACK2: [MSG, seqno=430], TP: [cluster=draw]

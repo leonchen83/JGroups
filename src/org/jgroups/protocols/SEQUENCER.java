@@ -12,10 +12,7 @@ import org.jgroups.util.*;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.util.List;
-import java.util.Map;
-import java.util.NavigableMap;
-import java.util.Objects;
+import java.util.*;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -33,7 +30,6 @@ import java.util.function.Supplier;
  */
 @MBean(description="Implementation of total order protocol using a sequencer")
 public class SEQUENCER extends Protocol {
-    protected Address                           local_addr;
     protected volatile Address                  coord;
     protected volatile View                     view;
     @ManagedAttribute
@@ -70,8 +66,6 @@ public class SEQUENCER extends Protocol {
     /** Used for each resent message to wait until the message has been received */
     protected final Promise<Long>               ack_promise=new Promise<>();
 
-    protected MessageFactory                    msg_factory;
-
 
 
     @Property(description="Size of the set to store received seqnos (for duplicate checking)")
@@ -82,7 +76,7 @@ public class SEQUENCER extends Protocol {
     protected int                               threshold=10;
 
     @Property(description="If true, all messages in the forward-table are sent to the new coord, else thye're " +
-      "dropped (https://issues.jboss.org/browse/JGRP-2268)")
+      "dropped (https://issues.redhat.com/browse/JGRP-2268)")
     protected boolean                           flush_forward_table=true;
 
     @ManagedAttribute protected int  num_acks;
@@ -95,7 +89,6 @@ public class SEQUENCER extends Protocol {
     @ManagedAttribute
     public boolean isCoordinator() {return is_coord;}
     public Address getCoordinator() {return coord;}
-    public Address getLocalAddress() {return local_addr;}
 
     @ManagedAttribute(description="Number of messages in the forward-table")
     public int getForwardTableSize() {return forward_table.size();}
@@ -111,7 +104,6 @@ public class SEQUENCER extends Protocol {
 
     public void init() throws Exception {
         super.init();
-        msg_factory=getTransport().getMessageFactory();
     }
 
     public void start() throws Exception {
@@ -136,10 +128,6 @@ public class SEQUENCER extends Protocol {
             case Event.TMP_VIEW:
                 handleTmpView(evt.getArg());
                 break;
-
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                break;
         }
         return down_prot.down(evt);
     }
@@ -156,7 +144,7 @@ public class SEQUENCER extends Protocol {
             block();
 
         // A seqno is not used to establish ordering, but only to weed out duplicates; next_seqno doesn't need
-        // to increase monotonically, but only to be unique (https://issues.jboss.org/browse/JGRP-1461) !
+        // to increase monotonically, but only to be unique (https://issues.redhat.com/browse/JGRP-1461) !
         long next_seqno=seqno.incrementAndGet();
         in_flight_sends.incrementAndGet();
         try {
@@ -233,7 +221,7 @@ public class SEQUENCER extends Protocol {
     }
 
     public void up(MessageBatch batch) {
-        MessageIterator it=batch.iterator();
+        Iterator<Message> it=batch.iterator();
         while(it.hasNext()) {
             Message msg=it.next();
             if(msg.isFlagSet(Message.Flag.NO_TOTAL_ORDER) || msg.isFlagSet(Message.Flag.OOB) || msg.getHeader(id) == null)
@@ -355,7 +343,7 @@ public class SEQUENCER extends Protocol {
         // - B receives message 4 and broadcasts it
         // ==> C's message 4 is delivered *before* message 3 !
         // ==> By resending 3 until it is received, then resending 4 until it is received, we make sure this won't happen
-        // (see https://issues.jboss.org/browse/JGRP-1449)
+        // (see https://issues.redhat.com/browse/JGRP-1449)
         while(flushing && running && !forward_table.isEmpty()) {
             Map.Entry<Long,Message> entry=forward_table.firstEntry();
             final Long key=entry.getKey();
@@ -466,7 +454,7 @@ public class SEQUENCER extends Protocol {
     protected void unwrapAndDeliver(final Message msg, boolean flush_ack) {
         try {
             // Message msg_to_deliver=Util.streamableFromBuffer(BytesMessage::new, msg.getArray(), msg.getOffset(), msg.getLength());
-            Message msg_to_deliver=Util.messageFromBuffer(msg.getArray(), msg.getOffset(), msg.getLength(), msg_factory);
+            Message msg_to_deliver=Util.messageFromBuffer(msg.getArray(), msg.getOffset(), msg.getLength());
             SequencerHeader hdr=msg_to_deliver.getHeader(this.id);
             if(flush_ack)
                 hdr.flush_ack=true;
@@ -554,7 +542,7 @@ public class SEQUENCER extends Protocol {
         if(flusher == null || !flusher.isAlive()) {
             if(log.isTraceEnabled())
                 log.trace(local_addr + ": flushing started");
-            // causes subsequent message sends (broadcasts and forwards) to block (https://issues.jboss.org/browse/JGRP-1495)
+            // causes subsequent message sends (broadcasts and forwards) to block (https://issues.redhat.com/browse/JGRP-1495)
             flushing=true;
             
             flusher=new Flusher(new_coord);
@@ -652,14 +640,14 @@ public class SEQUENCER extends Protocol {
         @Override
         public void writeTo(DataOutput out) throws IOException {
             out.writeByte(type);
-            Bits.writeLong(seqno,out);
+            Bits.writeLongCompressed(seqno, out);
             out.writeBoolean(flush_ack);
         }
 
         @Override
         public void readFrom(DataInput in) throws IOException {
             type=in.readByte();
-            seqno=Bits.readLong(in);
+            seqno=Bits.readLongCompressed(in);
             flush_ack=in.readBoolean();
         }
 

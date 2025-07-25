@@ -39,10 +39,18 @@ public class Frag3Header extends Header {
         this.offset=offset;
     }
 
-    public short                      getMagicId()                       {return 91;}
-    public Supplier<? extends Header> create()                           {return Frag3Header::new;}
-    public boolean                    needsDeserialization()             {return needs_deserialization;}
-    public Frag3Header                needsDeserialization(boolean flag) {needs_deserialization=flag; return this;}
+    public short                      getMagicId()                    {return 91;}
+    public Supplier<? extends Header> create()                        {return Frag3Header::new;}
+    public int                        getFragId()                     {return frag_id;}
+    public Frag3Header                setFragId(int frag_id)          {this.frag_id=frag_id; return this;}
+    public int                        getNumFrags()                   {return num_frags;}
+    public Frag3Header                setNumFrags(int n)              {this.num_frags=n; return this;}
+    public int                        getOriginalLength()             {return original_length;}
+    public Frag3Header                setOriginalLength(int l)        {this.original_length=l; return this;}
+    public int                        getOffset()                     {return offset;}
+    public Frag3Header                setOffset(int offset)           {this.offset=offset; return this;}
+    public boolean                    needsDeserialization()          {return needs_deserialization;}
+    public Frag3Header                needsDeserialization(boolean f) {needs_deserialization=f; return this;}
 
     public String toString() {
         return String.format("[id=%d, frag-id=%d, num_frags=%d orig-length=%d, offset=%d]",
@@ -51,11 +59,11 @@ public class Frag3Header extends Header {
 
     @Override
     public void writeTo(DataOutput out) throws IOException {
-        Bits.writeInt(id,out);
-        Bits.writeInt(frag_id, out);
-        Bits.writeInt(num_frags, out);
-        Bits.writeInt(original_length, out);
-        Bits.writeInt(offset, out);
+        Bits.writeIntCompressed(id, out);
+        Bits.writeIntCompressed(frag_id, out);
+        Bits.writeIntCompressed(num_frags, out);
+        Bits.writeIntCompressed(original_length, out);
+        Bits.writeIntCompressed(offset, out);
         out.writeBoolean(needs_deserialization);
     }
 
@@ -67,11 +75,11 @@ public class Frag3Header extends Header {
 
     @Override
     public void readFrom(DataInput in) throws IOException {
-        id=Bits.readInt(in);
-        frag_id=Bits.readInt(in);
-        num_frags=Bits.readInt(in);
-        original_length=Bits.readInt(in);
-        offset=Bits.readInt(in);
+        id=Bits.readIntCompressed(in);
+        frag_id=Bits.readIntCompressed(in);
+        num_frags=Bits.readIntCompressed(in);
+        original_length=Bits.readIntCompressed(in);
+        offset=Bits.readIntCompressed(in);
         needs_deserialization=in.readBoolean();
     }
 

@@ -17,7 +17,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
- * Tests partition and merge of {@link FILE_PING} (https://issues.jboss.org/browse/JGRP-2288)
+ * Tests partition and merge of {@link FILE_PING} (https://issues.redhat.com/browse/JGRP-2288)
  * @author Bela Ban
  * @since  4.0.17
  */
@@ -62,8 +62,8 @@ public class FILE_PING_Test {
         injectView(a,b); // installs view {A,B} in A and B
         injectView(c,d); // installs view {C,D} in C and D
 
-        Util.waitUntilAllChannelsHaveSameView(10000, 1000, a,b);
-        Util.waitUntilAllChannelsHaveSameView(10000, 1000, c,d);
+        Util.waitUntilAllChannelsHaveSameView(10000, 500, a,b);
+        Util.waitUntilAllChannelsHaveSameView(10000, 500, c,d);
 
         System.out.printf("views:\n%s\n",
                           Stream.of(a,b,c,d).map(ch -> ch.getAddress() + ": " + ch.getView()).collect(Collectors.joining("\n")));
@@ -80,7 +80,7 @@ public class FILE_PING_Test {
         Stream.of(a,b,c,d).forEach(ch -> ch.getProtocolStack().removeProtocol(DISCARD.class));
 
         System.out.println("waiting for partitions to merge");
-        Util.waitUntilAllChannelsHaveSameView(30000, 1000, b,c,d);
+        Util.waitUntilAllChannelsHaveSameView(30000, 500, b,c,d);
         System.out.printf("merged views:\n%s\n",
                           Stream.of(b,c,d).map(ch -> ch.getAddress() + ": " + ch.getView()).collect(Collectors.joining("\n")));
 

@@ -26,11 +26,13 @@ public class ParticipantGmsImpl extends ServerGmsImpl {
         suspected_mbrs.clear();
     }
 
-    public void join(Address mbr, boolean useFlushIfPresent) {
+    @Override
+    public void join(Address ignored) {
         wrongMethod("join");
     }
 
-    public void joinWithStateTransfer(Address mbr,boolean useFlushIfPresent) {
+    @Override
+    public void joinWithStateTransfer(Address ignored) {
         wrongMethod("join");
     }
 
@@ -87,8 +89,8 @@ public class ParticipantGmsImpl extends ServerGmsImpl {
         if(suspected_mbrs.isEmpty() && leaving_mbrs.isEmpty())
             return;
 
-        if(wouldIBeCoordinator(leaving_mbrs)) {
-            log.debug("%s: members are %s, coord=%s: I'm the new coordinator", gms.local_addr, gms.members, gms.local_addr);
+        if(wouldIBeCoordinator(leaving_mbrs, suspected_mbrs)) {
+            log.debug("%s: members are %s, coord=%s: I'm the new coordinator", gms.getAddress(), gms.members, gms.getAddress());
             gms.becomeCoordinator();
             Collection<Request> leavingOrSuspectedMembers=new LinkedHashSet<>();
             leaving_mbrs.forEach(mbr -> leavingOrSuspectedMembers.add(new Request(Request.LEAVE, mbr)));
@@ -101,8 +103,6 @@ public class ParticipantGmsImpl extends ServerGmsImpl {
                 leavingOrSuspectedMembers.add(new Request(Request.COORD_LEAVE));
             gms.getViewHandler().add(leavingOrSuspectedMembers);
         }
-        else
-            log.warn("%s: I'm not the coordinator (or next-in-line); dropping LEAVE request", gms.local_addr);
     }
 
 
@@ -126,11 +126,11 @@ public class ParticipantGmsImpl extends ServerGmsImpl {
      * D}. The resulting list is {B, C}. The first member of {B, C} is B, which is equal to the
      * local_addr. Therefore, true is returned.
      */
-    protected boolean wouldIBeCoordinator(Collection<Address> leaving_mbrs) {
-        List<Address> mbrs=gms.computeNewMembership(gms.members.getMembers(), null, leaving_mbrs, suspected_mbrs);
+    protected boolean wouldIBeCoordinator(Collection<Address> leaving_mbrs, Collection<Address> suspected_members) {
+        List<Address> mbrs=gms.computeNewMembership(gms.members.getMembers(), null, leaving_mbrs, suspected_members);
         if(mbrs.isEmpty()) return false;
         Address new_coord=mbrs.get(0);
-        return gms.local_addr.equals(new_coord);
+        return gms.getAddress().equals(new_coord);
     }
 
 

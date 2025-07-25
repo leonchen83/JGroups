@@ -29,9 +29,10 @@ public class FifoOrderTest extends ChannelTestBase {
 
     @BeforeMethod void setUp() throws Exception {
         latch=new CountDownLatch(1);
-        a=createChannel(true,3, "A");
-        b=createChannel(a,    "B");
-        c=createChannel(a,    "C");
+        a=createChannel().name("A");
+        b=createChannel().name("B");
+        c=createChannel().name("C");
+        makeUnique(a,b,c);
     }
 
     @AfterMethod protected void tearDown() throws Exception {Util.close(c,b,a);}
@@ -111,11 +112,9 @@ public class FifoOrderTest extends ChannelTestBase {
 
     private class Sender implements Runnable {
         final JChannel ch;
-        final Address local_addr;
 
         public Sender(JChannel ch) {
             this.ch=ch;
-            local_addr=ch.getAddress();
         }
 
         public void run() {

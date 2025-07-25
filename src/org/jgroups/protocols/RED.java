@@ -6,11 +6,14 @@ import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.annotations.Property;
 import org.jgroups.conf.AttributeType;
 import org.jgroups.stack.Protocol;
+import org.jgroups.util.MessageBatch;
 import org.jgroups.util.Util;
 
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+
+import static org.jgroups.conf.AttributeType.SCALAR;
 
 /**
  * Implementation of Random Early Drop: messages are discarded when the bundler's queue in the transport nears exhaustion.
@@ -38,16 +41,18 @@ public class RED extends Protocol {
     protected long            max;
 
     @ManagedAttribute(description="The average number of elements in the bundler's queue. Computed as " +
-      "o * (1 - 2^-wf) + c * (2^-wf) where o is the old average, c the current queue size amd wf the weight_factor")
+      "o * (1 - 2^-wf) + c * (2^-wf) where o is the old average, c the current queue size and wf the weight_factor")
     protected double          avg_queue_size;
 
     @Property(description="The weight used to compute the average queue size. The higher the value is, the less the " +
       "current queue size is taken into account. E.g. with 2, 25% of the current queue size and 75% of the old " +
       "average is taken to compute the new average. In other words: with a high value, the average will take " +
-      "longer to reflect the current queueu size.")
-    protected double          weight_factor=2;
+      "longer to reflect the current queue size.")
+    protected double          weight_factor=1;
 
+    @ManagedAttribute(description="The number of dropped messages",type=AttributeType.SCALAR)
     protected final LongAdder dropped_msgs=new LongAdder(); // dropped messages
+    @ManagedAttribute(description="Total number of messages processed",type=AttributeType.SCALAR)
     protected final LongAdder total_msgs=new LongAdder();   // total messages looked at
 
     protected Bundler         bundler;
@@ -59,17 +64,15 @@ public class RED extends Protocol {
     public boolean isEnabled()           {return enabled;}
     public RED     setEnabled(boolean e) {enabled=e; return this;}
     public double  getMinThreshold()     {return min_threshold;}
-
-
-
-    @ManagedAttribute(description="The number of dropped messages",type=AttributeType.SCALAR)
-    public long    getDroppedMessages() {return dropped_msgs.sum();}
-
-    @ManagedAttribute(description="Total number of messages processed",type=AttributeType.SCALAR)
-    public long    getTotalMessages()   {return total_msgs.sum();}
-
+    /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @SuppressWarnings("DeprecatedIsStillUsed")
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public long    getDroppedMessages()  {return dropped_msgs.sum();}
+    /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public long    getTotalMessages()    {return total_msgs.sum();}
     @ManagedAttribute(description="Percentage of all messages that were dropped")
-    public double  getDropRate()        {return dropped_msgs.sum() / (double)total_msgs.sum();}
+    public double  getDropRate()         {return dropped_msgs.sum() / (double)total_msgs.sum();}
 
 
     public void start() throws Exception {
@@ -77,7 +80,7 @@ public class RED extends Protocol {
         bundler=getTransport().getBundler();
         enabled=bundler != null && bundler.getQueueSize() >= 0;
         if(enabled) {
-            queue_capacity=getTransport().getBundlerCapacity();
+            queue_capacity=getTransport().getBundler().getCapacity();
             min=(long)(queue_capacity * checkRange(min_threshold, 0, 1, "min_threshold"));
             max=(long)(queue_capacity * checkRange(max_threshold, 0, 1, "max_threshold"));
             span=max-min;
@@ -93,38 +96,37 @@ public class RED extends Protocol {
     }
 
     public Object down(Message msg) {
-        if(enabled) {
+        if(msg.isFlagSet(Message.TransientFlag.DONT_BLOCK))
+            return down_prot.down(msg);
+        if(enabled && bundler != null) {
             int current_queue_size=bundler.getQueueSize();
             double avg;
             lock.lock();
             try {
                 avg=avg_queue_size=computeAverage(avg_queue_size, current_queue_size);
-                // System.out.printf("-- avg=%.2f, size=%d\n", avg, current_queue_size);
             }
             finally {
                 lock.unlock();
             }
-
             total_msgs.increment();
-            if(avg <= min)
-                ;            // message will be sent
-            else if(avg >= max)
-                return null; // message will be dropped
-            else {           // min_threshold < avg < max_threshold
-                // message will be dropped with probability p
-                double p=computeDropProbability(avg);
-                if(Util.tossWeightedCoin(p)) {
-                    dropped_msgs.increment();
-                    return null; // drop the message
-                }
+            // don't drop if avg <= min, drop if avg >= max, and drop with a probability p if avg is between min and max
+            boolean drop=!(avg <= min) && (avg >= max || drop(avg));
+            if(drop) {
+                dropped_msgs.increment();
+                return null;
             }
         }
         return down_prot.down(msg);
     }
 
+    public void up(MessageBatch batch) {
+        up_prot.up(batch);
+    }
+
     public String toString() {
-        return String.format("enabled=%b, queue capacity=%d, min=%d, max=%d, avg-queue-size=%.2f, " +
-                               "total=%d dropped=%d (%d%%)", enabled, queue_capacity, min, max, avg_queue_size,
+        return String.format("%s: enabled=%b, queue capacity=%d, min=%d, max=%d, avg-queue-size=%.2f, " +
+                               "total=%d dropped=%d (%d%%)", RED.class.getSimpleName(),
+                             enabled, queue_capacity, min, max, avg_queue_size,
                              total_msgs.sum(), dropped_msgs.sum(), (int)(getDropRate()*100.0));
     }
 
@@ -136,6 +138,12 @@ public class RED extends Protocol {
      * Probability increases linearly with min moving toward max */
     protected double computeDropProbability(double avg) {
         return Math.min(1, (avg-min) / span);
+    }
+
+    protected boolean drop(double avg) {
+        // message will be dropped with probability p
+        double p=computeDropProbability(avg);
+        return Util.tossWeightedCoin(p); // returns true if message should be dropped, false otherwise
     }
 
     protected static double checkRange(double val, double min, double max, String name) {

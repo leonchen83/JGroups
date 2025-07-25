@@ -8,7 +8,6 @@ import org.jgroups.blocks.cs.BaseServer;
 import org.jgroups.blocks.cs.NioServer;
 import org.jgroups.blocks.cs.ReceiverAdapter;
 import org.jgroups.blocks.cs.TcpServer;
-import org.jgroups.util.Bits;
 import org.jgroups.util.CondVar;
 import org.jgroups.util.Util;
 import org.testng.Assert;
@@ -19,6 +18,7 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
@@ -42,7 +42,7 @@ public class ServerUnitTest {
     }
 
     public void testSetup() throws Exception {
-        for(boolean nio : new boolean[]{false, true}) {
+        for(boolean nio: new boolean[]{false, true}) {
             try(BaseServer a=create(nio, 0);
                 BaseServer b=create(nio, 0)) {
                 Assert.assertNotSame(a.localAddress(), b.localAddress());
@@ -52,7 +52,7 @@ public class ServerUnitTest {
 
 
     public void testSendEmptyData() throws Exception {
-        for(boolean nio : new boolean[]{false, true}) {
+        for(boolean nio: new boolean[]{false, true}) {
             try(BaseServer a=create(nio, 0)) {
                 byte[] data=new byte[0];
                 Address myself=a.localAddress();
@@ -63,7 +63,7 @@ public class ServerUnitTest {
     }
 
     public void testSendNullData() throws Exception {
-        for(boolean nio : new boolean[]{false, true}) {
+        for(boolean nio: new boolean[]{false, true}) {
             try(BaseServer a=create(nio, 0)) {
                 Address myself=a.localAddress();
                 a.send(myself, null, 0, 0); // the test passes if send() doesn't throw an exception
@@ -73,7 +73,7 @@ public class ServerUnitTest {
 
 
     public void testSendToSelf() throws Exception {
-        for(boolean nio : new boolean[]{false, true}) {
+        for(boolean nio: new boolean[]{false, true}) {
             try(BaseServer a=create(nio, 0)) {
                 long NUM=1000, total_time;
                 Address myself=a.localAddress();
@@ -125,7 +125,7 @@ public class ServerUnitTest {
     }
 
     public void testSendToOther() throws Exception {
-        for(boolean nio : new boolean[]{false, true}) {
+        for(boolean nio: new boolean[]{false, true}) {
             try(BaseServer a=create(nio, 0);
                 BaseServer b=create(nio, 0)) {
                 long NUM=1000, total_time;
@@ -150,6 +150,7 @@ public class ServerUnitTest {
 
     // @Test(invocationCount=100)
     public void testSendToOtherGetResponse() throws Exception {
+        final byte[] data="hello world".getBytes();
         for(boolean nio : new boolean[]{false, true}) {
             try(BaseServer a=create(nio, 0);
                 BaseServer b=create(nio, 0)) {
@@ -157,20 +158,26 @@ public class ServerUnitTest {
                 Address other=b.localAddress();
                 MyReceiver r1=new MyReceiver(a, NUM, false);
                 MyReceiver r2=new MyReceiver(b, NUM, true); // send response
-                byte[] data="hello world".getBytes();
 
                 a.receiver(r1);
                 b.receiver(r2);
 
                 for(int i=0; i < NUM; i++)
                     send(data, a, other);
-                log("sent " + NUM + " msgs");
-                r1.waitForCompletion(20000);
+                System.out.printf("\n\n%s sent %d msgs to %s\n", "A", NUM, "B");
+
+                a.flushAll();
+                // now wait until B has received NUM messages from A
+                Util.waitUntilTrue(10000, 100, () -> r2.getNumReceived() >= r2.getNumExpected());
+
+                // this causes pending responses at B to be sent from B to A
+                b.flushAll();
+                Util.waitUntil(10000, 100, () -> r1.getNumReceived() == r1.getNumExpected());
+
                 total_time=r1.stop_time - r1.start_time;
-                log(String.format("r1.expected=%d, r1.received=%d, r2.expected=%d, r2.received=%d, r2.sent=%d, total time=%d (%.2f ms/msg)",
+                System.out.printf("A: expected=%d, received=%d\nB: expected=%d, received=%d, sent=%d\ntotal time=%d (%.2f ms/msg)",
                                   r1.getNumExpected(), r1.getNumReceived(), r1.getNumExpected(), r2.getNumReceived(), r2.num_sent.get(),
-                                  total_time, (double)total_time / r1.getNumReceived()
-                ));
+                                  total_time, (double)total_time / r1.getNumReceived());
 
                 Assert.assertEquals(r1.getNumReceived(), r1.getNumExpected());
             }
@@ -180,7 +187,7 @@ public class ServerUnitTest {
 
     /**
      * A connects to B and B connects to A at the same time. This test makes sure we only have <em>one</em> connection,
-     * not two, e.g. a spurious connection. Tests http://jira.jboss.com/jira/browse/JGRP-549.<p/>
+     * not two, e.g. a spurious connection. Tests https://issues.redhat.com/browse/JGRP-549.<p/>
      * Turned concurrent test into a simple sequential test. We're going to replace this code with NIO2 soon anyway...
      */
     public void testReuseOfConnection() throws Exception {
@@ -214,20 +221,28 @@ public class ServerUnitTest {
 
 
     public void testConnectionCountOnStop() throws Exception {
-        for(boolean nio : new boolean[]{false, true}) {
+        for(boolean nio: new boolean[]{false, true}) {
+       //  for(boolean nio: new boolean[]{true}) {
             try(BaseServer a=create(nio, 0);
                 BaseServer b=create(nio, 0)) {
-                Address addr1=a.localAddress(), addr2=b.localAddress();
+                Address addr_a=a.localAddress(), addr_b=b.localAddress();
                 byte[] data="hello world".getBytes();
-                send(data, a, addr1); // send to self
+                send(data, a, addr_a); // send to self
                 assert a.getNumConnections() == 0;
-                send(data, a, addr2);  // send to other
+                send(data, a, addr_b);  // send to other
 
-                send(data, b, addr2); // send to self
-                send(data, b, addr1); // send to other
+                send(data, b, addr_b); // send to self
+                send(data, b, addr_a); // send to other
 
-
-                System.out.println("A:\n" + a + "\nB:\n" + b);
+                Util.waitUntil(3000, 100, () -> {
+                    AtomicInteger connected=new AtomicInteger();
+                    Stream.of(a,b).forEach(s -> s.forAllConnections((__,c) -> {
+                        if(c.isConnected())
+                            connected.incrementAndGet();
+                    }));
+                    return connected.get() == 2;
+                });
+                System.out.println("A: " + a.toString(true) + "\nB: " + b.toString(true));
 
                 int num_conns_table1=a.getNumConnections(), num_conns_table2=b.getNumConnections();
                 assert num_conns_table1 == 1 : "A should have 1 connection, but has " + num_conns_table1 + ": " + a;
@@ -258,11 +273,8 @@ public class ServerUnitTest {
     }
 
     protected static void send(byte[] request, BaseServer server, Address dest) {
-        byte[] data=new byte[request.length + Global.INT_SIZE];
-        Bits.writeInt(request.length, data, 0);
-        System.arraycopy(request, 0, data, Global.INT_SIZE, request.length);
         try {
-            server.send(dest, data, 0, data.length);
+            server.send(dest, request, 0, request.length);
         }
         catch(Exception e) {
             System.err.println("Failed sending a request to " + dest + ": " + e);
@@ -288,16 +300,12 @@ public class ServerUnitTest {
     }
 
     protected static void waitForOpenConns(int expected, BaseServer... servers) throws Exception {
-        for(int i=0; i < 20; i++) {
-            if(!Arrays.stream(servers).allMatch(srv -> srv.getNumOpenConnections() == expected))
-                Util.sleep(1000);
-        }
-        if(!Arrays.stream(servers).allMatch(srv -> srv.getNumOpenConnections() == expected)) {
-            String msg=String.format("expected connections: %d, actual:\n%s\n", expected,
-                                     Stream.of(servers).map(s -> String.format("%s: %s", s.getNumOpenConnections(), s.printConnections()))
-                                       .collect(Collectors.joining("\n")));
-            throw new Exception(msg);
-        }
+        Util.waitUntil(3000, 500,
+                       () -> Arrays.stream(servers).allMatch(srv -> srv.getNumOpenConnections() == expected),
+                       () -> String.format("%s: expected connections: %d, actual:\n%s\n", servers[0].getClass().getSimpleName(), expected,
+                                           Stream.of(servers).map(s -> String.format("%s: %s: %s", s.localAddress(),
+                                                                                     s.getNumOpenConnections(), s.printConnections()))
+                                             .collect(Collectors.joining("\n"))));
     }
 
 
@@ -357,9 +365,8 @@ public class ServerUnitTest {
             }
         }
 
-        public synchronized void receive(Address sender, DataInput in) throws Exception {
-            int len=in.readInt();
-            byte[] buf=new byte[len];
+        public synchronized void receive(Address sender, DataInput in, int length) throws Exception {
+            byte[] buf=new byte[length];
             in.readFully(buf);
             // System.out.printf("[tcp] from %s: %d bytes\n", sender, len);
             long tmp=num_received.incrementAndGet();

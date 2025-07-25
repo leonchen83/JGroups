@@ -3,25 +3,27 @@
 package org.jgroups.stack;
 
 
-import org.jgroups.Event;
-import org.jgroups.JChannel;
-import org.jgroups.Message;
+import org.jgroups.*;
+import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.annotations.ManagedOperation;
 import org.jgroups.annotations.Property;
 import org.jgroups.conf.ClassConfigurator;
+import org.jgroups.conf.PropertyConverters;
+import org.jgroups.conf.XmlNode;
 import org.jgroups.logging.Log;
 import org.jgroups.logging.LogFactory;
 import org.jgroups.protocols.TP;
-import org.jgroups.util.MessageBatch;
-import org.jgroups.util.SocketFactory;
-import org.jgroups.util.ThreadFactory;
-import org.jgroups.util.Util;
-import org.w3c.dom.Node;
+import org.jgroups.util.*;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 
 /**
@@ -42,27 +44,30 @@ import java.util.List;
  *
  * @author Bela Ban
  */
-public abstract class Protocol {
-    protected Protocol         up_prot, down_prot;
-    protected ProtocolStack    stack;
-    
+public abstract class Protocol implements Lifecycle {
+    protected Protocol             up_prot, down_prot;
+    protected ProtocolStack        stack;
+
     @Property(description="Determines whether to collect statistics (and expose them via JMX). Default is true")
-    protected boolean          stats=true;
+    protected boolean              stats=true;
 
     @Property(description="Enables ergonomics: dynamically find the best values for properties at runtime")
-    protected boolean          ergonomics=true;
+    protected boolean              ergonomics=true;
 
     @Property(description="Fully qualified name of a class implementing ProtocolHook, will be called after creation of " +
       "the protocol (before init())",writable=false)
-    protected String           after_creation_hook;
+    protected String               after_creation_hook;
 
     @Property(description="Give the protocol a different ID if needed so we can have multiple " +
             "instances of it in the same stack",writable=false)
-    protected short            id=ClassConfigurator.getProtocolId(getClass());
+    protected short                id=ClassConfigurator.getProtocolId(getClass());
 
-    protected final Log        log=LogFactory.getLog(this.getClass());
+    @ManagedAttribute(description="The local address of this member")
+    protected Address              local_addr;
 
+    protected final Log            log=LogFactory.getLog(this.getClass());
 
+    protected List<Policy>         policies;
 
 
     /**
@@ -76,6 +81,10 @@ public abstract class Protocol {
     @Property(name="level", description="logger level (see javadocs)")
     public String                  getLevel()                        {return log.getLevel();}
     public <T extends Protocol> T  level(String level)               {return setLevel(level);}
+    public Address                 getAddress()                      {return local_addr;}
+    public Address                 addr()                            {return local_addr;}
+    public <T extends Protocol> T  addr(Address addr)                {this.local_addr=addr; return (T)this;}
+    public <T extends Protocol> T  setAddress(Address addr)          {this.local_addr=addr; return (T)this;}
     public boolean                 isErgonomics()                    {return ergonomics;}
     public <T extends Protocol> T  setErgonomics(boolean ergonomics) {this.ergonomics=ergonomics; return (T)this;}
     public ProtocolStack           getProtocolStack()                {return stack;}
@@ -91,7 +100,30 @@ public abstract class Protocol {
     public <T extends Protocol> T  setProtocolStack(ProtocolStack s) {this.stack=s; return (T)this;}
     public String                  afterCreationHook()               {return after_creation_hook;}
     public Log                     getLog()                          {return log;}
+    public List<? extends Policy>  getPolicies()                     {return policies;}
 
+    @ManagedAttribute(description="The list of policies")
+    public String policies() {return policies == null? "n/a" :
+      policies.stream().map(p -> p.getClass().getSimpleName()).collect(Collectors.joining(", "));}
+
+    @Property(name="policies",converter= PropertyConverters.PolicyConverter.class)
+    public <T extends Protocol> T  setPolicies(List<Policy> l) {
+        this.policies=l;
+        return (T)this;
+    }
+
+    public <T extends Protocol> T  addPolicy(Policy p) {
+        if(policies == null)
+            policies=new ArrayList<>();
+        policies.add(Objects.requireNonNull(p));
+        return (T)this;
+    }
+
+    public <T extends Protocol> T  removePolicy(Policy p) {
+        if(policies != null && p != null)
+            policies.remove(p);
+        return (T)this;
+    }
 
     public Object getValue(String name) {
         if(name == null) return null;
@@ -122,15 +154,17 @@ public abstract class Protocol {
 
     /**
      * After configuring the protocol itself from the properties defined in the XML config, a protocol might have
-     * additional objects which need to be configured. This callback allows a protocol developer to configure those
-     * other objects. This call is guaranteed to be invoked <em>after</em> the protocol itself has been configured.
+     * additional component objects which need to be configured. This callback allows a protocol developer to configure those
+     * other objects. This call is guaranteed to be invoked <em>after</em> the protocol itself has been configured.<br/>
      * See AUTH for an example.
      */
-    public List<Object> getConfigurableObjects() {return null;}
+    public List<Object> getComponents() {
+        return Util.getComponents(this);
+    }
 
     /** Called by the XML parser when subelements are found in the configuration of a protocol. This allows
      * a protocol to define protocol-specific information and to parse it */
-    public void parse(Node node) throws Exception {;}
+    public void parse(XmlNode node) throws Exception {;}
 
     /** Returns the protocol IDs of all protocols above this one (excluding the current protocol) */
     public short[] getIdsAbove() {
@@ -148,7 +182,7 @@ public abstract class Protocol {
     }
 
 
-    protected TP getTransport() {
+    public TP getTransport() {
         Protocol retval=this;
         while(retval != null && retval.down_prot != null) {
             retval=retval.down_prot;
@@ -194,41 +228,35 @@ public abstract class Protocol {
 
 
     /**
-     * Called after instance has been created (null constructor) and before protocol is started.
-     * Properties are already set. Other protocols are not yet connected and events cannot yet be sent.
+     * Called after a protocol has been created and before the protocol is started.
+     * Attributes are already set. Other protocols are not yet connected and events cannot yet be sent.
      * @exception Exception Thrown if protocol cannot be initialized successfully. This will cause the
-     *                      ProtocolStack to fail, so the channel constructor will throw an exception
+     *                      ProtocolStack to fail, so the the channel constructor will throw an exception
      */
-    public void init() throws Exception {
+    @Override public void init() throws Exception {
     }
 
     /**
-     * This method is called on a {@link JChannel#connect(String)}. Starts work.
-     * Protocols are connected and queues are ready to receive events.
-     * Will be called <em>from bottom to top</em>. This call will replace
-     * the <b>START</b> and <b>START_OK</b> events.
+     * This method is called on a {@link JChannel#connect(String)}; starts work. Protocols are connected ready to
+     * receive events.  Will be called <em>from bottom to top</em>.
      * @exception Exception Thrown if protocol cannot be started successfully. This will cause the ProtocolStack
      *                      to fail, so {@link JChannel#connect(String)} will throw an exception
      */
-    public void start() throws Exception {
+    @Override public void start() throws Exception {
     }
 
     /**
-     * This method is called on a {@link JChannel#disconnect()}. Stops work (e.g. by closing multicast socket).
-     * Will be called <em>from top to bottom</em>. This means that at the time of the method invocation the
-     * neighbor protocol below is still working. This method will replace the
-     * <b>STOP</b>, <b>STOP_OK</b>, <b>CLEANUP</b> and <b>CLEANUP_OK</b> events. The ProtocolStack guarantees that
-     * when this method is called all messages in the down queue will have been flushed
+     * Called on a {@link JChannel#disconnect()}; stops work (e.g. by closing multicast socket). Will be called
+     * <em>from top to bottom</em>.
      */
-    public void stop() {
+    @Override public void stop() {
     }
 
 
     /**
-     * This method is called on a {@link JChannel#close()}.
-     * Does some cleanup; after the call the VM will terminate
+     * This method is called on a {@link JChannel#close()}. Does some cleanup; after the call, the VM will terminate
      */
-    public void destroy() {
+    @Override public void destroy() {
     }
 
 
@@ -281,8 +309,8 @@ public abstract class Protocol {
     }
 
     /**
-     * A message is sent down the stack. Protocols may examine the message and do something (e.g. add a header) with it
-     * before passing it down.
+     * A message is sent down the stack. Protocols may examine the message and do something (e.g. add a header)
+     * with it, before passing it down.
      * @since 4.0
      */
     public Object down(Message msg) {
@@ -291,10 +319,31 @@ public abstract class Protocol {
 
 
     /**
+     * Passes a message down asynchronously. The sending is executed in the transport's thread pool. If the pool is full
+     * and the message is marked as {@link org.jgroups.Message.TransientFlag#DONT_BLOCK}, then it will be dropped,
+     * otherwise it will be sent on the caller's thread.
+     * @param msg The message to be sent
+     * @param async Whether to send the message asynchronously
+     * @return A CompletableFuture of the result (or exception)
+     */
+    public CompletableFuture<Object> down(Message msg, boolean async) {
+        AsyncExecutor<Object> executor=getTransport().getAsyncExecutor();
+        Supplier<Object> s=() -> down(msg);
+        try {
+            return !async? CompletableFuture.completedFuture(down_prot.down(msg)):
+              executor.execute(s, msg.isFlagSet(Message.TransientFlag.DONT_BLOCK));
+        }
+        catch(Throwable t) {
+            return CompletableFuture.failedFuture(t);
+        }
+    }
+
+
+    /**
      * An event was received from the protocol below. Usually the current protocol will want to examine the event type
      * and - depending on its type - perform some computation (e.g. removing headers from a MSG event type, or updating
      * the internal membership list when receiving a VIEW_CHANGE event).
-     * Finally the event is either a) discarded, or b) an event is sent down the stack using {@code down_prot.down()}
+     * Finally, the event is either a) discarded, or b) an event is sent down the stack using {@code down_prot.down()}
      * or c) the event (or another event) is sent up the stack using {@code up_prot.up()}.
      */
     public Object up(Event evt) {
@@ -321,7 +370,7 @@ public abstract class Protocol {
      * (calling {@link #accept(Message)}), and - if true - calls {@link #up(org.jgroups.Event)}
      * for that message and removes the message. If the batch is not empty, it is passed up, or else it is dropped.<p/>
      * Subclasses should check if there are any messages destined for them (e.g. using
-     * {@link MessageBatch#getMatchingMessages(short,boolean)}), then possibly remove and process them and finally pass
+     * {@link MessageBatch#iterator(Predicate)}), then possibly remove and process them and finally pass
      * the batch up to the next protocol. Protocols can also modify messages in place, e.g. ENCRYPT could decrypt all
      * encrypted messages in the batch, not remove them, and pass the batch up when done.
      * @param batch The message batch
@@ -343,7 +392,9 @@ public abstract class Protocol {
             up_prot.up(batch);
     }
 
-
+    public String toString() {
+        return String.format("%s%s", getClass().getSimpleName(), local_addr != null? String.format(" (%s)", local_addr) : "");
+    }
 
     /**
      * Called by the default implementation of {@link #up(org.jgroups.util.MessageBatch)} for each message to determine

@@ -166,7 +166,7 @@ public class MergerTest {
      * B: ACB
      * C: ACB
      * D: BACD
-     * Test case is https://issues.jboss.org/browse/JGRP-1451
+     * Test case is https://issues.redhat.com/browse/JGRP-1451
      */
     public void testOverlappingMerge4() {
         Map<Address,View> map=new HashMap<>();
@@ -187,10 +187,6 @@ public class MergerTest {
         assert map.get(d).size() == 1;
     }
 
-
-    private static <T> Collection<T> makeList(T ... elements) {
-        return new ArrayList<>(Arrays.asList(elements));
-    }
 
     private static View makeView(Address coord, Address ... members) {
         return View.create(coord, 1, members);

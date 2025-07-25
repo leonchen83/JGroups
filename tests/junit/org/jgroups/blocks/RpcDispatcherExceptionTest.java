@@ -21,7 +21,8 @@ public class RpcDispatcherExceptionTest extends ChannelTestBase {
     private final Target target=new Target();
 
     @BeforeClass void setUp() throws Exception {
-        channel=createChannel(true);
+        channel=createChannel();
+        makeUnique(channel);
         disp=new RpcDispatcher(channel, target);
         channel.connect("RpcDispatcherExceptionTest");
     }
@@ -54,10 +55,12 @@ public class RpcDispatcherExceptionTest extends ChannelTestBase {
         }
     }
 
+    @SuppressWarnings("unused")
     private static class Pojo { // doesn't implement Serializable !
         int age; String name;
     }
 
+    @SuppressWarnings("unused")
     private static class Target {
         public static void foo(Pojo p) {
             System.out.println(p.toString());

@@ -19,11 +19,11 @@ import java.util.stream.Stream;
 import static org.jgroups.util.Util.shutdown;
 
 /**
- * Tests use cases for {@link ASYM_ENCRYPT} described in https://issues.jboss.org/browse/JGRP-2021.
+ * Tests use cases for {@link ASYM_ENCRYPT} described in https://issues.redhat.com/browse/JGRP-2021.
  * @author Bela Ban
  * @since  4.0
  */
-@Test(groups={Global.FUNCTIONAL,Global.ENCRYPT},singleThreaded=true)
+@Test(groups=Global.ENCRYPT,singleThreaded=true)
 public class ASYM_ENCRYPT_Test extends EncryptTest {
     protected static final String KEYSTORE="keystore.jks";
     protected static final String KEYSTORE_PWD="password";
@@ -171,7 +171,7 @@ public class ASYM_ENCRYPT_Test extends EncryptTest {
     /**
      * Tests {A,B,C} with A crashing. B installs a new view with a freshly created secret key SK. However, C won't be
      * able to decrypt the new view as it doesn't have SK.<br/>
-     * https://issues.jboss.org/browse/JGRP-2203
+     * https://issues.redhat.com/browse/JGRP-2203
      */
     public void testCrashOfCoord() throws Exception {
         Address crashed_coord=a.getAddress();
@@ -249,7 +249,7 @@ public class ASYM_ENCRYPT_Test extends EncryptTest {
         Stream.of(a,b,c,d).forEach(ch -> merge_views.put(ch.getAddress(), ch.getView()));
         gms.up(new Event(Event.MERGE, merge_views));
 
-        Util.waitUntilAllChannelsHaveSameView(1000000, 1000, a,b,c,d); // todo: reduce timeout
+        Util.waitUntilAllChannelsHaveSameView(10000, 1000, a,b,c,d);
         printSymVersion(a,b,c,d);
     }
 

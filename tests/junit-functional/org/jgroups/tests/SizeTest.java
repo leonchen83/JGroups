@@ -3,26 +3,29 @@ package org.jgroups.tests;
 
 
 import org.jgroups.*;
-import org.jgroups.auth.*;
+import org.jgroups.auth.FixedMembershipToken;
+import org.jgroups.auth.RegexMembership;
+import org.jgroups.auth.X509Token;
 import org.jgroups.blocks.RequestCorrelator;
 import org.jgroups.protocols.*;
 import org.jgroups.protocols.pbcast.*;
-import org.jgroups.protocols.relay.RELAY2;
+import org.jgroups.protocols.relay.RelayHeader;
 import org.jgroups.protocols.relay.SiteMaster;
 import org.jgroups.protocols.relay.SiteUUID;
 import org.jgroups.stack.GossipData;
 import org.jgroups.stack.GossipType;
 import org.jgroups.stack.IpAddress;
-import org.jgroups.util.*;
 import org.jgroups.util.UUID;
+import org.jgroups.util.*;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
+import java.io.*;
+import java.net.InetAddress;
 import java.util.*;
+import java.util.concurrent.ConcurrentSkipListSet;
+
+import static org.jgroups.protocols.relay.RelayHeader.DATA;
 
 
 /**
@@ -33,10 +36,31 @@ import java.util.*;
 public class SizeTest {
 
 
-    public static void testTpHeader() throws Exception {
+    public void testTpHeader() throws Exception {
         _testSize(new TpHeader("DemoChannel"));
+        _testSize(new TpHeader("DemoChannel", (byte)1, 4));
+        _testSize(new TpHeader("DemoChannel", (byte)2, 4));
     }
 
+    public void testInfoHeader() throws Exception {
+        InfoHeader hdr=new InfoHeader();
+        _testSize(hdr);
+        hdr.put("name", "Bela");
+        _testSize(hdr);
+        hdr.put("id", "322649");
+        _testSize(hdr);
+    }
+
+    public void testByteArray() throws Exception {
+        byte[] arr={};
+        ByteArray ba=new ByteArray(arr);
+        _testSize(ba);
+        arr="hello world".getBytes();
+        ba=new ByteArray(arr);
+        _testSize(ba);
+        ba=new ByteArray(arr, 6, 5);
+        _testSize(ba);
+    }
 
     public void testPingHeader() throws Exception {
         _testSize(new PingHeader(PingHeader.GET_MBRS_REQ).clusterName("bla"));
@@ -46,7 +70,7 @@ public class SizeTest {
     }
  
 
-    public static void testPingData() throws Exception {
+    public void testPingData() throws Exception {
         PingData data;
         final Address a=Util.createRandomAddress("A");
         final PhysicalAddress physical_addr=new IpAddress("127.0.0.1", 7500);
@@ -63,6 +87,25 @@ public class SizeTest {
         data=new PingData(a, true, "A", physical_addr).coord(true)
           .mbrs(Arrays.asList(Util.createRandomAddress("A"), Util.createRandomAddress("B")));
         _testSize(data);
+
+        // testing equals(), hashcode() and compareTo():
+        UUID u1=new UUID(1,1), u2=new UUID(2,2), u3=new UUID(1,1);
+        NameCache.add(u1, "U1"); NameCache.add(u2, "U2)"); NameCache.add(u3, "U3");
+        PingData p1=new PingData(u1, true), p2=new PingData(u2, true), p3=new PingData(u3, true);
+
+        //noinspection EqualsWithItself
+        assert p1.compareTo(p1) == 0;
+        assert p1.compareTo(p2) < 0;
+        assert p1.compareTo(p3) == 0;
+
+        Map<PingData,String> m=new HashMap<>(3);
+        m.put(p1, "p1");
+        m.put(p2, "p2");
+        m.put(p3, "p3");
+        assert m.size() == 2;
+
+        Set<PingData> s=new ConcurrentSkipListSet<>(List.of(p1, p2, p3));
+        assert s.size() == 2;
     }
 
     public static void testAuthHeader() throws Exception {
@@ -127,19 +170,23 @@ public class SizeTest {
         _testSize(digest);
     }
 
-    public static void testNakackHeader() throws Exception {
+    public void testNakackHeader2() throws Exception {
         _testSize(NakAckHeader2.createMessageHeader(322649));
         _testSize(NakAckHeader2.createXmitRequestHeader(Util.createRandomAddress()));
         _testSize(NakAckHeader2.createXmitResponseHeader());
+    }
+
+    public void testNakackHeader() throws Exception {
+        _testSize(NakAckHeader.createMessageHeader(322649));
+        _testSize(NakAckHeader.createXmitRequestHeader(Util.createRandomAddress()));
+        _testSize(NakAckHeader.createXmitResponseHeader());
+        _testSize(NakAckHeader.createAckHeader(322649));
     }
 
 
     public void testFdHeaders() throws Exception {
         IpAddress a1=new IpAddress("127.0.0.1", 5555);
         IpAddress a2=new IpAddress("127.0.0.1", 6666);
-        List<Address> suspects=new ArrayList<>();
-        suspects.add(a1);
-        suspects.add(a2);
 
         FD_SOCK.FdHeader sockhdr=new FD_SOCK.FdHeader(FD_SOCK.FdHeader.GET_CACHE);
         _testSize(sockhdr);
@@ -147,33 +194,36 @@ public class SizeTest {
         sockhdr=new FD_SOCK.FdHeader(FD_SOCK.FdHeader.SUSPECT, new IpAddress("127.0.0.1", 5555));
         _testSize(sockhdr);
 
-        Set<Address> tmp=new HashSet<>();
-        tmp.add(a1);
-        tmp.add(a2);
-        sockhdr=new FD_SOCK.FdHeader(FD_SOCK.FdHeader.SUSPECT).mbrs(tmp);
-        _testSize(sockhdr);
-
-
-        Map<Address,IpAddress> cache=new HashMap<>();
-        cache.put(a1, a2);
-        cache.put(a2, a1);
+        Set<Address> tmp=Set.of(a1, a2);
         sockhdr=new FD_SOCK.FdHeader(FD_SOCK.FdHeader.SUSPECT);
         _testSize(sockhdr);
+
+        sockhdr.mbrs(tmp);
+        _testSize(sockhdr);
+
+        FD_SOCK2.FdHeader hdr=new FD_SOCK2.FdHeader(FD_SOCK2.FdHeader.SUSPECT);
+        _testSize(hdr);
+        hdr.mbrs(tmp);
+        _testSize(hdr);
+
+        hdr=new FD_SOCK2.FdHeader(FD_SOCK2.FdHeader.CONNECT_RSP);
+        hdr.serverAddress(a1);
+        _testSize(hdr);
+
+        hdr.cluster("demo");
+        _testSize(hdr);
     }
 
 
 
-    public static void testFdSockHeaders() throws Exception {
+    public void testFdSockHeaders() throws Exception {
         FD_SOCK.FdHeader hdr=new FD_SOCK.FdHeader(FD_SOCK.FdHeader.GET_CACHE);
         _testSize(hdr);
 
         hdr=new FD_SOCK.FdHeader(FD_SOCK.FdHeader.GET_CACHE, new IpAddress("127.0.0.1", 4567));
         _testSize(hdr);
 
-        Set<Address> set=new HashSet<>();
-        set.add(new IpAddress(3452));
-        set.add(new IpAddress("127.0.0.1", 5000));
-
+        Set<Address> set=Set.of(new IpAddress(3452), new IpAddress("127.0.0.1", 5000));
         hdr=new FD_SOCK.FdHeader(FD_SOCK.FdHeader.GET_CACHE).mbrs(set);
         _testSize(hdr);
 
@@ -182,8 +232,6 @@ public class SizeTest {
                                    new IpAddress("127.0.0.1", 4567));
         _testSize(hdr) ;
     }
-
-
 
     public void testUnicast3Header() throws Exception {
         UnicastHeader3 hdr=UnicastHeader3.createDataHeader(322649, (short)127, false);
@@ -348,7 +396,7 @@ public class SizeTest {
     }
 
 
-    public static void testMergeView2() throws Exception {
+    public void testMergeView2() throws Exception {
         Address a=Util.createRandomAddress("A"), b=Util.createRandomAddress("B"), c=Util.createRandomAddress("C"),
           d=Util.createRandomAddress("D"), e=Util.createRandomAddress("E"), f=Util.createRandomAddress("F");
         List<Address> all=Arrays.asList(a,b,c,d,e,f);
@@ -356,18 +404,14 @@ public class SizeTest {
         View v2=View.create(d, 2, d);
         View v3=View.create(e, 3, e,f);
 
-        ArrayList<View> subgroups=new ArrayList<>();
-        subgroups.add(v1);
-        subgroups.add(v2);
-        subgroups.add(v3);
-
+        List<View> subgroups=List.of(v1,v2,v3);
         MergeView view_all=new MergeView(a, 5, all, subgroups);
         System.out.println("MergeView: " + view_all);
         _testSize(view_all);
     }
 
 
-    public static void testMergeView3() throws Exception {
+    public void testMergeView3() throws Exception {
         List<Address> m1, m2 , m3, all;
         List<View> subgroups;
         Address a,b,c,d,e,f;
@@ -380,12 +424,11 @@ public class SizeTest {
         e=new IpAddress(5000);
         f=new IpAddress(6000);
 
-        m1=new ArrayList<>(); m2=new ArrayList<>(); m3=new ArrayList<>(); all=new ArrayList<>();
+        m1=List.of(a,b,c);
+        m2=List.of(d);
+        m3=List.of(e,f);
+        all=List.of(a,b,c,d,e,f);
         subgroups=new ArrayList<>();
-        m1.add(a); m1.add(b); m1.add(c);
-        m2.add(d);
-        m3.add(e); m3.add(f);
-        all.add(a); all.add(b); all.add(c); all.add(d); all.add(e); all.add(f);
 
         v1=new View(a, 1, m1);
         v2=new MergeView(d, 2, m2, new ArrayList<>());
@@ -403,29 +446,19 @@ public class SizeTest {
 
 
 
-    public static void testMergeViewWithMergeViewsAsSubgroups() throws Exception {
+    public void testMergeViewWithMergeViewsAsSubgroups() throws Exception {
         Address[] mbrs=Util.createRandomAddresses(4);
         Address a=mbrs[0], b=mbrs[1], c=mbrs[2], d=mbrs[3];
-        View ab=new MergeView(a, 2, Arrays.asList(a,b), Arrays.asList(View.create(a, 1, a), View.create(b, 1, b)));
-        View cd=new MergeView(c, 2, Arrays.asList(c,d), Arrays.asList(View.create(c, 1, c), View.create(d, 1, d)));
-        MergeView abcd=new MergeView(a, 3, Arrays.asList(mbrs), Arrays.asList(ab, cd));
+        View ab=new MergeView(a, 2, List.of(a,b), Arrays.asList(View.create(a, 1, a), View.create(b, 1, b)));
+        View cd=new MergeView(c, 2, List.of(c,d), Arrays.asList(View.create(c, 1, c), View.create(d, 1, d)));
+        MergeView abcd=new MergeView(a, 3, List.of(mbrs), List.of(ab, cd));
         _testSize(abcd);
     }
 
 
-    /** Tests a MergeView whose subgroups are *not* a subset of the members (https://issues.jboss.org/browse/JGRP-1707) */
-    public static void testMergeViewWithNonMatchingSubgroups() throws Exception {
+    /** Tests a MergeView whose subgroups are *not* a subset of the members (https://issues.redhat.com/browse/JGRP-1707) */
+    public void testMergeViewWithNonMatchingSubgroups() throws Exception {
         Address[] mbrs=Util.createRandomAddresses(6);
-
-        /*Address[] mbrs=new Address[6];
-        mbrs[0]=Util.createRandomAddress("A");
-        mbrs[1]=Util.createRandomAddress("B");
-        mbrs[2]=Util.createRandomAddress("C");
-        mbrs[3]=PayloadUUID.randomUUID("D", "**");
-        mbrs[4]=Util.createRandomAddress("E");
-        mbrs[5]=Util.createRandomAddress("F");*/
-
-
         Address a=mbrs[0],b=mbrs[1],c=mbrs[2],d=mbrs[3],e=mbrs[4],f=mbrs[5];
         List<Address> abc=Arrays.asList(a,b,c);     // A,B,C
         List<Address> def=Arrays.asList(d,e,f);  // D,E,F
@@ -440,13 +473,12 @@ public class SizeTest {
         mv=new MergeView(a, 5, full, subviews);
         tmp_view=(MergeView)_testSize(mv);
         assert mv.deepEquals(tmp_view) : "views don't match: original=" + mv + ", new=" + tmp_view;
-
     }
 
 
 
 
-    public static void testLargeMergeView() throws Exception {
+    public void testLargeMergeView() throws Exception {
         int NUM=100;
         Address[] members=Util.createRandomAddresses(NUM, true);
         Address[] first=Arrays.copyOf(members,NUM / 2);
@@ -459,7 +491,7 @@ public class SizeTest {
     }
 
 
-    public static void testMergeHeader() throws Exception {
+    public void testMergeHeader() throws Exception {
         MERGE3.MergeHeader hdr=new MERGE3.MergeHeader();
         _testSize(hdr);
         ViewId view_id=new ViewId(Util.createRandomAddress("A"), 22);
@@ -497,7 +529,7 @@ public class SizeTest {
         _testSize(rsp);
     }
 
-    public static void testLargeJoinRsp() throws Exception {
+    public void testLargeJoinRsp() throws Exception {
         int NUM=1000;
         Address[] members=new Address[NUM];
         for(int i=0; i < members.length; i++)
@@ -516,24 +548,19 @@ public class SizeTest {
     }
 
 
-    public static void testGmsHeader() throws Exception {
+    public void testGmsHeader() throws Exception {
         Address addr=UUID.randomUUID();
         GMS.GmsHeader hdr=new GMS.GmsHeader(GMS.GmsHeader.JOIN_REQ, addr);
         _testSize(hdr);
 
-        List<Address> members=new ArrayList<>();
-        members.add(addr);
-        members.add(addr);
         hdr=new GMS.GmsHeader(GMS.GmsHeader.JOIN_RSP);
         _testSize(hdr);
 
-        Collection<Address> mbrs=new ArrayList<>();
-        Collections.addAll(mbrs, UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
         hdr=new GMS.GmsHeader(GMS.GmsHeader.MERGE_REQ);
         _testSize(hdr);
 
-        Address[]     addresses=Util.createRandomAddresses(20);
-        View          view=View.create(addresses[0], 1, addresses);
+        Address[] addresses=Util.createRandomAddresses(20);
+        View      view=View.create(addresses[0], 1, addresses);
         MutableDigest digest=new MutableDigest(view.getMembersRaw());
         for(int i=0; i < addresses.length; i++) {
             long hd=i + 10000;
@@ -599,19 +626,40 @@ public class SizeTest {
     }
 
 
-    public void testRelay2Header() throws Exception {
+    public void testRelayHeader() throws Exception {
         Address dest=new SiteMaster("sfo");
-        RELAY2.Relay2Header hdr=new RELAY2.Relay2Header(RELAY2.Relay2Header.DATA, dest, null);
+        RelayHeader hdr=new RelayHeader(DATA, dest, null);
         _testSize(hdr);
         Address sender=new SiteUUID(UUID.randomUUID(), "dummy", "sfo");
-        hdr=new RELAY2.Relay2Header(RELAY2.Relay2Header.DATA, dest, sender);
+        hdr=new RelayHeader(DATA, dest, sender);
         _testSize(hdr);
 
-        hdr=new RELAY2.Relay2Header(RELAY2.Relay2Header.SITES_UP, null, null)
-          .setSites("sfo", "lon","nyc");
+        hdr=new RelayHeader(RelayHeader.SITES_UP, null, null)
+          .addToSites("sfo", "lon", "nyc");
         _testSize(hdr);
+
+        hdr=new RelayHeader(DATA, dest, null)
+          .addToSites("sfo")
+          .addToVisitedSites(List.of("nyc", "sfc", "lon"));
+        _testSize(hdr);
+
+        Header[] hdrs=headers();
+        hdr.originalHeaders(hdrs);
+        _testSize(hdr);
+
+        RelayHeader hdr2=hdr.copy();
+        assert hdr.getType() == hdr2.getType();
+        assert hdr.getSites().equals(hdr2.getSites());
+        assert hdr.getVisitedSites().equals(hdr2.getVisitedSites());
     }
 
+    public void testSiteUUID() throws Exception {
+        SiteUUID u1=new SiteUUID((UUID)Util.createRandomAddress(), "A", "sfo");
+        _testSize(u1);
+
+        SiteMaster sm=new SiteMaster("sfo");
+        _testSize(sm);
+    }
 
     public void testEncryptHeader() throws Exception {
         EncryptHeader hdr=new EncryptHeader((byte)0, new byte[]{'b','e', 'l', 'a'}, new byte[]{'b', 'a', 'n'});
@@ -621,7 +669,7 @@ public class SizeTest {
     }
 
 
-    public static void testIpAddress() throws Exception {
+    public void testIpAddress() throws Exception {
         IpAddress addr=new IpAddress();
         _testSize(addr);
     }
@@ -646,12 +694,15 @@ public class SizeTest {
 
 
     public static void testIpAddress3() throws Exception {
-        IpAddress addr=new IpAddress(5555, false);
+        IpAddress addr=new IpAddress((String)null, 5555);
         _testSize(addr);
     }
 
 
-
+    public static void testIpAddress4() throws Exception {
+        IpAddress addr=new IpAddress((InetAddress)null, 5555);
+        _testSize(addr);
+    }
 
 
     public static void testWriteAddress() throws Exception {
@@ -668,26 +719,7 @@ public class SizeTest {
         _testWriteAddress(addr);
     }
 
-    private static void _testWriteAddress(Address addr) throws Exception {
-        int len=Util.size(addr);
-        ByteArrayOutputStream output=new ByteArrayOutputStream();
-        DataOutputStream out=new DataOutputStream(output);
-        Util.writeAddress(addr, out);
-        out.flush();
-        byte[] buf=output.toByteArray();
-        out.close();
-
-        System.out.println("\nlen=" + len + ", serialized length=" + buf.length);
-        assert len == buf.length;
-        DataInputStream in=new DataInputStream(new ByteArrayInputStream(buf));
-        Address new_addr=Util.readAddress(in);
-        System.out.println("old addr=" + addr + "\nnew addr=" + new_addr);
-        assert addr.equals(new_addr);
-    }
-
-
-
-    public static void testWriteAddresses() throws Exception {
+    public void testWriteAddresses() throws Exception {
         List<Address> list=new ArrayList<>();
         for(int i=0; i < 3; i++)
             list.add(UUID.randomUUID());
@@ -699,25 +731,6 @@ public class SizeTest {
         list.add(new IpAddress("127.0.0.1", 5674));
         _testWriteAddresses(list);
     }
-
-    private static void _testWriteAddresses(List<Address> list) throws Exception {
-        long len=Util.size(list);
-        ByteArrayOutputStream output=new ByteArrayOutputStream();
-        DataOutputStream out=new DataOutputStream(output);
-        Util.writeAddresses(list, out);
-        out.flush();
-        byte[] buf=output.toByteArray();
-        out.close();
-
-        System.out.println("\nlen=" + len + ", serialized length=" + buf.length);
-        assert len == buf.length;
-        DataInputStream in=new DataInputStream(new ByteArrayInputStream(buf));
-        Collection<Address> new_list=Util.readAddresses(in, ArrayList::new);
-        System.out.println("old list=" + list + "\nnew list=" + new_list);
-        assert list.equals(new_list);
-    }
-
-
 
     public void testUUID() throws Exception {
         org.jgroups.util.UUID uuid=org.jgroups.util.UUID.randomUUID();
@@ -736,8 +749,6 @@ public class SizeTest {
         System.out.println("hash 2: " + hash2);
         assert hash1 == hash2;
     }
-
-
 
     public void testRequestCorrelatorHeader() throws Exception {
         RequestCorrelator.Header hdr;
@@ -761,10 +772,10 @@ public class SizeTest {
         hdr=new RequestCorrelator.Header();
         hdr.readFrom(in);
 
-        Assert.assertEquals(322649, hdr.req_id);
+        Assert.assertEquals(hdr.req_id, 322649);
         assert hdr.rspExpected();
-        Assert.assertEquals((short)356, hdr.corrId);
-        Assert.assertEquals(RequestCorrelator.Header.RSP, hdr.type);
+        Assert.assertEquals(hdr.corrId, (short)356);
+        Assert.assertEquals(hdr.type, RequestCorrelator.Header.RSP);
 
         hdr=new RequestCorrelator.Header(RequestCorrelator.Header.RSP, 322649, (short)356);
 
@@ -782,10 +793,10 @@ public class SizeTest {
         hdr=new RequestCorrelator.Header();
         hdr.readFrom(in);
 
-        Assert.assertEquals(322649, hdr.req_id);
+        Assert.assertEquals(hdr.req_id, 322649);
         assert hdr.rspExpected();
-        Assert.assertEquals(356, hdr.corrId);
-        Assert.assertEquals(RequestCorrelator.Header.RSP, hdr.type);
+        Assert.assertEquals(hdr.corrId, 356);
+        Assert.assertEquals(hdr.type, RequestCorrelator.Header.RSP);
 
         Address a=Util.createRandomAddress("A"), b=Util.createRandomAddress("B");
 
@@ -813,6 +824,39 @@ public class SizeTest {
         assert Arrays.equals(hdr.dhKey(), hdr2.dhKey());
     }
 
+    private static void _testWriteAddresses(List<Address> list) throws Exception {
+        int len=Util.size(list);
+        ByteArrayOutputStream output=new ByteArrayOutputStream();
+        DataOutputStream out=new DataOutputStream(output);
+        Util.writeAddresses(list, out);
+        out.flush();
+        byte[] buf=output.toByteArray();
+        out.close();
+
+        System.out.println("\nlen=" + len + ", serialized length=" + buf.length);
+        assert len == buf.length;
+        DataInputStream in=new DataInputStream(new ByteArrayInputStream(buf));
+        Collection<Address> new_list=Util.readAddresses(in, ArrayList::new);
+        System.out.println("old list=" + list + "\nnew list=" + new_list);
+        assert list.equals(new_list);
+    }
+
+    private static void _testWriteAddress(Address addr) throws Exception {
+        int len=Util.size(addr);
+        ByteArrayOutputStream output=new ByteArrayOutputStream();
+        DataOutputStream out=new DataOutputStream(output);
+        Util.writeAddress(addr, out);
+        out.flush();
+        byte[] buf=output.toByteArray();
+        out.close();
+
+        System.out.println("\nlen=" + len + ", serialized length=" + buf.length);
+        assert len == buf.length;
+        DataInputStream in=new DataInputStream(new ByteArrayInputStream(buf));
+        Address new_addr=Util.readAddress(in);
+        System.out.println("old addr=" + addr + "\nnew addr=" + new_addr);
+        assert addr.equals(new_addr);
+    }
 
     private static void _testMarshalling(UnicastHeader3 hdr) throws Exception {
         byte[] buf=Util.streamableToByteBuffer(hdr);
@@ -837,18 +881,18 @@ public class SizeTest {
         long size=hdr.serializedSize();
         byte[] serialized_form=Util.streamableToByteBuffer(hdr);
         System.out.println(hdr.getClass().getSimpleName() + ": size=" + size + ", serialized size=" + serialized_form.length);
-        Assert.assertEquals(serialized_form.length, size);
-
+        assert serialized_form.length == size;
         Header hdr2=Util.streamableFromByteBuffer(hdr.getClass(), serialized_form);
         assert hdr2.serializedSize() == hdr.serializedSize();
     }
-
 
     private static void _testSize(Address addr) throws Exception {
         long size=addr.serializedSize();
         byte[] serialized_form=Util.streamableToByteBuffer(addr);
         System.out.println("size=" + size + ", serialized size=" + serialized_form.length);
         Assert.assertEquals(serialized_form.length, size);
+        Address addr2=Util.streamableFromByteBuffer(addr.getClass(), serialized_form);
+        assert addr.equals(addr2);
     }
 
 
@@ -880,7 +924,7 @@ public class SizeTest {
     }
 
     private static void _testSize(Collection<Address> coll) throws Exception {
-        long size=Util.size(coll);
+        int size=Util.size(coll);
         byte[] serialized_form=Util.collectionToByteBuffer(coll);
         System.out.println("size=" + size + ", serialized size=" + serialized_form.length);
         Assert.assertEquals(serialized_form.length, size);
@@ -905,7 +949,6 @@ public class SizeTest {
         assert Util.match(rsp.getFailReason(), rsp2.getFailReason());
     }
 
-
     private static void _testSize(SizeStreamable data) throws Exception {
         System.out.println("\ndata: " + data);
         long size=data.serializedSize();
@@ -914,5 +957,12 @@ public class SizeTest {
         assert serialized_form.length == size : "serialized length=" + serialized_form.length + ", size=" + size;
     }
 
+    private static Header[] headers() {
+        return new Header[] {
+          UnicastHeader3.createDataHeader(322649L, (short)1, false),
+          new RequestCorrelator.Header((byte)1, 33L, (short)2),
+          new FORK.ForkHeader("foo", "bar")
+        };
+    }
 
 }

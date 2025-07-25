@@ -1,5 +1,7 @@
 package org.jgroups.nio;
 
+import org.jgroups.util.Util;
+
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -13,14 +15,20 @@ import java.util.NoSuchElementException;
 /**
  * Class to do scattering reads or gathering writes on a sequence of {@link ByteBuffer} instances. The buffers are
  * kept in an array with fixed capacity (max Short.MAX_VALUE).
- * Buffers can be added and removed dynamically (they're dropped when the capacity is exceeded).<p/>
- * A read is successful when all non-null buffers from left to right are filled, ie. all {@link ByteBuffer#remaining()}
- * methods return 0.<p/>
+ * Buffers can be added and removed dynamically, but they're <em>dropped when the capacity is exceeded</em>. This
+ * means that, if a we have configured a capacity of 5 buffers, and want to add 6, <em>none of the 6 buffers will
+ * be added!</em>
+ * <br/>
+ * A read is successful when all non-null buffers from left to right are filled, i.e. all {@link ByteBuffer#remaining()}
+ * methods return 0.
+ * <br/>
  * Same for writes: when all non-null buffers (from left to right) have been written ({@link ByteBuffer#remaining()} == 0),
- * a write is considered successful; otherwise it is partial.<p/>
+ * a write is considered successful; otherwise it is partial.
+ * <br/>
  * Individual buffers can be accessed; e.g. for reading its value after a read. It is also possible to add buffers
  * dynamically, e.g. after reading a 'length' buffer, a user may want to add a new buffer allocated for reading
- * 'length' bytes.<p/>
+ * 'length' bytes.
+ * <br/>
  * This class is not synchronized.
  * @author Bela Ban
  * @since  3.6.5
@@ -30,6 +38,7 @@ public class Buffers implements Iterable<ByteBuffer> {
     protected short position;          // points to the next buffer in bufs to be read or written
     protected short limit;             // points beyond the last buffer in bufs that was read or written
     protected short next_to_copy;      // index of the next buffer to copy, set by copy(): position <= last_copied <= limit
+    protected int   max_length;        // max number of bytes to read (JGRP-2523)
 
     /**
      * Creates a new instance with an array of capacity buffers
@@ -57,7 +66,8 @@ public class Buffers implements Iterable<ByteBuffer> {
     public Buffers limit(int new_limit)    {this.limit=toPositiveUnsignedShort(new_limit); return this;}
     public int     nextToCopy()            {return next_to_copy;}
     public Buffers nextToCopy(int next)    {next_to_copy=toPositiveUnsignedShort(next); return this;}
-
+    public int     maxLength()             {return max_length;}
+    public Buffers maxLength(int len)      {max_length=len; return this;}
 
     public int remaining() {
         int remaining=0;
@@ -78,7 +88,10 @@ public class Buffers implements Iterable<ByteBuffer> {
         return false;
     }
 
-
+    /**
+     * Adds a number of buffers. Note that if the buffers cannot be added <em>as a whole,
+     * e.g. because of exceeding the capacity, none of them will be added!</em>
+     */
     public Buffers add(ByteBuffer ... buffers) {
         if(buffers == null)
             return this;
@@ -91,6 +104,7 @@ public class Buffers implements Iterable<ByteBuffer> {
         return this;
     }
 
+    /** Adds a buffer. If there's no capacity, the buffer will not be added and will be silently dropped */
     public Buffers add(ByteBuffer buf) {
         if(buf == null)
             return this;
@@ -114,7 +128,6 @@ public class Buffers implements Iterable<ByteBuffer> {
     }
 
 
-
     /**
      * Reads length and then length bytes into the data buffer, which is grown if needed.
      * @param ch The channel to read data from
@@ -128,6 +141,12 @@ public class Buffers implements Iterable<ByteBuffer> {
             return null;
 
         int len=bufs[0].getInt(0);
+        // https://issues.redhat.com/browse/JGRP-2523: check if max_length has been exceeded
+        if(max_length > 0 && len > max_length)
+            throw new IllegalStateException(String.format("the length of a message (%s) from %s is bigger than the " +
+                                                            "max accepted length (%s): discarding the message",
+                                                          Util.printBytes(len), ch.getRemoteAddress(),
+                                                          Util.printBytes(max_length)));
         if(bufs[1] == null || len > bufs[1].capacity())
             bufs[1]=ByteBuffer.allocate(len);
         // Workaround for JDK8 compatibility
@@ -188,10 +207,9 @@ public class Buffers implements Iterable<ByteBuffer> {
                 throw closed_ex;
             }
             catch(NotYetConnectedException | IOException others) {
-                ; // ignore, we'll queue 1 write
+                ; // ignore, we'll queue writes up to Buffers.capacity
             }
         }
-
         return nullData();
     }
 
@@ -279,12 +297,6 @@ public class Buffers implements Iterable<ByteBuffer> {
         return num;
     }
 
-    /*protected void assertNextToCopy() {
-        boolean condition=position <= next_to_copy && next_to_copy <= limit;
-        assert condition
-          : String.format("position=%d next_to_copy=%d limit=%d\n", position, next_to_copy, limit);
-    }*/
-
     /** Copies a ByteBuffer by copying and wrapping the underlying array of a heap-based buffer. Direct buffers
         are converted to heap-based buffers */
     public static ByteBuffer copyBuffer(final ByteBuffer buf) {
@@ -295,7 +307,6 @@ public class Buffers implements Iterable<ByteBuffer> {
         if(!buf.isDirect())
             System.arraycopy(buf.array(), offset, tmp, 0, len);
         else {
-         //   buf.get(tmp, 0, len);
             for(int i=0; i < len; i++)
                 tmp[i]=buf.get(i+offset);
         }

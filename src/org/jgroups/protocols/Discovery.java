@@ -19,6 +19,7 @@ import java.util.*;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 
 /**
@@ -81,12 +82,12 @@ public abstract class Discovery extends Protocol {
     protected int                        max_rank_to_reply;
 
     @Property(description="The number of times a discovery process is executed when finding initial members " +
-      "(https://issues.jboss.org/browse/JGRP-2317)")
+      "(https://issues.redhat.com/browse/JGRP-2317)")
     protected int                        num_discovery_runs=1;
 
     /* ---------------------------------------------   JMX      ------------------------------------------------------ */
 
-    @ManagedAttribute(description="Total number of discovery requests sent ")
+    @ManagedAttribute(description="Total number of discovery requests sent",type=AttributeType.SCALAR)
     protected int                        num_discovery_requests;
 
     /* --------------------------------------------- Fields ------------------------------------------------------ */
@@ -97,7 +98,6 @@ public abstract class Discovery extends Protocol {
     protected volatile View              view;
     @ManagedAttribute(description="Whether this member is the current coordinator")
     protected volatile boolean           is_coord;
-    protected volatile Address           local_addr;
     protected volatile Address           current_coord;
     protected String                     cluster_name;
     protected TP                         transport;
@@ -159,6 +159,8 @@ public abstract class Discovery extends Protocol {
     public boolean                 useDiskCache()                     {return use_disk_cache;}
     public <T extends Discovery> T useDiskCache(boolean flag)         {use_disk_cache=flag; return (T)this;}
     public <T extends Discovery> T discoveryRspExpiryTime(long t)     {this.discovery_rsp_expiry_time=t; return (T)this;}
+    public boolean                 sendCacheOnJoin()                  {return send_cache_on_join;}
+    public <T extends Discovery> T sendCacheOnJoin(boolean b)         {this.send_cache_on_join=b; return (T)this;}
 
 
 
@@ -191,7 +193,6 @@ public abstract class Discovery extends Protocol {
         super.resetStats();
         num_discovery_requests=0;
     }
-
 
     public void addResponse(Responses rsp) {
         synchronized(ping_responses) {
@@ -293,58 +294,85 @@ public abstract class Discovery extends Protocol {
         PingHeader hdr=msg.getHeader(this.id);
         if(hdr == null)
             return up_prot.up(msg);
-
         if(is_leaving)
-            return null; // prevents merging back a leaving member (https://issues.jboss.org/browse/JGRP-1336)
+            return null; // prevents merging back a leaving member (https://issues.redhat.com/browse/JGRP-1336)
+        return handle(hdr, msg);
+    }
 
-        PingData data=readPingData(msg.getArray(), msg.getOffset(), msg.getLength());
-        Address logical_addr=data != null? data.getAddress() : msg.getSrc();
+    public void up(MessageBatch batch) {
+        if(is_leaving)
+            batch.removeIf(m -> m.getHeader(id) != null, true);
+        else {
+            for(Iterator<Message> it=batch.iterator(); it.hasNext();) {
+                Message msg=it.next();
+                PingHeader hdr=msg.getHeader(id);
+                if(hdr != null) {
+                    it.remove();
+                    handle(hdr, msg);
+                }
+            }
+        }
+        if(!batch.isEmpty())
+            up_prot.up(batch);
+    }
 
+    protected Object handle(PingHeader hdr, Message msg) {
+        List<PingData> data=readPingData(msg.getArray(), msg.getOffset(), msg.getLength());
         switch(hdr.type) {
-
             case PingHeader.GET_MBRS_REQ:   // return Rsp(local_addr, coord)
                 if(cluster_name == null || hdr.cluster_name == null) {
                     log.warn("cluster_name (%s) or cluster_name of header (%s) is null; passing up discovery " +
                                "request from %s, but this should not be the case", cluster_name, hdr.cluster_name, msg.getSrc());
                 }
-                else {
-                    if(!cluster_name.equals(hdr.cluster_name)) {
-                        log.warn("%s: discarding discovery request for cluster '%s' from %s; " +
-                                   "our cluster name is '%s'. Please separate your clusters properly",
-                                 logical_addr, hdr.cluster_name, msg.getSrc(), cluster_name);
-                        return null;
-                    }
+                else if(!cluster_name.equals(hdr.cluster_name)) {
+                    log.warn("%s: discarding discovery request for cluster '%s' from %s; " +
+                               "our cluster name is '%s'. Please separate your clusters properly",
+                             msg.src(), hdr.cluster_name, msg.getSrc(), cluster_name);
+                    return null;
                 }
 
                 // add physical address and logical name of the discovery sender (if available) to the cache
                 if(data != null) { // null if use_ip_addrs is true
-                    addDiscoveryResponseToCaches(logical_addr, data.getLogicalName(), data.getPhysicalAddr());
-                    discoveryRequestReceived(msg.getSrc(), data.getLogicalName(), data.getPhysicalAddr());
-                    addResponse(data, false);
+                    for(PingData pd: data) {
+                        Address logical_addr=pd != null? pd.getAddress() : msg.getSrc();
+                        addDiscoveryResponseToCaches(logical_addr, pd.getLogicalName(), pd.getPhysicalAddr());
+                        discoveryRequestReceived(msg.getSrc(), pd.getLogicalName(), pd.getPhysicalAddr());
+                        addResponse(pd, false);
+                    }
                 }
 
                 if(return_entire_cache) {
                     Map<Address,PhysicalAddress> cache=(Map<Address,PhysicalAddress>)down(new Event(Event.GET_LOGICAL_PHYSICAL_MAPPINGS));
                     if(cache != null) {
+                        List<PingData> rsps=new ArrayList<>();
                         for(Map.Entry<Address,PhysicalAddress> entry: cache.entrySet()) {
                             Address addr=entry.getKey();
                             // JGRP-1492: only return our own address, and addresses in view.
                             if(addr.equals(local_addr) || (view != null && view.containsMember(addr))) {
                                 PhysicalAddress physical_addr=entry.getValue();
-                                sendDiscoveryResponse(addr, physical_addr, NameCache.get(addr), msg.getSrc(), isCoord(addr));
+                                String name=NameCache.get(addr);
+                                rsps.add(new PingData(addr, is_server, name, physical_addr).coord(isCoord(addr)));
                             }
                         }
+                        sendDiscoveryResponse(rsps, msg.src());
                     }
                     return null;
                 }
-
-                // Only send a response if hdr.mbrs is not empty and contains myself. Otherwise always send my info
-                Collection<? extends Address> mbrs=data != null? data.mbrs() : null;
-                boolean drop_because_of_rank=max_rank_to_reply > 0 && hdr.initialDiscovery() && Util.getRank(view, local_addr) > max_rank_to_reply;
-                if(drop_because_of_rank || (mbrs != null && !mbrs.contains(local_addr)))
+                if(max_rank_to_reply > 0 && hdr.initialDiscovery() && Util.getRank(view, local_addr) > max_rank_to_reply)
                     return null;
+                // Drop the response if PingData.mbrs is not empty/null and doesn't contain myself
+                // Otherwise, (mbrs==null) always send a response
+                if(data != null) {
+                    List<? extends Address> list=data.stream()
+                      .map(PingData::mbrs)
+                      .filter(Objects::nonNull)
+                      .flatMap(Collection::stream).collect(Collectors.toList());
+                    if(!list.isEmpty() && !list.contains(local_addr))
+                        return null;
+                }
                 PhysicalAddress physical_addr=(PhysicalAddress)down(new Event(Event.GET_PHYSICAL_ADDRESS, local_addr));
-                sendDiscoveryResponse(local_addr, physical_addr, NameCache.get(local_addr), msg.getSrc(), is_coord);
+                PingData p=new PingData(local_addr, is_server, NameCache.get(local_addr), physical_addr).coord(is_coord);
+                sendDiscoveryResponse(List.of(p), msg.src());
                 return null;
 
             case PingHeader.GET_MBRS_RSP:
@@ -352,8 +380,7 @@ public abstract class Discovery extends Protocol {
                 if(data != null) {
                     // find the top discovery prot and deliver the response: https://issues.redhat.com/browse/JGRP-2230
                     Discovery d=findTopmostDiscoveryProtocol();
-                    log.trace("%s: received GET_MBRS_RSP from %s: %s%s",
-                              local_addr, msg.getSrc(), data,
+                    log.trace("%s: received GET_MBRS_RSP from %s: %s%s", local_addr, msg.getSrc(), print(data),
                               d != this? ", delivering it to " + d.getClass().getSimpleName() : "");
                     d.handleDiscoveryResponse(data, msg.getSrc());
                 }
@@ -364,6 +391,7 @@ public abstract class Discovery extends Protocol {
                 return null;
         }
     }
+
 
     /** Calls {@link #findMembers(List, boolean, Responses)} in this protocol and all discovery protocols below */
     protected void callFindMembersInAllDiscoveryProtocols(List<Address> mbrs, boolean initial_discovery, Responses rsps) {
@@ -383,8 +411,18 @@ public abstract class Discovery extends Protocol {
         return ret;
     }
 
+    protected void handleDiscoveryResponse(List<PingData> data, Address sender) {
+        // add physical address (if available) to transport's cache
+        if(data != null) {
+            for(PingData pd: data)
+                handleDiscoveryResponse(pd, sender);
+        }
+    }
+
     protected void handleDiscoveryResponse(PingData data, Address sender) {
         // add physical address (if available) to transport's cache
+        if(data == null)
+            return;
         Address logical_addr=data.getAddress() != null? data.getAddress() : sender;
         addDiscoveryResponseToCaches(logical_addr, data.getLogicalName(), data.getPhysicalAddr());
         boolean overwrite=Objects.equals(logical_addr, sender);
@@ -422,14 +460,8 @@ public abstract class Discovery extends Protocol {
                 is_server=true;
                 return null;
 
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                return down_prot.down(evt);
-
             case Event.CONNECT:
             case Event.CONNECT_WITH_STATE_TRANSFER:
-            case Event.CONNECT_USE_FLUSH:
-            case Event.CONNECT_WITH_STATE_TRANSFER_USE_FLUSH:
                 is_leaving=false;
                 cluster_name=evt.getArg();
                 Object ret=down_prot.down(evt);
@@ -583,10 +615,11 @@ public abstract class Discovery extends Protocol {
      * @param data the PingData instance to serialize.
      * @return
      */
-    protected byte[] serializeWithoutView(PingData data) {
-        final PingData clone = new PingData(data.getAddress(), data.isServer(), data.getLogicalName(), data.getPhysicalAddr()).coord(data.isCoord());
+    protected ByteArray serializeWithoutView(PingData data) {
+        final PingData clone=new PingData(data.getAddress(), data.isServer(), data.getLogicalName(), data.getPhysicalAddr())
+          .coord(data.isCoord());
         try {
-            return Util.streamableToByteBuffer(clone);
+            return marshal(clone);
         }
         catch(Exception e) {
             log.error(Util.getMessage("ErrorSerializingPingData"), e);
@@ -594,22 +627,47 @@ public abstract class Discovery extends Protocol {
         }
     }
 
-    protected static PingData deserialize(final byte[] data) throws Exception {
-        return Util.streamableFromByteBuffer(PingData::new, data);
+    public static List<PingData> deserialize(final byte[] data, int offset, int length) throws Exception {
+        ByteArrayDataInputStream in=new ByteArrayDataInputStream(data, offset, length);
+        int num=in.readInt();
+        if(num == 0)
+            return null;
+        List<PingData> list=new ArrayList<>(num);
+        for(int i=0; i < num; i++) {
+            PingData pd=new PingData();
+            pd.readFrom(in);
+            list.add(pd);
+        }
+        return list;
     }
 
     public static ByteArray marshal(PingData data) {
+       return marshal(new PingData[] {data});
+    }
+
+    public static ByteArray marshal(PingData ... list) {
+        return marshal(List.of(list));
+    }
+
+    public static ByteArray marshal(List<PingData> list) {
         try {
-            return Util.streamableToBuffer(data);
+            int size=Integer.BYTES + list.stream().mapToInt(PingData::serializedSize).sum();
+            ByteArrayDataOutputStream out=new ByteArrayDataOutputStream(size);
+            out.writeInt(list.size());
+            for(PingData data: list)
+                data.writeTo(out);
+            return out.getBuffer();
         }
         catch(Exception e) {
             return null;
         }
     }
 
-    protected PingData readPingData(byte[] buffer, int offset, int length) {
+    protected List<PingData> readPingData(byte[] buffer, int offset, int length) {
         try {
-            return buffer != null? Util.streamableFromBuffer(PingData::new, buffer, offset, length) : null;
+            if(buffer == null)
+                return null;
+            return deserialize(buffer, offset, length);
         }
         catch(Exception ex) {
             log.error("%s: failed reading PingData from message: %s", local_addr, ex);
@@ -620,7 +678,7 @@ public abstract class Discovery extends Protocol {
     protected void sendDiscoveryResponse(Address logical_addr, PhysicalAddress physical_addr,
                                          String logical_name, final Address sender, boolean coord) {
         PingData data=new PingData(logical_addr, is_server, logical_name, physical_addr).coord(coord);
-        Message rsp_msg=new BytesMessage(sender).setFlag(Message.Flag.INTERNAL, Message.Flag.OOB, Message.Flag.DONT_BUNDLE)
+        Message rsp_msg=new BytesMessage(sender).setFlag(Message.Flag.OOB, Message.Flag.DONT_BUNDLE)
           .putHeader(this.id, new PingHeader(PingHeader.GET_MBRS_RSP)).setArray(marshal(data));
 
         if(stagger_timeout > 0) {
@@ -637,6 +695,33 @@ public abstract class Discovery extends Protocol {
 
         log.trace("%s: received GET_MBRS_REQ from %s, sending response %s", local_addr, sender, data);
         down_prot.down(rsp_msg);
+    }
+
+    protected void sendDiscoveryResponse(List<PingData> list, final Address sender) {
+        Message rsp_msg=new BytesMessage(sender)
+          .setFlag(Message.Flag.OOB, Message.Flag.DONT_BUNDLE).setFlag(Message.TransientFlag.DONT_BLOCK)
+          .putHeader(this.id, new PingHeader(PingHeader.GET_MBRS_RSP)).setArray(marshal(list));
+
+        if(stagger_timeout > 0) {
+            int view_size=view != null? view.size() : 10;
+            int rank=Util.getRank(view, local_addr); // returns 0 if view or local_addr are null
+            long sleep_time=rank == 0? Util.random(stagger_timeout)
+              : stagger_timeout * rank / view_size - (stagger_timeout / view_size);
+            timer.schedule(() -> {
+                log.trace("%s: received GET_MBRS_REQ from %s, sending staggered response %s", local_addr, sender, print(list));
+                down_prot.down(rsp_msg);
+            }, sleep_time, TimeUnit.MILLISECONDS, sends_can_block);
+            return;
+        }
+
+        log.trace("%s: received GET_MBRS_REQ from %s, sending response %s", local_addr, sender, print(list));
+        down_prot.down(rsp_msg);
+    }
+
+    protected static String print(List<PingData> list) {
+        if(list == null)
+            return "null";
+        return list.stream().map(PingData::toString).collect(Collectors.joining("\n"));
     }
 
     protected static String addressAsString(Address address) {
@@ -676,7 +761,7 @@ public abstract class Discovery extends Protocol {
 
         // 2. Send information about new_mbrs to <everyone - self - left_mbrs - new_mbrs>
         Set<Address> targets=new HashSet<>(current_mbrs);
-        targets.removeAll(new_mbrs);
+        new_mbrs.forEach(targets::remove);
 
         if(!targets.isEmpty()) {
             for(Address addr : new_mbrs) {

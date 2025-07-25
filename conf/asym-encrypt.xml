@@ -1,13 +1,11 @@
 
-<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-        xmlns="urn:org:jgroups"
-        xsi:schemaLocation="urn:org:jgroups http://www.jgroups.org/schema/jgroups.xsd"
-        >
-    <UDP />
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="urn:org:jgroups"
+        xsi:schemaLocation="urn:org:jgroups http://www.jgroups.org/schema/jgroups.xsd">
+    <include file="${transport-config:udp-default.xml}" />
     <PING/>
     <MERGE3/>
-    <FD_ALL3 timeout="8000" interval="3000"/>
-    <FD_SOCK/>
+    <FD_ALL3 timeout="8s" interval="3s"/>
+    <FD_SOCK2/>
     <VERIFY_SUSPECT/>
     <!-- Possibly use a second FRAG2 if the public/private keys added in ASYM_ENCRYPT to the payload make the message too big -->
     <!--FRAG2 id="1234"/-->
@@ -22,5 +20,5 @@
     <UNICAST3/>
     <pbcast.STABLE/>
     <FRAG2/>
-    <pbcast.GMS join_timeout="2000" />
+    <pbcast.GMS join_timeout="2s" />
 </config>

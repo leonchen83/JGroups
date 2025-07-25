@@ -2,6 +2,7 @@ package org.jgroups.protocols;
 
 import org.jgroups.Address;
 import org.jgroups.annotations.Property;
+import org.jgroups.util.ByteArray;
 import org.jgroups.util.Responses;
 import org.jgroups.util.Util;
 
@@ -10,6 +11,7 @@ import javax.naming.NamingException;
 import javax.sql.DataSource;
 import java.sql.*;
 import java.util.List;
+import java.util.function.Function;
 
 /**
  * <p>Discovery protocol using a JDBC connection to a shared database.
@@ -83,6 +85,10 @@ public class JDBC_PING extends FILE_PING {
         "properties must be empty.")
     protected String datasource_jndi_name;
 
+    @Property(description="The fully qualified name of a class which implements a Function<JDBC_PING,DataSource>. " +
+      "If not null, this has precedence over datasource_jndi_name.")
+    protected String datasource_injecter_class;
+
     /* --------------------------------------------- Fields ------------------------------------------------------ */
 
     protected DataSource dataSource;
@@ -92,20 +98,52 @@ public class JDBC_PING extends FILE_PING {
         ; // do *not* create root file system (don't remove !)
     }
 
-    public JDBC_PING setDataSource(DataSource dataSource) {
-        this.dataSource = dataSource; return this;
-    }
+    public JDBC_PING  setDataSource(DataSource ds)         {this.dataSource=ds; return this;}
+    public DataSource getDataSource()                      {return dataSource;}
+    public String     getConnectionUrl()                   {return connection_url;}
+    public JDBC_PING  setConnectionUrl(String c)           {this.connection_url=c; return this;}
+    public String     getConnectionUsername()              {return connection_username;}
+    public JDBC_PING  setConnectionUsername(String c)      {this.connection_username=c; return this;}
+    public String     getConnectionPassword()              {return connection_password;}
+    public JDBC_PING  setConnectionPassword(String c)      {this.connection_password=c; return this;}
+    public String     getConnectionDriver()                {return connection_driver;}
+    public JDBC_PING  setConnectionDriver(String c)        {this.connection_driver=c; return this;}
+    public String     getInitializeSql()                   {return initialize_sql;}
+    public JDBC_PING  setInitializeSql(String i)           {this.initialize_sql=i; return this;}
+    public String     getInsertSingleSql()                 {return insert_single_sql;}
+    public JDBC_PING  setInsertSingleSql(String i)         {this.insert_single_sql=i; return this;}
+    public String     getDeleteSingleSql()                 {return delete_single_sql;}
+    public JDBC_PING  setDeleteSingleSql(String d)         {this.delete_single_sql=d; return this;}
+    public String     getClearSql()                        {return clear_sql;}
+    public JDBC_PING  setClearSql(String c)                {this.clear_sql=c; return this;}
+    public String     getSelectAllPingdataSql()            {return select_all_pingdata_sql;}
+    public JDBC_PING  setSelectAllPingdataSql(String s)    {this.select_all_pingdata_sql=s; return this;}
+    public String     getContainsSql()                     {return contains_sql;}
+    public JDBC_PING  setContainsSql(String c)             {this.contains_sql=c; return this;}
+    public String     getDatasourceJndiName()              {return datasource_jndi_name;}
+    public JDBC_PING  setDatasourceJndiName(String d)      {this.datasource_jndi_name=d; return this;}
+    public String     getDatasourceInjecterClass()         {return datasource_injecter_class;}
+    public JDBC_PING  setDatasourceInjecterClass(String d) {this.datasource_injecter_class=d; return this;}
+
 
     @Override
     public void init() throws Exception {
         super.init();
         verifyConfigurationParameters();
         // If dataSource is already set, skip loading driver or JNDI lookup
-        if (dataSource == null) {
-            if (stringIsEmpty(datasource_jndi_name)) {
-                loadDriver();
-            } else {
-                dataSource = getDataSourceFromJNDI(datasource_jndi_name.trim());
+        if(dataSource == null) {
+            if(datasource_injecter_class != null) {
+                dataSource=injectDataSource(datasource_injecter_class);
+                if(dataSource == null) {
+                    String m=String.format("datasource_injecter_class %s created null datasource", datasource_injecter_class);
+                    throw new IllegalArgumentException(m);
+                }
+            }
+            else {
+                if(datasource_jndi_name != null)
+                    dataSource=getDataSourceFromJNDI(datasource_jndi_name.trim());
+                else
+                    loadDriver();
             }
         }
         attemptSchemaInitialization();
@@ -218,13 +256,17 @@ public class JDBC_PING extends FILE_PING {
 	            while(resultSet.next()) {
 	                byte[] bytes=resultSet.getBytes(1);
 	                try {
-	                    PingData data=deserialize(bytes);
-                        reads++;
-	                    if(data == null || (members != null && !members.contains(data.getAddress())))
-	                        continue;
-	                    rsps.addResponse(data, false);
-	                    if(local_addr != null && !local_addr.equals(data.getAddress()))
-	                        addDiscoveryResponseToCaches(data.getAddress(), data.getLogicalName(), data.getPhysicalAddr());
+	                    List<PingData> list=readPingData(bytes, 0, bytes.length);
+                        if(list != null) {
+                            for(PingData data: list) {
+                                reads++;
+                                if(data == null || (members != null && !members.contains(data.getAddress())))
+                                    continue;
+                                rsps.addResponse(data, false);
+                                if(local_addr != null && !local_addr.equals(data.getAddress()))
+                                    addDiscoveryResponseToCaches(data.getAddress(), data.getLogicalName(), data.getPhysicalAddr());
+                            }
+                        }
 	                }
 	                catch(Exception e) {
 	                    int row=resultSet.getRow();
@@ -243,8 +285,8 @@ public class JDBC_PING extends FILE_PING {
 
 
     protected void attemptSchemaInitialization() {
-        if(stringIsEmpty(initialize_sql)) {
-            log.debug("Table creation step skipped: initialize_sql property is missing");
+        if(initialize_sql == null) {
+            log.debug("Table creation step skipped: initialize_sql attribute is missing");
             return;
         }
         Connection connection=getConnection();
@@ -262,27 +304,29 @@ public class JDBC_PING extends FILE_PING {
                         "To suppress this message, set initialize_sql to an empty value. Cause: %s", e.getMessage());
         }
         finally {
-            try {
-                connection.close();
-            }
-            catch(SQLException e) {
-                log.error(Util.getMessage("ErrorClosingConnection"), e);
-            }
+            closeConnection(connection);
         }
     }
 
     protected void loadDriver() {
-        if (stringIsEmpty(connection_driver))
-            return;
-        log.debug("Registering JDBC Driver named '%s'", connection_driver);
+        assertNonNull("connection_driver", connection_driver);
+        log.debug("Registering JDBC driver %s", connection_driver);
         try {
-            Class.forName(connection_driver);
-        } catch (ClassNotFoundException e) {
-            throw new IllegalArgumentException("JDBC Driver required for JDBC_PING "
-                        + " protocol could not be loaded: '" + connection_driver + "'");
+            Util.loadClass(connection_driver, this.getClass().getClassLoader());
+        }
+        catch (ClassNotFoundException e) {
+            throw new IllegalArgumentException(String.format("JDBC driver could not be loaded: '%s'", connection_driver));
         }
     }
 
+    protected DataSource injectDataSource(String ds_class) throws Exception {
+        Class<?> cl=Util.loadClass(ds_class, Thread.currentThread().getContextClassLoader());
+        Object obj=cl.getConstructor().newInstance();
+        Function<JDBC_PING,DataSource> fun=(Function<JDBC_PING,DataSource>)obj;
+        return fun.apply(this);
+    }
+
+    // todo: check if connections should be cached (connection pool?)
     protected Connection getConnection() {
         if (dataSource == null) {
             Connection connection;
@@ -310,11 +354,11 @@ public class JDBC_PING extends FILE_PING {
 
 
     protected synchronized void insert(Connection connection, PingData data, String clustername, String address) throws SQLException {
-        final byte[] serializedPingData = serializeWithoutView(data);
+        final ByteArray serializedPingData = serializeWithoutView(data);
         try (PreparedStatement ps=connection.prepareStatement(insert_single_sql)) {
             ps.setString(1, address);
             ps.setString(2, clustername);
-            ps.setBytes(3, serializedPingData);
+            ps.setBytes(3, serializedPingData.getBytes());
             if(log.isTraceEnabled())
                 log.trace("%s: SQL for insertion: %s", local_addr, ps);
             ps.executeUpdate();
@@ -350,20 +394,29 @@ public class JDBC_PING extends FILE_PING {
 
 
     protected void clearTable(String clustername) {
-        try(Connection conn=getConnection();
-            PreparedStatement ps=conn.prepareStatement(clear_sql)) {
-            // check presence of cluster_name parameter for backwards compatibility
-            if (clear_sql.indexOf('?') >= 0)
-                ps.setString(1, clustername);
-            else
-                log.debug("Please update your clear_sql to include cluster_name parameter.");
-            if(log.isTraceEnabled())
-                log.trace("%s: SQL for clearing the table: %s", local_addr, ps);
-            ps.execute();
-            log.debug("%s: cleared table for cluster %s", local_addr, clustername);
+        try(Connection conn=getConnection()) {
+            if(conn != null) {
+                try(PreparedStatement ps=conn.prepareStatement(clear_sql)) {
+                    // check presence of cluster_name parameter for backwards compatibility
+                    if(clear_sql.indexOf('?') >= 0)
+                        ps.setString(1, clustername);
+                    else
+                        log.debug("Please update your clear_sql to include cluster_name parameter.");
+                    if(log.isTraceEnabled())
+                        log.trace("%s: SQL for clearing the table: %s", local_addr, ps);
+                    ps.execute();
+                    log.debug("%s: cleared table for cluster %s", local_addr, clustername);
+                }
+                catch(SQLException e1) {
+                    log.error(Util.getMessage("ErrorClearingTable"), e1);
+                }
+                finally {
+                    closeConnection(conn);
+                }
+            }
         }
-        catch(SQLException e) {
-            log.error(Util.getMessage("ErrorClearingTable"), e);
+        catch(SQLException e2) {
+            log.error(Util.getMessage("ErrorClearingTable"), e2);
         }
     }
 
@@ -403,42 +456,21 @@ public class JDBC_PING extends FILE_PING {
     }
     
     protected void verifyConfigurationParameters() {
-        // Skip if datasource is already provided via integration code (e.g. WildFly)
-        if (dataSource == null) {
-            if (stringIsEmpty(this.connection_url) ||
-                    stringIsEmpty(this.connection_driver) ||
-                    stringIsEmpty(this.connection_username)) {
-                if (stringIsEmpty(this.datasource_jndi_name)) {
-                    throw new IllegalArgumentException("Either the 4 configuration properties starting with 'connection_' or the datasource_jndi_name must be set");
-                }
-            }
-            if (stringNotEmpty(this.connection_url) ||
-                    stringNotEmpty(this.connection_driver) ||
-                    stringNotEmpty(this.connection_username)) {
-                if (stringNotEmpty(this.datasource_jndi_name)) {
-                    throw new IllegalArgumentException("When using the 'datasource_jndi_name' configuration property, all properties starting with 'connection_' must not be set");
-                }
-            }
-        }
-        if (stringIsEmpty(this.insert_single_sql)) {
-            throw new IllegalArgumentException("The insert_single_sql configuration property is mandatory");
-        }
-        if (stringIsEmpty(this.delete_single_sql)) {
-            throw new IllegalArgumentException("The delete_single_sql configuration property is mandatory");
-        }
-        if (stringIsEmpty(this.select_all_pingdata_sql)) {
-            throw new IllegalArgumentException("The select_all_pingdata_sql configuration property is mandatory");
-        }
+        // initialize_sql is skipped as the table could be created external to JDBC_PING
+        assertNonNull("insert_single_sql",         insert_single_sql,
+                      "clear_sql",                 clear_sql,
+                      "delete_single_sql",         delete_single_sql,
+                      "select_all_pingdata_sql",   select_all_pingdata_sql,
+                      "contains_sql",              contains_sql);
     }
     
-    private static boolean stringIsEmpty(final String value) {
-        return value == null || value.trim().isEmpty();
+    protected static void assertNonNull(String... strings) {
+        for(int i=0; i < strings.length; i+=2) {
+            String attr=strings[i], val=strings[i+1];
+            if(val == null)
+                throw new IllegalArgumentException(String.format("%s must not be null", attr));
+        }
     }
-    
-    private static boolean stringNotEmpty(final String value) {
-        return !stringIsEmpty(value);
-    }
-
 
     public static void main(String[] args) throws ClassNotFoundException {
         String driver="org.hsqldb.jdbcDriver";
@@ -488,8 +520,12 @@ public class JDBC_PING extends FILE_PING {
                 while(resultSet.next()) {
                     byte[] bytes=resultSet.getBytes(1);
                     try {
-                        PingData data=deserialize(bytes);
-                        System.out.printf("%d %s\n", index++, data);
+                        List<PingData> list=deserialize(bytes, 0, bytes.length);
+                        if(list != null) {
+                            for(PingData data: list) {
+                                System.out.printf("%d %s\n", index++, data);
+                            }
+                        }
                     }
                     catch(Exception e) {
                     }

@@ -67,6 +67,16 @@ public class ViewHandlerTest {
         assert list.equals(Arrays.asList(1,3,5,2,4,6));
     }
 
+    public void testAddNullRequest() {
+        List<Integer> list=new ArrayList<>();
+        req_handler=list::addAll;
+        req_matcher=ViewHandlerTest::matches;
+        Stream.of(1,null,3,4,null).forEach(n -> view_handler.add(n));
+        System.out.printf("list: %s\n", list);
+        assert list.size() == 3;
+        assert list.equals(Arrays.asList(1,3,4));
+    }
+
     public void testAdd2() {
         List<Integer> list=new ArrayList<>();
         req_handler=list::addAll;
@@ -77,7 +87,7 @@ public class ViewHandlerTest {
     }
 
 
-    public void testAddList() {
+    public void testAddArray() {
         List<Integer> list=new ArrayList<>();
         req_handler=list::addAll;
         req_matcher=ViewHandlerTest::matches; // either both even or both odd
@@ -85,6 +95,39 @@ public class ViewHandlerTest {
         view_handler.add(numbers);
         System.out.printf("drained: %s\n", list);
         assert list.equals(Arrays.asList(numbers));
+    }
+
+    public void testAddArrayWithNullElements() {
+        List<Integer> list=new ArrayList<>();
+        req_handler=list::addAll;
+        req_matcher=ViewHandlerTest::matches; // either both even or both odd
+        Integer[] numbers={1,2,null,3,4,null};
+        view_handler.add(numbers);
+        System.out.printf("drained: %s\n", list);
+        List<Integer> copy=new ArrayList<>(Arrays.asList(numbers));
+        copy.removeIf(Objects::isNull);
+        assert list.equals(copy);
+    }
+
+    public void testAddList() {
+        List<Integer> list=new ArrayList<>();
+        req_handler=list::addAll;
+        req_matcher=ViewHandlerTest::matches; // either both even or both odd
+        List<Integer> numbers=Arrays.asList(1, 3, 5, 2, 4, 6, 7, 9, 8, 10);
+        view_handler.add(numbers);
+        System.out.printf("drained: %s\n", list);
+        assert list.equals(numbers);
+    }
+
+    public void testAddListWithNullElements() {
+        List<Integer> list=new ArrayList<>();
+        req_handler=list::addAll;
+        req_matcher=ViewHandlerTest::matches; // either both even or both odd
+        List<Integer> numbers=Arrays.asList(1, null, 3, 4, null);
+        view_handler.add(numbers);
+        ArrayList<Integer> copy=new ArrayList<>(numbers);
+        copy.removeIf(Objects::isNull);
+        assert list.equals(copy);
     }
 
     public void testConcurrentAdd() throws Exception {
@@ -260,8 +303,7 @@ public class ViewHandlerTest {
             System.out.printf("Joined %d in %d ms\n", adder.getId(), time);
         }
         System.out.println("view_handler = " + view_handler);
-        view_handler.waitUntilComplete(10000);
-        // view_handler.waitUntilComplete();
+        view_handler.waitUntilComplete();
         System.out.println("view_handler = " + view_handler);
         assert view_handler.size() == 0;
     }
@@ -276,7 +318,7 @@ public class ViewHandlerTest {
         ViewHandler<GmsImpl.Request> handler=new ViewHandler<>(gms, req_processor, GmsImpl.Request::canBeProcessedTogether);
         handler.add(new GmsImpl.Request(GmsImpl.Request.COORD_LEAVE),
                     new GmsImpl.Request(GmsImpl.Request.COORD_LEAVE));
-
+        handler.waitUntilComplete();
         assert result.get();
     }
 
@@ -293,10 +335,28 @@ public class ViewHandlerTest {
                     new GmsImpl.Request(GmsImpl.Request.JOIN, b),
                     new GmsImpl.Request(GmsImpl.Request.COORD_LEAVE),
                     new GmsImpl.Request(GmsImpl.Request.COORD_LEAVE));
-
+        handler.waitUntilComplete();
         assert result.get();
     }
 
+    /** Tests the case where ViewHandler.process() encounters an exception throw by the request processor. This must
+     * not prevent processing from being set to false when process() returns */
+    public void testProcessWithException() {
+        Consumer<Collection<Integer>> processor=l -> {
+            if(l.size() < 5)
+                System.out.printf("list: %s\n", l);
+            else throw new RuntimeException("boom");
+        };
+        view_handler.reqProcessor(processor).reqMatcher((a,b) -> true);
+        view_handler.add(Arrays.asList(1,2,3)); // OK
+        try {
+            view_handler.add(Arrays.asList(4, 5, 6, 7, 8, 9, 10)); // boom
+        }
+        catch(Throwable t) {
+            System.out.printf("received exception as expected: %s\n", t);
+        }
+        assert !view_handler.processing();
+    }
 
     protected static void configureGMS(GMS gms) {
         Address local_addr=Util.createRandomAddress("A");
@@ -316,11 +376,11 @@ public class ViewHandlerTest {
     }
 
     protected static class Adder extends Thread {
-        protected final int            from, to;
-        protected final ViewHandler    vh;
-        protected final CountDownLatch latch;
+        protected final int                  from, to;
+        protected final ViewHandler<Integer> vh;
+        protected final CountDownLatch       latch;
 
-        public Adder(int from, int to, ViewHandler vh, CountDownLatch latch) {
+        public Adder(int from, int to, ViewHandler<Integer> vh, CountDownLatch latch) {
             this.from=from;
             this.to=to;
             this.vh=vh;
@@ -335,11 +395,9 @@ public class ViewHandlerTest {
             }
 
             int len=to-from+1;
-            Object[] numbers=new Integer[len];
+            Integer[] numbers=new Integer[len];
             for(int i=0; i < numbers.length; i++)
                 numbers[i]=from+i;
-
-            // IntStream.rangeClosed(from, to).forEach(vh::add);
             vh.add(numbers);
         }
     }

@@ -11,5 +11,7 @@ public enum GossipType {
     GET_MBRS,
     GET_MBRS_RSP,
     MESSAGE,
-    SUSPECT
+    HEARTBEAT, // request *and* response
+    SUSPECT,
+    GET_MBRS_RSP_LAST // the last response
 }

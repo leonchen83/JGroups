@@ -1,15 +1,12 @@
 package org.jgroups.stack;
 
-import org.jgroups.Address;
-import org.jgroups.Version;
-import org.jgroups.View;
+import org.jgroups.annotations.ManagedAttribute;
+import org.jgroups.annotations.Property;
 import org.jgroups.blocks.cs.ReceiverAdapter;
+import org.jgroups.conf.PropertyConverters;
 import org.jgroups.logging.Log;
-import org.jgroups.protocols.TP;
-import org.jgroups.util.Runner;
-import org.jgroups.util.SocketFactory;
-import org.jgroups.util.ThreadFactory;
-import org.jgroups.util.Util;
+import org.jgroups.logging.LogFactory;
+import org.jgroups.util.*;
 
 import java.io.*;
 import java.net.*;
@@ -17,71 +14,108 @@ import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.function.BiConsumer;
+import java.util.function.Function;
 
 /**
  * @author Bela Ban
  * @since 3.0
  */
 
-public class DiagnosticsHandler extends ReceiverAdapter {
-    public static final String        UDP_THREAD_NAME="UdpDiagHandler";
-    public static final String        TCP_THREAD_NAME="TcpDiagHandler";
-    protected TP                      transport;
-    protected volatile boolean        udp_enabled=true, tcp_enabled=true;
-    protected ServerSocket            srv_sock;  // when TCP is used
-    protected Runner                  udp_runner, tcp_runner;
-    protected MulticastSocket         udp_mcast_sock;        // receiving of mcast packets when UDP is used
-    protected DatagramSocket          udp_ucast_sock;        // sending of UDP responses
-    protected InetAddress             diagnostics_addr;      // multicast address for the UDP multicast socket
-    protected InetAddress             diagnostics_bind_addr; // to bind the TCP socket
-    protected int                     diagnostics_port=7500;
-    protected int                     diagnostics_port_range=50;
-    protected int                     ttl=8;
-    protected List<NetworkInterface>  bind_interfaces;
-    protected final Set<ProbeHandler> handlers=new CopyOnWriteArraySet<>();
-    protected final Log               log;
-    protected final SocketFactory     socket_factory;
-    protected final ThreadFactory     thread_factory;
-    protected final String            passcode;
+public class DiagnosticsHandler extends ReceiverAdapter implements Closeable {
+    public static final String         UDP_THREAD_NAME="UdpDiagHandler";
+    public static final String         TCP_THREAD_NAME="TcpDiagHandler";
+
+    @Property(description="Switch to enable diagnostic probing")
+    protected boolean                  enabled=true;
+
+    @Property(description="Use a multicast socket to listen for probe requests (ignored if diag.enabled is false)")
+    protected volatile boolean         enable_udp=true;
+
+    @Property(description="Use a TCP socket to listen for probe requests (ignored if diag.enabled is false)")
+    protected volatile boolean         enable_tcp;
+
+    @Property(description="Multicast address for diagnostic probing (UDP MulticastSocket). Used when enable_udp " +
+      "is true", defaultValueIPv4="224.0.75.75",defaultValueIPv6="ff0e::0:75:75")
+    protected InetAddress              mcast_addr;
+
+    @Property(description="Port for diagnostic probing. Default is 7500")
+    protected int                      port=7500;
+
+    @Property(description="Bind address for diagnostic probing, to bind the TCP socket. Used when enable_tcp is true")
+    protected InetAddress              bind_addr;
+
+    @Property(description="The number of ports to be probed for an available port (TCP)")
+    protected int                      port_range=50;
+
+    @Property(description="TTL of the diagnostics multicast socket")
+    protected int                      ttl=8;
+
+    @Property(converter=PropertyConverters.NetworkInterfaceList.class,
+      description="Comma delimited list of interfaces (IP addrs or interface names) that the multicast socket should bind to")
+    protected List<NetworkInterface>   bind_interfaces;
+
+    @Property(description="Authorization passcode for diagnostics. If specified every probe query will be authorized")
+    protected String                   passcode;
+
+    protected ServerSocket             srv_sock;  // when TCP is used
+    protected Runner                   udp_runner, tcp_runner;
+    protected MulticastSocket          udp_mcast_sock;        // receiving of mcast packets when UDP is used
+    protected DatagramSocket           udp_ucast_sock;        // sending of UDP responses
+    protected final Set<ProbeHandler>  handlers=new CopyOnWriteArraySet<>();
+    protected final Log                log;
+    protected final SocketFactory      socket_factory;
+    protected final ThreadFactory      thread_factory;
+    protected Function<Boolean,String> print_headers=b -> "";
+    protected Function<String,Boolean> same_cluster=b -> true;
 
     protected final BiConsumer<SocketAddress,String> udp_response_sender=
       (sender,response) -> sendResponse(udp_ucast_sock, sender, response.getBytes());
 
-    public DiagnosticsHandler(InetAddress diagnostics_addr, int diagnostics_port,
-             Log log, SocketFactory socket_factory, ThreadFactory thread_factory) {
-       this(diagnostics_addr,diagnostics_port,log,socket_factory,thread_factory,null);
+    public DiagnosticsHandler printHeaders(Function<Boolean,String> f) {
+        print_headers=Objects.requireNonNull(f);
+        return this;
     }
-    
-    public DiagnosticsHandler(InetAddress diagnostics_addr, int diagnostics_port,
-                              Log log, SocketFactory socket_factory, ThreadFactory thread_factory, String passcode) {
-        this.diagnostics_addr=diagnostics_addr;
-        this.diagnostics_port=diagnostics_port;
+
+    public DiagnosticsHandler sameCluster(Function<String,Boolean> f) {
+        same_cluster=Objects.requireNonNull(f);
+        return this;
+    }
+
+    /** Constructor used for standalone apps (without a JGroups stack) */
+    public DiagnosticsHandler() throws Exception {
+        this(LogFactory.getLog(DiagnosticsHandler.class), new DefaultSocketFactory(),
+             new DefaultThreadFactory("diag", true, true));
+        Configurator.setDefaultAddressValues(this, Util.getIpStackType());
+    }
+
+    public DiagnosticsHandler(Log log, SocketFactory socket_factory, ThreadFactory thread_factory) {
         this.log=log;
         this.socket_factory=socket_factory;
         this.thread_factory=thread_factory;
-        this.passcode=passcode;
     }
 
-    public DiagnosticsHandler(InetAddress diagnostics_addr, int diagnostics_port,
-                              List<NetworkInterface> bind_interfaces, int diagnostics_ttl,
-                              Log log, SocketFactory socket_factory, ThreadFactory thread_factory, String passcode) {
-        this(diagnostics_addr, diagnostics_port, log, socket_factory, thread_factory, passcode);
-        this.bind_interfaces=bind_interfaces;
-        this.ttl=diagnostics_ttl;
-    }
 
-    public TP                 transport()                              {return transport;}
-    public DiagnosticsHandler transport(TP tp)                         {transport=tp; return this;}
-    public DiagnosticsHandler setDiagnosticsBindAddress(InetAddress a) {this.diagnostics_bind_addr=a; return this;}
-    public InetAddress        getDiagnosticsBindAddress()              {return diagnostics_bind_addr;}
-    public boolean            udpEnabled()                             {return udp_enabled;}
-    public DiagnosticsHandler enableUdp(boolean f)                     {udp_enabled=f; return this;}
-    public boolean            tcpEnabled()                             {return tcp_enabled;}
-    public DiagnosticsHandler enableTcp(boolean f)                     {tcp_enabled=f; return this;}
-    public int                getDiagnosticsPort()                     {return diagnostics_port;}
-    public DiagnosticsHandler setDiagnosticsPort(int p)                {diagnostics_port=p; return this;}
-    public int                getDiagnosticsPortRange()                {return diagnostics_port_range;}
-    public DiagnosticsHandler setDiagnosticsPortRange(int r)           {diagnostics_port_range=r; return this;}
+    public boolean                isEnabled()                                 {return enabled;}
+    public DiagnosticsHandler     setEnabled(boolean f)                       {enabled=f; return this;}
+    public DiagnosticsHandler     setMcastAddress(InetAddress a)              {this.mcast_addr=a; return this;}
+    public InetAddress            getMcastAddress()                           {return mcast_addr;}
+    public DiagnosticsHandler     setBindAddress(InetAddress a)               {this.bind_addr=a; return this;}
+    public InetAddress            getBindAddress()                            {return bind_addr;}
+    public boolean                udpEnabled()                                {return enable_udp;}
+    public DiagnosticsHandler     enableUdp(boolean f)                        {enable_udp=f; if(f) enabled=f; return this;}
+    public boolean                tcpEnabled()                                {return enable_tcp;}
+    public DiagnosticsHandler     enableTcp(boolean f)                        {enable_tcp=f; if(f) enabled=f; return this;}
+    public int                    getPort()                                   {return port;}
+    public DiagnosticsHandler     setPort(int p)                              {port=p; return this;}
+    public int                    getPortRange()                              {return port_range;}
+    public DiagnosticsHandler     setPortRange(int r)                         {port_range=r; return this;}
+    public int                    getTtl()                                    {return ttl;}
+    public DiagnosticsHandler     setTtl(int d)                               {this.ttl=d; return this;}
+    public String                 getPasscode()                               {return passcode;}
+    public DiagnosticsHandler     setPasscode(String d)                       {this.passcode=d; return this;}
+    public List<NetworkInterface> getBindInterfaces()                         {return bind_interfaces;}
+    public DiagnosticsHandler     setBindInterfaces(List<NetworkInterface> l) {this.bind_interfaces=l; return this;}
+
 
     public DiagnosticsHandler setThreadNames() {
         if(udp_runner != null) {
@@ -107,31 +141,68 @@ public class DiagnosticsHandler extends ReceiverAdapter {
 
     public Set<ProbeHandler> getProbeHandlers() {return handlers;}
 
-    public void registerProbeHandler(ProbeHandler handler) {
-        if(handler != null)
-            handlers.add(handler);
+    public DiagnosticsHandler registerProbeHandler(ProbeHandler handler) {
+        handlers.add(Objects.requireNonNull(handler));
+        return this;
     }
 
-    public void unregisterProbeHandler(ProbeHandler handler) {
+    public DiagnosticsHandler unregisterProbeHandler(ProbeHandler handler) {
         if(handler != null)
             handlers.remove(handler);
+        return this;
     }
 
-    public void start() throws Exception {
-        if(!udp_enabled && !tcp_enabled)
+    public DiagnosticsHandler start() throws Exception {
+        if(!enabled)
+            return this;
+        if(!enable_udp && !enable_tcp)
             throw new IllegalStateException("both UDP and TCP are disabled - enable at least 1 of them");
-        if(udp_enabled)
+        if(enable_udp)
             startUDP();
-        if(tcp_enabled)
+        if(enable_tcp)
             startTCP();
+        return this;
     }
 
-    public void stop() {
-        Util.close(udp_runner, tcp_runner); // only stops if running
+    public void close() throws IOException {
+        stop();
     }
 
+    public DiagnosticsHandler stop() {
+        Util.close(udp_runner, tcp_runner);
+        return this; // only stops if running
+    }
+
+    @ManagedAttribute(description="Is the diagnostics handler running?")
     public boolean isRunning() {
         return udp_runner != null && udp_runner.isRunning() || tcp_runner != null && tcp_runner.isRunning();
+    }
+
+    /** Returns the local datagram socket address (UDP) or the srv address (TCP) */
+    public SocketAddress getLocalAddress() {
+        if(udp_ucast_sock != null) {
+            InetAddress addr=udp_ucast_sock.getLocalAddress();
+            if(addr == null || addr. isAnyLocalAddress()) {
+                try {
+                    addr=InetAddress.getLocalHost();
+                }
+                catch(UnknownHostException e) {
+                }
+            }
+            return new InetSocketAddress(addr, udp_ucast_sock.getLocalPort());
+        }
+        if(srv_sock != null) {
+            InetAddress addr=srv_sock.getInetAddress();
+            if(addr == null || addr.isAnyLocalAddress()) {
+                try {
+                    addr=InetAddress.getLocalHost();
+                }
+                catch(UnknownHostException e) {
+                }
+            }
+            return new InetSocketAddress(addr, srv_sock.getLocalPort());
+        }
+        return null;
     }
 
     protected void runUDP() {
@@ -141,10 +212,10 @@ public class DiagnosticsHandler extends ReceiverAdapter {
             udp_mcast_sock.receive(packet);
             int payloadStartOffset = 0;
             if(passcode != null)
-                payloadStartOffset=authorizeProbeRequest(packet);
-            handleDiagnosticProbe(packet.getSocketAddress(),
-                                  new String(packet.getData(), packet.getOffset() + payloadStartOffset, packet.getLength()),
-                                  udp_response_sender);
+                payloadStartOffset=authorizeProbeRequest(packet.getData());
+            int len=packet.getLength();
+            String req=new String(packet.getData(), payloadStartOffset, len-payloadStartOffset);
+            handleDiagnosticProbe(packet.getSocketAddress(), req, udp_response_sender);
         }
         catch(IOException socket_ex) {
         }
@@ -159,13 +230,18 @@ public class DiagnosticsHandler extends ReceiverAdapter {
             InputStream input=client_sock.getInputStream();
             OutputStream output=client_sock.getOutputStream();) {
             sender=client_sock.getRemoteSocketAddress();
-            String request=Util.readLine(input);
-            handleDiagnosticProbe(sender, request, (snd,response) -> {
+            byte[] request=Util.readBytes(input).getBytes();
+            int payloadStartOffset=0;
+            if(passcode != null)
+                payloadStartOffset=authorizeProbeRequest(request);
+
+            String req=new String(request, payloadStartOffset, request.length-payloadStartOffset);
+            handleDiagnosticProbe(sender, req, (snd,response) -> {
                 try {
                     output.write(response.getBytes());
                 }
                 catch(IOException e) {
-                    log.error("%s: failed handling TCP probe request: %s", transport.getLocalAddress(), e.getMessage());
+                    log.error("failed handling TCP probe request: %s", e.getMessage());
                 }
             });
         }
@@ -173,7 +249,7 @@ public class DiagnosticsHandler extends ReceiverAdapter {
 
         }
         catch(Throwable t) {
-            log.error("%s: failed processing TCP client request from %s: %s", transport.getLocalAddress(), sender, t);
+            log.error("failed processing TCP client request from %s: %s", sender, t);
         }
     }
 
@@ -182,16 +258,16 @@ public class DiagnosticsHandler extends ReceiverAdapter {
             udp_ucast_sock=socket_factory.createDatagramSocket("jgroups.tp.diag.udp_ucast_sock");
 
         if(udp_mcast_sock == null || udp_mcast_sock.isClosed()) {
-            // https://jira.jboss.org/jira/browse/JGRP-777 - this doesn't work on MacOS, and we don't have
+            // https://issues.redhat.com/browse/JGRP-777 - this doesn't work on MacOS, and we don't have
             // cross talking on Windows anyway, so we just do it for Linux. (How about Solaris ?)
 
             // If possible, the MulticastSocket(SocketAddress) ctor is used which binds to diagnostics_addr:diagnostics_port.
             // This acts like a filter, dropping multicasts to different multicast addresses
             if(Util.can_bind_to_mcast_addr)
                 udp_mcast_sock=Util.createMulticastSocket(socket_factory, "jgroups.tp.diag.udp_mcast_sock",
-                                                          diagnostics_addr, diagnostics_port, log);
+                                                          mcast_addr, port, log);
             else
-                udp_mcast_sock=socket_factory.createMulticastSocket("jgroups.tp.diag.udp_mcast_sock", diagnostics_port);
+                udp_mcast_sock=socket_factory.createMulticastSocket("jgroups.tp.diag.udp_mcast_sock", port);
             try {
                 udp_mcast_sock.setTimeToLive(ttl);
             }
@@ -211,7 +287,7 @@ public class DiagnosticsHandler extends ReceiverAdapter {
     protected DiagnosticsHandler startTCP() throws Exception {
         if(srv_sock == null || srv_sock.isClosed())
             srv_sock=Util.createServerSocket(socket_factory, "jgroups.tp.diag.tcp_sock",
-                                             diagnostics_bind_addr, diagnostics_port, diagnostics_port+diagnostics_port_range, 0);
+                                             bind_addr, port, port+ port_range, 0);
         if(tcp_runner == null)
             tcp_runner=new Runner(thread_factory, TCP_THREAD_NAME, this::runTCP, () -> Util.close(srv_sock));
         tcp_runner.start();
@@ -229,24 +305,18 @@ public class DiagnosticsHandler extends ReceiverAdapter {
             if(!req.isEmpty()) {
                  // if -cluster=<name>: discard requests that have a cluster name != our own cluster name
                 if(req.startsWith("cluster=")) {
-                    if(!sameCluster(req))
+                    if(!same_cluster.apply(req)) {
+                        log.debug("probe response dropped as cluster %s does not match", req.substring("cluster=".length()));
                         return;
+                    }
                     continue;
                 }
                 list.add(req);
             }
         }
         if(list.isEmpty()) {
-            if(transport != null) {
-                Address local_addr=transport.localAddress();
-                String default_rsp=String.format("local_addr=%s\nphysical_addr=%s\nview=%s\ncluster=%s\nversion=%s\n",
-                                                 local_addr != null? local_addr : "n/a",
-                                                 transport.getLocalPhysicalAddress(),
-                                                 transport.view(),
-                                                 transport.getClusterName(),
-                                                 Version.description);
-                rsp_sender.accept(sender, default_rsp);
-            }
+            String default_rsp=print_headers.apply(true);
+            rsp_sender.accept(sender, default_rsp);
             return;
         }
 
@@ -254,59 +324,42 @@ public class DiagnosticsHandler extends ReceiverAdapter {
         for(int i=0; i < list.size(); i++)
             tokens[i]=list.get(i);
 
+        Map<String,String> map=new LinkedHashMap<>();
         for(ProbeHandler handler: handlers) {
-            Map<String, String> map=null;
             try {
-                map=handler.handleProbe(tokens);
+                Map<String,String> m=handler.handleProbe(tokens);
+                if(m == null || m.isEmpty())
+                    continue;
+                for(Map.Entry<String,String> e: m.entrySet()) {
+                    String key=e.getKey(), val=e.getValue();
+                    String existing=map.putIfAbsent(key, val);
+                    if(existing != null)
+                        log.warn("%s already present; skipping addition of new key by probe handler %s", key, handler);
+                }
             }
             catch(IllegalArgumentException ex) {
                 log.warn(ex.getMessage());
                 return;
             }
-            if(map == null || map.isEmpty())
-                continue;
-            StringBuilder info=new StringBuilder(defaultHeaders());
-            for(Map.Entry<String,String> entry: map.entrySet())
-                info.append(String.format("%s=%s\r\n", entry.getKey(), entry.getValue()));
-
-            String diag_rsp=info.toString();
-            rsp_sender.accept(sender, diag_rsp);
         }
-    }
-
-    protected String defaultHeaders() {
-        if(transport == null) return "";
-        Address local_addr=transport.localAddress();
-        View view=transport.view();
-        int num_members=view != null? view.size() : 0;
-        return String.format("local_addr=%s [ip=%s, version=%s, cluster=%s, %d mbr(s)]\n",
-                             local_addr != null? local_addr : "n/a", transport.getLocalPhysicalAddress(),
-                             Version.description, transport.getClusterName(), num_members);
-    }
-
-
-    protected boolean sameCluster(String req) {
-        if(!req.startsWith("cluster="))
-            return true;
-        String cluster_name_pattern=req.substring("cluster=".length()).trim();
-        String cname=transport.getClusterName();
-        if(cluster_name_pattern != null && !Util.patternMatch(cluster_name_pattern, cname)) {
-            log.debug("Probe request dropped as cluster name %s does not match pattern %s", cname, cluster_name_pattern);
-            return false;
-        }
-        return true;
+        String tmp=print_headers.apply(false);
+        StringBuilder info=new StringBuilder(tmp);
+        for(Map.Entry<String,String> entry: map.entrySet())
+            info.append(String.format("%s=%s\r\n", entry.getKey(), entry.getValue()));
+        String diag_rsp=info.toString();
+        rsp_sender.accept(sender, diag_rsp);
     }
 
 
     /**
-     * Performs authorization on given DatagramPacket.
-     * @param packet to authorize
+     * Performs authorization on given byte array
+     * @param request to authorize
      * @return offset in DatagramPacket where request payload starts
      * @throws Exception thrown if passcode received from client does not match set passcode
      */
-    protected int authorizeProbeRequest(DatagramPacket packet) throws Exception {
+    protected int authorizeProbeRequest(byte[] request) throws Exception {
         int offset = 0;
-        ByteArrayInputStream bis = new ByteArrayInputStream(packet.getData());
+        ByteArrayInputStream bis = new ByteArrayInputStream(request);
         DataInputStream in = new DataInputStream(bis);
         long t1 = in.readLong();
         double q1 = in.readDouble();
@@ -331,29 +384,32 @@ public class DiagnosticsHandler extends ReceiverAdapter {
     }
 
     protected void bindToInterfaces(List<NetworkInterface> interfaces, MulticastSocket s) {
-        SocketAddress group_addr=new InetSocketAddress(diagnostics_addr, diagnostics_port);
+        SocketAddress group_addr=new InetSocketAddress(mcast_addr, port);
         for(Iterator<NetworkInterface> it=interfaces.iterator(); it.hasNext();) {
             NetworkInterface i=it.next();
             try {
                 if(Util.isUp(i)) {
                     List<InterfaceAddress> inet_addrs=i.getInterfaceAddresses();
-                    if(inet_addrs != null && !inet_addrs.isEmpty()) { // fix for VM crash - suggested by JJalenak@netopia.com
+                    if(inet_addrs != null && !inet_addrs.isEmpty() && isCompatible(mcast_addr, inet_addrs)) { // fix for VM crash - suggested by JJalenak@netopia.com
                         s.joinGroup(group_addr, i);
                         log.trace("joined %s on %s", group_addr, i.getName());
                     }
                 }
             }
-            catch(Exception e) { // also catches NPE in getInterfaceAddresses() (https://issues.jboss.org/browse/JGRP-1845)
+            catch(Exception e) { // also catches NPE in getInterfaceAddresses() (https://issues.redhat.com/browse/JGRP-1845)
                 log.warn("failed to join " + group_addr + " on " + i.getName() + ": " + e);
             }
         }
     }
-    
+
+    /** Checks if there's any address in the address list that's compatible (same address family) to addr */
+    protected static boolean isCompatible(InetAddress addr, List<InterfaceAddress> addrs) {
+        return addrs.stream().map(InterfaceAddress::getAddress).anyMatch(a -> Objects.equals(a.getClass(), addr.getClass()));
+    }
 
     public interface ProbeHandler {
         /**
          * Handles a probe. For each key that is handled, the key and its result should be in the returned map.
-         * @param keys
          * @return Map<String,String>. A map of keys and values. A null return value is permissible.
          */
         Map<String,String> handleProbe(String... keys);

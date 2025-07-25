@@ -1,11 +1,13 @@
 package org.jgroups.util;
 
 import org.jgroups.*;
+import org.jgroups.annotations.Component;
 import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.annotations.Property;
 import org.jgroups.blocks.cs.Connection;
 import org.jgroups.conf.ClassConfigurator;
 import org.jgroups.jmx.JmxConfigurator;
+import org.jgroups.jmx.ResourceDMBean;
 import org.jgroups.logging.Log;
 import org.jgroups.protocols.*;
 import org.jgroups.protocols.pbcast.GMS;
@@ -13,9 +15,7 @@ import org.jgroups.protocols.pbcast.NAKACK2;
 import org.jgroups.protocols.pbcast.STABLE;
 import org.jgroups.protocols.relay.SiteMaster;
 import org.jgroups.protocols.relay.SiteUUID;
-import org.jgroups.stack.IpAddress;
-import org.jgroups.stack.Protocol;
-import org.jgroups.stack.ProtocolStack;
+import org.jgroups.stack.*;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
@@ -24,20 +24,23 @@ import javax.management.MBeanServer;
 import javax.management.MBeanServerFactory;
 import java.io.*;
 import java.lang.annotation.Annotation;
-import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
-import java.lang.management.ManagementFactory;
-import java.lang.management.ThreadInfo;
-import java.lang.management.ThreadMXBean;
+import java.lang.invoke.VarHandle;
+import java.lang.management.*;
 import java.lang.reflect.*;
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.*;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -46,6 +49,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 import static java.lang.System.nanoTime;
 import static org.jgroups.protocols.TP.LIST;
@@ -95,6 +99,8 @@ public class Util {
     protected static int         CCHM_CONCURRENCY_LEVEL=16;
     public static final int      DEFAULT_HEADERS;
 
+    public static final String   JAVA_VERSION;
+
     /**
      * The max size of an address list, used in View or Digest when toString() is called. Limiting this
      * reduces the amount of log data
@@ -105,24 +111,47 @@ public class Util {
     private static final byte[]  TYPE_BOOLEAN_TRUE={TYPE_BOOLEAN, 1};
     private static final byte[]  TYPE_BOOLEAN_FALSE={TYPE_BOOLEAN, 0};
 
-    public static final Class<? extends Protocol>[] getUnicastProtocols() {return new Class[]{UNICAST3.class};}
+    public static final Class<? extends Protocol>[] getUnicastProtocols() {
+        return new Class[]{UNICAST3.class,UNICAST4.class};
+    }
 
     public enum AddressScope {GLOBAL,SITE_LOCAL,LINK_LOCAL,LOOPBACK,NON_LOOPBACK}
 
-    private static boolean          ipv4_stack_available=false, ipv6_stack_available=false;
-    private static final StackType  ip_stack_type=_getIpStackType();
-    public static final boolean     can_bind_to_mcast_addr;
-    protected static ResourceBundle resource_bundle;
+    private static boolean                          ipv4_stack_available=false, ipv6_stack_available=false;
+    private static final StackType                  ip_stack_type;
+    private static volatile List<NetworkInterface>  CACHED_INTERFACES=null;
+    private static volatile Collection<InetAddress> CACHED_ADDRESSES=null;
+    private static InetAddress                      LOCALHOST=null;
+    public static final boolean                     can_bind_to_mcast_addr;
+    protected static ResourceBundle                 resource_bundle;
+    static DateTimeFormatter                        UTF_FORMAT=DateTimeFormatter.ofPattern("E MMM d H:m:s 'UTC' y");
+    protected static final String                   UUID_PREFIX="uuid://";
+    protected static final String                   SITE_UUID_PREFIX="site-addr://";
+    protected static final String                   IP_PREFIX="ip://";
+    protected static final String                   OTHER_ADDR="other://";
+    protected static final SplittableRandom         RANDOM=new SplittableRandom();
 
-    // Fibers (project Loom - Java 15)
-    private static final MethodHandles.Lookup LOOKUP=MethodHandles.publicLookup();
-    private static final int                  VIRTUAL=getVirtual();
-    private static final MethodHandle         THREAD_NEW_THREAD=getThreadNewThread();
-    private static final MethodHandle         EXECUTORS_NEW_VIRTUAL_THREAD_FACTORY=getNewVirtualThreadFactory();
+    protected static final Function<String,List<Address>> FUNC=__ -> new ArrayList<>();
 
+    public static final VarHandle LONG_ARRAY_VIEW=MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.BIG_ENDIAN);
+    public static final VarHandle INT_ARRAY_VIEW=MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.BIG_ENDIAN);
 
     static {
-        String tmp;
+
+        try {
+            CACHED_INTERFACES=getAllAvailableInterfaces();
+            CACHED_ADDRESSES=getAllAvailableAddresses();
+        }
+        catch(SocketException e) {
+            throw new RuntimeException(e);
+        }
+        ip_stack_type=_getIpStackType();
+
+        try {
+            LOCALHOST=IpAddress.getLocalHost();
+        }
+        catch(Throwable ex) {
+        }
         resource_bundle=ResourceBundle.getBundle("jg-messages",Locale.getDefault(),Util.class.getClassLoader());
 
         add(TYPE_NULL, Void.class);
@@ -150,7 +179,7 @@ public class Util {
           || Util.checkForSolaris() || Util.checkForHp() || Util.checkForMac();
 
         try {
-            String cchm_initial_capacity=SecurityActions.getProperty(Global.CCHM_INITIAL_CAPACITY);
+            String cchm_initial_capacity=System.getProperty(Global.CCHM_INITIAL_CAPACITY);
             if(cchm_initial_capacity != null)
                 CCHM_INITIAL_CAPACITY=Integer.parseInt(cchm_initial_capacity);
         }
@@ -158,7 +187,7 @@ public class Util {
         }
 
         try {
-            String cchm_load_factor=SecurityActions.getProperty(Global.CCHM_LOAD_FACTOR);
+            String cchm_load_factor=System.getProperty(Global.CCHM_LOAD_FACTOR);
             if(cchm_load_factor != null)
                 CCHM_LOAD_FACTOR=Float.parseFloat(cchm_load_factor);
         }
@@ -166,15 +195,16 @@ public class Util {
         }
 
         try {
-            String cchm_concurrency_level=SecurityActions.getProperty(Global.CCHM_CONCURRENCY_LEVEL);
+            String cchm_concurrency_level=System.getProperty(Global.CCHM_CONCURRENCY_LEVEL);
             if(cchm_concurrency_level != null)
                 CCHM_CONCURRENCY_LEVEL=Integer.parseInt(cchm_concurrency_level);
         }
         catch(SecurityException ignored) {
         }
 
+        String tmp;
         try {
-            tmp=SecurityActions.getProperty(Global.MAX_LIST_PRINT_SIZE);
+            tmp=System.getProperty(Global.MAX_LIST_PRINT_SIZE);
             if(tmp != null)
                 MAX_LIST_PRINT_SIZE=Integer.parseInt(tmp);
         }
@@ -182,129 +212,24 @@ public class Util {
         }
 
         try {
-            tmp=SecurityActions.getProperty(Global.DEFAULT_HEADERS);
+            tmp=System.getProperty(Global.DEFAULT_HEADERS);
             DEFAULT_HEADERS=tmp != null? Integer.parseInt(tmp) : 4;
         }
         catch(Throwable t) {
             throw new IllegalArgumentException(String.format("property %s has an incorrect value", Global.DEFAULT_HEADERS), t);
         }
+
+        JAVA_VERSION=System.getProperty("java.vm.version", "");
     }
 
-
+    @Deprecated
     public static boolean fibersAvailable() {
-        return THREAD_NEW_THREAD != null;
+        return ThreadCreator.hasVirtualThreads();
     }
 
-    protected static int getVirtual() {
-        MethodHandle tmp_handle=null;
-        try {
-            tmp_handle=LOOKUP.findStaticGetter(Thread.class, "VIRTUAL", int.class);
-            return (int)tmp_handle.invokeExact();
-        }
-        catch(Throwable t) {
-            return 1;
-        }
+    public static boolean virtualThreadsAvailable() {
+        return ThreadCreator.hasVirtualThreads();
     }
-
-    protected static MethodHandle getThreadNewThread() {
-        MethodType type=MethodType.methodType(Thread.class, String.class, int.class, Runnable.class);
-        try {
-            return LOOKUP.findStatic(Thread.class, "newThread", type);
-        }
-        catch(Exception e) {
-            return null;
-        }
-    }
-
-    protected static MethodHandle getNewVirtualThreadFactory() {
-        MethodType type=MethodType.methodType(ExecutorService.class);
-        try {
-            return LOOKUP.findStatic(Executors.class, "newVirtualThreadExecutor", type);
-        }
-        catch(Exception e) {
-            return null;
-        }
-    }
-
-
-    public static ExecutorService createFiberThreadPool() {
-        if(EXECUTORS_NEW_VIRTUAL_THREAD_FACTORY == null)
-            throw new IllegalStateException("failed to create fiber thread pool (factory is null)");
-        try {
-            return (ExecutorService)EXECUTORS_NEW_VIRTUAL_THREAD_FACTORY.invokeExact();
-        }
-        catch(Throwable t) {
-            throw new IllegalStateException(String.format("failed to create fiber thread pool: %s", t));
-        }
-    }
-
-    /**
-     * Use of reflection to create fibers. If a JDK < 15/Loom is found, we'll create regular threads.
-     */
-    public static Thread createFiber(Runnable r, String name) {
-        if(THREAD_NEW_THREAD == null) {
-            return new Thread(r, name);
-        }
-        try {
-            return (Thread)THREAD_NEW_THREAD.invokeExact(name, VIRTUAL, r);
-        }
-        catch(Throwable ex) {
-            return new Thread(r, name);
-        }
-    }
-
-    public static void assertTrue(boolean condition) {
-        assert condition;
-    }
-
-    public static void assertTrue(String message,boolean condition) {
-        if(message != null)
-            assert condition : message;
-        else
-            assert condition;
-    }
-
-    public static void assertFalse(boolean condition) {
-        assertFalse(null,condition);
-    }
-
-    public static void assertFalse(String message,boolean condition) {
-        if(message != null)
-            assert !condition : message;
-        else
-            assert !condition;
-    }
-
-
-    public static void assertEquals(String message,Object val1,Object val2) {
-        if(message != null) {
-            assert val1.equals(val2) : message;
-        }
-        else {
-            assert val1.equals(val2);
-        }
-    }
-
-    public static void assertNotNull(String message,Object val) {
-        if(message != null)
-            assert val != null : message;
-        else
-            assert val != null;
-    }
-
-
-    public static void assertNotNull(Object val) {
-        assertNotNull(null, val);
-    }
-
-
-    public static void assertNull(String message,Object val) {
-        if(message != null)
-            assert val == null : message;
-        else
-            assert val == null;
-    }
-
 
     public static int getNextHigherPowerOfTwo(int num) {
         if(num <= 0) return 1;
@@ -347,6 +272,22 @@ public class Util {
         return tmp;
     }
 
+    public static Protocol[] getTestStackNew(Protocol... additional_protocols) {
+        Protocol[] protocols={
+          new SHARED_LOOPBACK(),
+          new SHARED_LOOPBACK_PING(),
+          new NAKACK4(),
+          new UNICAST4(),
+          new GMS().setJoinTimeout(500),
+          new FRAG2().setFragSize(8000)
+        };
+
+        if(additional_protocols == null)
+            return protocols;
+        Protocol[] tmp=Arrays.copyOf(protocols,protocols.length + additional_protocols.length);
+        System.arraycopy(additional_protocols, 0, tmp, protocols.length, additional_protocols.length);
+        return tmp;
+    }
 
     /**
      * Blocks until all channels have the same view
@@ -364,7 +305,7 @@ public class Util {
         while(System.currentTimeMillis() <= target_time) {
             boolean all_channels_have_correct_view=true;
             View first=channels[0].getView();
-            for(JChannel ch : channels) {
+            for(JChannel ch: channels) {
                 View view=ch.getView();
                 if(first == null || !Objects.equals(view, first) || view.size() != channels.length) {
                     all_channels_have_correct_view=false;
@@ -390,8 +331,6 @@ public class Util {
     public static void waitUntilAllChannelsHaveSameView(long timeout, long interval,
                                                         Collection<JChannel> channels) throws TimeoutException {
         JChannel[] tmp=new JChannel[channels != null? channels.size() : 0];
-        if(tmp == null)
-            return;
         int index=0;
         for(Iterator<JChannel> it=channels.iterator(); it.hasNext();)
             tmp[index++]=it.next();
@@ -412,6 +351,44 @@ public class Util {
         }
         String error_msg=String.format("Timeout %d kicked in%s", timeout, msg != null? ": " + msg.get() : "");
         throw new TimeoutException(error_msg);
+    }
+
+    public static boolean waitUntilNoX(long timeout, long interval, BooleanSupplier condition) {
+        long target_time=System.currentTimeMillis() + timeout;
+        while(System.currentTimeMillis() <= target_time) {
+            if(condition.getAsBoolean())
+                return true;
+            Util.sleep(interval);
+        }
+        return condition.getAsBoolean();
+    }
+
+    public static boolean waitUntilTrue(long timeout, long interval, BooleanSupplier condition) {
+        long target_time=System.currentTimeMillis() + timeout;
+        while(System.currentTimeMillis() <= target_time) {
+            if(condition.getAsBoolean())
+                return true;
+            Util.sleep(interval);
+        }
+        return false;
+    }
+
+    /** In a separate thread (common ForkJoinPool): waits for the given timeout / interval until a condition is true.
+     * When true, executes the on_success supplier, else the on_failure supplier */
+    public static <T> void asyncWaitUntilTrue(long timeout, long interval, BooleanSupplier cond,
+                                          Supplier<T> on_success, Supplier<T> on_failure) {
+        CompletableFuture.supplyAsync(() -> Util.waitUntilTrue(timeout, interval, cond))
+          .thenAccept(success -> {
+              if(success)
+                  on_success.get();
+              else
+                  on_failure.get();
+          });
+    }
+
+    public static int assertPositive(int value, String message) {
+        if(value <= 0) throw new IllegalArgumentException(message);
+        return value;
     }
 
     public static boolean allChannelsHaveSameView(JChannel... channels) {
@@ -435,7 +412,13 @@ public class Util {
         return sb.toString();
     }
 
-
+    public static String print(MessageBatch batch, boolean print_headers) {
+        int count=1;
+        StringBuilder sb=new StringBuilder(String.format("%s:\n", batch.toString()));
+        for(Message msg: batch)
+            sb.append(String.format("  %d: %s%s\n", count++, msg, print_headers? String.format(", hdrs: %s", msg.printHeaders()) : ""));
+        return sb.toString();
+    }
 
     /**
      * Waits until a list has the expected number of elements. Throws an exception if not met
@@ -475,6 +458,12 @@ public class Util {
             }
         }
     }
+
+    /** Creates an enum from a string */
+    public static <T extends Enum<T>> T createEnum(String name, Type type) {
+        return Enum.valueOf((Class<T>) type, name);
+    }
+
 
     public static byte[] createAuthenticationDigest(String passcode,long t1,double q1) throws IOException,
                                                                                               NoSuchAlgorithmException {
@@ -547,7 +536,7 @@ public class Util {
 
     public static void close(Closeable... closeables) {
         if(closeables != null) {
-            for(Closeable closeable : closeables)
+            for(Closeable closeable: closeables)
                 Util.close(closeable);
         }
     }
@@ -580,12 +569,8 @@ public class Util {
      * the view until failure detection has kicked in and the new coord installed the new view
      */
     public static void shutdown(JChannel ch) throws Exception {
-        DISCARD discard=new DISCARD();
-        discard.setLocalAddress(ch.getAddress());
-        discard.discardAll(true);
-        ProtocolStack stack=ch.getProtocolStack();
-        TP transport=stack.getTransport();
-        stack.insertProtocol(discard,ProtocolStack.Position.ABOVE,transport.getClass());
+        DISCARD discard=new DISCARD().setAddress(ch.getAddress()).discardAll(true);
+        ch.stack().insertProtocol(discard,ProtocolStack.Position.ABOVE,TP.class);
 
         //abruptly shutdown FD_SOCK just as in real life when member gets killed non gracefully
         FD_SOCK fd=ch.getProtocolStack().findProtocol(FD_SOCK.class);
@@ -600,8 +585,8 @@ public class Util {
             ViewId new_vid=new ViewId(ch.getAddress(),vid.getId() + 1);
             View new_view=new View(new_vid,members);
 
-            // inject view in which the shut down member is the only element
-            GMS gms=stack.findProtocol(GMS.class);
+            // inject view in which the shut-down member is the only element
+            GMS gms=ch.stack().findProtocol(GMS.class);
             gms.installView(new_view);
         }
         Util.close(ch);
@@ -619,7 +604,7 @@ public class Util {
 
 
     public static byte clearFlags(byte bits,byte flag) {
-        return bits&=~flag;
+        return bits=(byte)(bits & ~flag);
     }
 
     public static String flagsToString(short flags) {
@@ -717,8 +702,8 @@ public class Util {
             case TYPE_CHAR:    case TYPE_CHAR_OBJ:    return (T)(Character)Bits.readChar(buffer, offset);
             case TYPE_DOUBLE:  case TYPE_DOUBLE_OBJ:  return (T)(Double)Bits.readDouble(buffer, offset);
             case TYPE_FLOAT:   case TYPE_FLOAT_OBJ:   return (T)(Float)Bits.readFloat(buffer, offset);
-            case TYPE_INT:     case TYPE_INT_OBJ:     return (T)(Integer)Bits.readInt(buffer, offset);
-            case TYPE_LONG:    case TYPE_LONG_OBJ:    return (T)(Long)Bits.readLong(buffer, offset);
+            case TYPE_INT:     case TYPE_INT_OBJ:     return (T)(Integer)Bits.readIntCompressed(buffer, offset);
+            case TYPE_LONG:    case TYPE_LONG_OBJ:    return (T)(Long)Bits.readLongCompressed(buffer, offset);
             case TYPE_SHORT:   case TYPE_SHORT_OBJ:   return (T)(Short)Bits.readShort(buffer, offset);
             case TYPE_STRING:
                 in=new ByteArrayDataInputStream(buffer, offset, length);
@@ -757,8 +742,8 @@ public class Util {
             case TYPE_CHAR:    case TYPE_CHAR_OBJ:    return (T)(Character)Bits.readChar(buffer);
             case TYPE_DOUBLE:  case TYPE_DOUBLE_OBJ:  return (T)(Double)Bits.readDouble(buffer);
             case TYPE_FLOAT:   case TYPE_FLOAT_OBJ:   return (T)(Float)Bits.readFloat(buffer);
-            case TYPE_INT:     case TYPE_INT_OBJ:     return (T)(Integer)Bits.readInt(buffer);
-            case TYPE_LONG:    case TYPE_LONG_OBJ:    return (T)(Long)Bits.readLong(buffer);
+            case TYPE_INT:     case TYPE_INT_OBJ:     return (T)(Integer)Bits.readIntCompressed(buffer);
+            case TYPE_LONG:    case TYPE_LONG_OBJ:    return (T)(Long)Bits.readLongCompressed(buffer);
             case TYPE_SHORT:   case TYPE_SHORT_OBJ:   return (T)(Short)Bits.readShort(buffer);
             case TYPE_BYTEARRAY:
                 byte[] tmp=new byte[buffer.remaining()];
@@ -834,14 +819,16 @@ public class Util {
                 Bits.writeFloat((float)obj, buf, 1);
                 return buf;
             case TYPE_INT: case TYPE_INT_OBJ:
-                buf=new byte[Global.BYTE_SIZE + Global.INT_SIZE];
+                int i=(int)obj;
+                buf=new byte[Global.BYTE_SIZE + Bits.size(i)];
                 buf[0]=type;
-                Bits.writeInt((int)obj, buf, 1);
+                Bits.writeIntCompressed(i, buf, 1);
                 return buf;
             case TYPE_LONG: case TYPE_LONG_OBJ:
-                buf=new byte[Global.BYTE_SIZE + Global.LONG_SIZE];
+                long l=(long)obj;
+                buf=new byte[Global.BYTE_SIZE + Bits.size(l)];
                 buf[0]=type;
-                Bits.writeLong((long)obj, buf, 1);
+                Bits.writeLongCompressed((long)obj, buf, 1);
                 return buf;
             case TYPE_SHORT: case TYPE_SHORT_OBJ:
                 buf=new byte[Global.BYTE_SIZE + Global.SHORT_SIZE];
@@ -898,11 +885,29 @@ public class Util {
             return Global.BYTE_SIZE;
         if(obj instanceof SizeStreamable)
             return Global.BYTE_SIZE + Util.size((SizeStreamable)obj);
+        return sizePrimitive(obj);
+    }
+
+    public static int size(SizeStreamable s) {
+        int retval=Global.BYTE_SIZE;
+        if(s == null)
+            return retval;
+        retval+=Global.SHORT_SIZE; // magic number
+        short magic_number=ClassConfigurator.getMagicNumber(s.getClass());
+        if(magic_number == -1)
+            retval+=Bits.sizeUTF(s.getClass().getName());
+        return retval + s.serializedSize();
+    }
+
+    public static int sizePrimitive(Object obj) {
+        if(obj == null)
+            return 1; // TYPE_NULL
         Byte type=obj instanceof Class<?>? TYPES.get(obj) : TYPES.get(obj.getClass());
         if(obj instanceof Class<?>) {
             if(type != null)
                 return Global.BYTE_SIZE *2;
         }
+
         int retval=Global.BYTE_SIZE;
         switch(type) {
             case TYPE_BOOLEAN: case TYPE_BOOLEAN_OBJ:
@@ -932,33 +937,23 @@ public class Util {
         }
     }
 
-    public static void objectToStream(Object obj, DataOutput out) throws IOException {
+    public static void writeTypeStreamable(Streamable obj, DataOutput out) throws IOException {
+        out.writeByte(TYPE_STREAMABLE);
+        Util.writeGenericStreamable(obj, out);
+    }
+
+    public static void primitiveToStream(Object obj, DataOutput out) throws IOException {
         if(obj == null) {
             out.write(TYPE_NULL);
             return;
         }
-        if(obj instanceof Streamable) {
-            out.writeByte(TYPE_STREAMABLE);
-            writeGenericStreamable((Streamable)obj,out);
+        Byte type=obj instanceof Class<?>? TYPES.get(obj) : TYPES.get(obj.getClass());
+        if(obj instanceof Class<?>) {
+            out.writeByte(TYPE_CLASS);
+            out.writeByte(type);
             return;
         }
-        Byte type=obj instanceof Class<?>? TYPES.get(obj) : TYPES.get(obj.getClass());
-        if(type == null) {
-            out.write(TYPE_SERIALIZABLE);
-            try(ObjectOutputStream tmp=new ObjectOutputStream(out instanceof ByteArrayDataOutputStream?
-                                                                new OutputStreamAdapter((ByteArrayDataOutputStream)out) :
-                                                                (OutputStream)out)) {
-                tmp.writeObject(obj);
-                return;
-            }
-        }
-        if(obj instanceof Class<?>) {
-            if(type != null) {
-                out.writeByte(TYPE_CLASS);
-                out.writeByte(type);
-                return;
-            }
-        }
+
         out.writeByte(type);
         switch(type) {
             case TYPE_BOOLEAN: case TYPE_BOOLEAN_OBJ:
@@ -998,23 +993,17 @@ public class Util {
         }
     }
 
-    public static <T extends Object> T objectFromStream(DataInput in) throws IOException, ClassNotFoundException {
-        return objectFromStream(in, null);
-    }
-
-    public static <T extends Object> T objectFromStream(DataInput in, ClassLoader loader) throws IOException, ClassNotFoundException {
+    public static <T> T primitiveFromStream(DataInput in) throws IOException {
         if(in == null) return null;
         byte b=in.readByte();
+        return primitiveFromStream(in, b);
+    }
 
-        switch(b) {
-            case TYPE_NULL:       return null;
-            case TYPE_STREAMABLE: return readGenericStreamable(in, loader);
-            case TYPE_SERIALIZABLE: // the object is Externalizable or Serializable
-                InputStream is=in instanceof ByteArrayDataInputStream?
-                  new org.jgroups.util.InputStreamAdapter((ByteArrayDataInputStream)in) : (InputStream)in;
-                try(ObjectInputStream tmp=new ObjectInputStreamWithClassloader(is, loader)) {
-                    return (T)tmp.readObject();
-                }
+    public static <T> T primitiveFromStream(DataInput in, byte type) throws IOException {
+        if(in == null) return null;
+        switch(type) {
+            case TYPE_NULL:
+                return null;
             case TYPE_BOOLEAN: case TYPE_BOOLEAN_OBJ: return (T)(Boolean)in.readBoolean();
             case TYPE_BYTE:    case TYPE_BYTE_OBJ:    return (T)(Byte)in.readByte();
             case TYPE_CHAR:    case TYPE_CHAR_OBJ:    return (T)(Character)in.readChar();
@@ -1031,9 +1020,53 @@ public class Util {
             case TYPE_CLASS:
                 return (T)CLASS_TYPES.get(in.readByte());
             default:
-                throw new IllegalArgumentException("type " + b + " is invalid");
+                throw new IllegalArgumentException("type " + type + " is invalid");
         }
     }
+
+    public static void objectToStream(Object obj, DataOutput out) throws IOException {
+        if(obj == null) {
+            out.write(TYPE_NULL);
+            return;
+        }
+        if(obj instanceof Streamable) {
+            writeTypeStreamable((Streamable) obj, out);
+            return;
+        }
+        Byte type=obj instanceof Class<?>? TYPES.get(obj) : TYPES.get(obj.getClass());
+        if(type == null) {
+            out.write(TYPE_SERIALIZABLE);
+            try(ObjectOutputStream tmp=new ObjectOutputStream(out instanceof ByteArrayDataOutputStream?
+                                                                new OutputStreamAdapter((ByteArrayDataOutputStream)out) :
+                                                                (OutputStream)out)) {
+                tmp.writeObject(obj);
+                return;
+            }
+        }
+        primitiveToStream(obj, out);
+    }
+
+    public static <T extends Object> T objectFromStream(DataInput in) throws IOException, ClassNotFoundException {
+        return objectFromStream(in, null);
+    }
+
+    public static <T extends Object> T objectFromStream(DataInput in, ClassLoader loader) throws IOException, ClassNotFoundException {
+        if(in == null) return null;
+        byte b=in.readByte();
+
+        switch(b) {
+            case TYPE_STREAMABLE:
+                return readGenericStreamable(in, loader);
+            case TYPE_SERIALIZABLE: // the object is Externalizable or Serializable
+                InputStream is=in instanceof ByteArrayDataInputStream?
+                  new org.jgroups.util.InputStreamAdapter((ByteArrayDataInputStream)in) : (InputStream)in;
+                try(ObjectInputStream tmp=new ObjectInputStreamWithClassloader(is, loader)) {
+                    return (T)tmp.readObject();
+                }
+        }
+        return primitiveFromStream(in, b);
+    }
+
 
     public static <T extends Streamable> T streamableFromByteBuffer(Class<? extends Streamable> cl,byte[] buffer)
       throws Exception {
@@ -1043,8 +1076,6 @@ public class Util {
     public static <T extends Streamable> T streamableFromByteBuffer(Supplier<T> factory, byte[] buffer) throws Exception {
         return streamableFromByteBuffer(factory, buffer, 0, buffer.length);
     }
-
-
 
     /**
      * Poor man's serialization of an exception. Serializes only the message, stack trace and cause (not suppressed exceptions)
@@ -1122,7 +1153,7 @@ public class Util {
                 Bits.writeString(trace.getClassName(), out);
                 Bits.writeString(trace.getMethodName(), out);
                 Bits.writeString(trace.getFileName(), out);
-                Bits.writeInt(trace.getLineNumber(), out);
+                Bits.writeIntCompressed(trace.getLineNumber(), out);
             }
         }
 
@@ -1149,8 +1180,7 @@ public class Util {
         try {
             ctor=clazz.getDeclaredConstructor(String.class);
             if(ctor != null) {
-                if(!ctor.isAccessible())
-                    ctor.setAccessible(true);
+                ctor.setAccessible(true);
                 retval=ctor.newInstance(message);
             }
         }
@@ -1173,7 +1203,7 @@ public class Util {
                 String class_name=Bits.readString(in);
                 String method_name=Bits.readString(in);
                 String filename=Bits.readString(in);
-                int line_number=Bits.readInt(in);
+                int line_number=Bits.readIntCompressed(in);
                 StackTraceElement trace=new StackTraceElement(class_name, method_name, filename, line_number);
                 stack_trace[i]=trace;
             }
@@ -1240,7 +1270,7 @@ public class Util {
     public static <T extends Streamable> T streamableFromByteBuffer(Class<? extends Streamable> cl, ByteBuffer buffer) throws Exception {
         if(buffer == null) return null;
         DataInput in=new ByteBufferInputStream(buffer);
-        T retval=(T)cl.newInstance();
+        T retval=(T)cl.getConstructor().newInstance();
         retval.readFrom(in);
         return retval;
     }
@@ -1282,10 +1312,10 @@ public class Util {
     }
 
 
-    public static Message messageFromBuffer(byte[] buf, int offset, int length, MessageFactory mf) throws Exception {
+    public static Message messageFromBuffer(byte[] buf, int offset, int length) throws Exception {
         ByteArrayDataInputStream in=new ByteArrayDataInputStream(buf, offset, length);
         short type=in.readShort();
-        Message msg=mf.create(type);
+        Message msg=MessageFactory.create(type);
         msg.readFrom(in);
         return msg;
     }
@@ -1301,14 +1331,37 @@ public class Util {
     }
 
 
-    public static Message messageFromByteBuffer(byte[] buffer, int offset, int length, MessageFactory mf) throws Exception {
+    public static Message messageFromByteBuffer(byte[] buffer, int offset, int length) throws Exception {
         DataInput in=new ByteArrayDataInputStream(buffer,offset,length);
         if(!in.readBoolean())
             return null;
         short type=in.readShort();
-        Message msg=mf.create(type);
+        Message msg=MessageFactory.create(type);
         msg.readFrom(in);
         return msg;
+    }
+
+    /** Tries to return a legible representation of a message's payload */
+    public static String getObject(Message msg) {
+        if(msg == null)
+            return "null";
+        if(!msg.hasPayload())
+            return msg.printHeaders();
+        try {
+            Object obj=msg.getObject();
+            return obj != null? obj.toString() : "null";
+        }
+        catch(Throwable t) {
+            return String.format("<%d bytes>", msg.getLength());
+        }
+    }
+
+    public static String getObjects(Iterable<Message> it) {
+        if(it == null)
+            return "0";
+        return StreamSupport.stream(it.spliterator(), false)
+          .map(Message::getObject)
+          .map(Object::toString).collect(Collectors.joining(", "));
     }
 
     public static ByteBuffer wrapDirect(byte[] array) {
@@ -1322,7 +1375,7 @@ public class Util {
     }
 
     public static byte[] collectionToByteBuffer(Collection<Address> c) throws IOException {
-        final ByteArrayDataOutputStream out=new ByteArrayDataOutputStream((int)Util.size(c));
+        final ByteArrayDataOutputStream out=new ByteArrayDataOutputStream(Util.size(c));
         Util.writeAddresses(c,out);
         return Arrays.copyOf(out.buffer(), out.position());
     }
@@ -1385,15 +1438,21 @@ public class Util {
         return left.length - right.length;
     }
 
-    public static Object convert(String arg, Class<?> type) {
+    public static Object convert(String arg, Class<?> type, TimeUnit unit) {
         if(type == String.class) return arg;
         if(type == boolean.class || type == Boolean.class) return Boolean.valueOf(arg);
         if(type == byte.class    || type == Byte.class)    return Byte.valueOf(arg);
         if(type == short.class   || type == Short.class)   return Short.valueOf(arg);
         if(type == int.class     || type == Integer.class) return Integer.valueOf(arg);
-        if(type == long.class    || type == Long.class)    return Long.valueOf(arg);
+        if(type == long.class    || type == Long.class)
+            return unit != null? Util.readDurationLong(arg, unit) : Long.parseLong(arg);
         if(type == float.class   || type == Float.class)   return Float.valueOf(arg);
         if(type == double.class  || type == Double.class)  return Double.valueOf(arg);
+        if(arg == null || arg.equals("null"))
+            return null;
+        if(type.isEnum()) {
+            return Util.createEnum(arg, type);
+        }
         return arg;
     }
 
@@ -1409,9 +1468,9 @@ public class Util {
         msg.writeTo(dos);
     }
 
-    public static Message readMessage(DataInput in, MessageFactory mf) throws IOException, ClassNotFoundException {
+    public static Message readMessage(DataInput in) throws IOException, ClassNotFoundException {
         short type=in.readShort();
-        Message msg=mf.create(type);
+        Message msg=MessageFactory.create(type);
         msg.readFrom(in);
         return msg;
     }
@@ -1426,25 +1485,46 @@ public class Util {
      * Message:  | presence | leading | flags | [src] | length | [buffer] | size | [Headers*] |
      *
      * </pre>
-     * @param dest
-     * @param src
-     * @param msgs
-     * @param dos
-     * @param multicast
-     * @throws Exception
      */
-    public static void writeMessageList(Address dest, Address src, byte[] cluster_name,
-                                        List<Message> msgs, DataOutput dos, boolean multicast, short transport_id) throws IOException {
+    public static void writeMessageList(Address dest, Address src, byte[] cluster_name, List<Message> msgs,
+                                        DataOutput dos, boolean multicast) throws IOException {
         writeMessageListHeader(dest, src, cluster_name, msgs != null ? msgs.size() : 0, dos, multicast);
 
         if(msgs != null)
             for(Message msg: msgs) {
                 dos.writeShort(msg.getType());
-                msg.writeToNoAddrs(src, dos, transport_id); // exclude the transport header
+                msg.writeToNoAddrs(src, dos);
             }
     }
 
-    public static void writeMessageListHeader(Address dest, Address src, byte[] cluster_name, int numMsgs, DataOutput dos, boolean multicast) throws IOException {
+
+    public static void writeMessageList(Address dest, Address src, byte[] cluster_name, FastArray<Message> msgs,
+                                        DataOutput dos, boolean multicast) throws IOException {
+        writeMessageListHeader(dest, src, cluster_name, msgs != null ? msgs.size() : 0, dos, multicast);
+
+        if(msgs != null)
+            for(Message msg: msgs) {
+                dos.writeShort(msg.getType());
+                msg.writeToNoAddrs(src, dos);
+            }
+    }
+
+
+    public static void writeMessageList(Address dest, Address src, byte[] cluster_name,
+                                        Message[] msgs, int offset, int length, DataOutput dos, boolean multicast)
+      throws IOException {
+        writeMessageListHeader(dest, src, cluster_name, length, dos, multicast);
+
+        if(msgs != null)
+            for(int i=0; i < length; i++) {
+                Message msg=msgs[offset+i];
+                dos.writeShort(msg.getType());
+                msg.writeToNoAddrs(src, dos);
+            }
+    }
+
+    public static void writeMessageListHeader(Address dest, Address src, byte[] cluster_name, int numMsgs,
+                                              DataOutput dos, boolean multicast) throws IOException {
         dos.writeShort(Version.version);
 
         byte flags=LIST;
@@ -1465,7 +1545,7 @@ public class Util {
     }
 
 
-    public static List<Message> readMessageList(DataInput in, short transport_id, MessageFactory mf)
+    public static List<Message> readMessageList(DataInput in, short transport_id)
       throws IOException, ClassNotFoundException {
         List<Message> list=new LinkedList<>();
         Address dest=Util.readAddress(in);
@@ -1480,7 +1560,7 @@ public class Util {
 
         for(int i=0; i < len; i++) {
             short type=in.readShort(); // skip the
-            Message msg=mf.create(type);
+            Message msg=MessageFactory.create(type);
             msg.readFrom(in);
             msg.setDest(dest);
             if(msg.getSrc() == null)
@@ -1495,20 +1575,16 @@ public class Util {
     }
 
     /**
-     * Reads a list of messages into 4 MessageBatches:
+     * Reads a list of messages into 2 MessageBatches:
      * <ol>
      *     <li>regular</li>
      *     <li>OOB</li>
-     *     <li>INTERNAL-OOB (INTERNAL and OOB)</li>
-     *     <li>INTERNAL (INTERNAL)</li>
      * </ol>
-     * @param in
-     * @return an array of 4 MessageBatches in the order above, the first batch is at index 0
-     * @throws Exception
+     * @return an array of 2 MessageBatches in the order above, the first batch is at index 0
      */
-    public static MessageBatch[] readMessageBatch(DataInput in, boolean multicast, MessageFactory factory)
+    public static MessageBatch[] readMessageBatch(DataInput in, boolean multicast)
       throws IOException, ClassNotFoundException {
-        MessageBatch[] batches=new MessageBatch[4]; // [0]: reg, [1]: OOB, [2]: internal-oob, [3]: internal
+        MessageBatch[] batches=new MessageBatch[2]; // [0]: reg, [1]: OOB
         Address dest=Util.readAddress(in);
         Address src=Util.readAddress(in);
         short length=in.readShort();
@@ -1519,24 +1595,14 @@ public class Util {
         int len=in.readInt();
         for(int i=0; i < len; i++) {
             short type=in.readShort();
-            Message msg=factory.create(type);
+            Message msg=MessageFactory.create(type).setDest(dest).setSrc(src);
             msg.readFrom(in);
-            msg.setDest(dest);
-            if(msg.getSrc() == null)
-                msg.setSrc(src);
             boolean oob=msg.isFlagSet(Message.Flag.OOB);
-            boolean internal=msg.isFlagSet(Message.Flag.INTERNAL);
             int index=0;
             MessageBatch.Mode mode=MessageBatch.Mode.REG;
-            if(oob || internal) {
-                if(oob) {
-                    mode=MessageBatch.Mode.OOB;
-                    index=internal? 2 : 1;
-                }
-                else {
-                    index=3;
-                    mode=MessageBatch.Mode.INTERNAL;
-                }
+            if(oob) {
+                mode=MessageBatch.Mode.OOB;
+                index=1;
             }
             if(batches[index] == null)
                 batches[index]=new MessageBatch(dest, src, cluster_name != null? new AsciiString(cluster_name) : null, multicast, mode, len);
@@ -1546,16 +1612,17 @@ public class Util {
     }
 
     public static void parse(byte[] buf, int offset, int length, BiConsumer<Short,Message> msg_consumer,
-                        BiConsumer<Short,MessageBatch> batch_consumer, boolean tcp) {
-        parse(new ByteArrayInputStream(buf, offset, length), msg_consumer, batch_consumer, tcp);
+                        BiConsumer<Short,MessageBatch> batch_consumer, Consumer<GossipData> gossip_consumer,
+                             boolean tcp, boolean gossip) {
+        parse(new ByteArrayInputStream(buf, offset, length), msg_consumer, batch_consumer, gossip_consumer, tcp, gossip);
     }
 
     public static void parse(InputStream input, BiConsumer<Short,Message> msg_consumer,
-                             BiConsumer<Short,MessageBatch> batch_consumer, boolean tcp) {
+                             BiConsumer<Short,MessageBatch> batch_consumer, Consumer<GossipData> gossip_consumer,
+                             boolean tcp, boolean gossip) {
         if(msg_consumer == null && batch_consumer == null)
             return;
         byte[] tmp=new byte[Global.INT_SIZE];
-        MessageFactory mf=new DefaultMessageFactory();
         try(DataInputStream dis=new DataInputStream(input)) {
             for(;;) {
                 // for TCP, we send the length first; this needs to be skipped as it is not part of the JGroups payload
@@ -1574,12 +1641,21 @@ public class Util {
                         // int len=Bits.readInt(tmp, 0);
                     }
                 }
+                if(gossip) { // messages to or from a GossipRouter
+                    GossipData g=new GossipData();
+                    g.readFrom(dis, true, false);
+                    if(g.getType() != GossipType.MESSAGE) {
+                        if(gossip_consumer != null)
+                            gossip_consumer.accept(g);
+                        continue;
+                    }
+                }
                 short version=dis.readShort();
                 byte flags=dis.readByte();
                 boolean is_message_list=(flags & LIST) == LIST;
                 boolean multicast=(flags & MULTICAST) == MULTICAST;
                 if(is_message_list) { // used if message bundling is enabled
-                    final MessageBatch[] batches=Util.readMessageBatch(dis,multicast, mf);
+                    final MessageBatch[] batches=Util.readMessageBatch(dis,multicast);
                     for(MessageBatch batch: batches) {
                         if(batch == null)
                             continue;
@@ -1592,7 +1668,7 @@ public class Util {
                     }
                 }
                 else {
-                    Message msg=Util.readMessage(dis, mf);
+                    Message msg=Util.readMessage(dis);
                     if(msg_consumer != null)
                         msg_consumer.accept(version, msg);
                 }
@@ -1830,7 +1906,7 @@ public class Util {
      * @param addrs Collection<Address>
      * @return long size
      */
-    public static long size(Collection<? extends Address> addrs) {
+    public static int size(Collection<? extends Address> addrs) {
         int retval=Global.SHORT_SIZE; // number of elements
         if(addrs != null && !addrs.isEmpty()) {
             Address addr=addrs.iterator().next();
@@ -1839,7 +1915,7 @@ public class Util {
         return retval;
     }
 
-    public static long size(Address[] addrs) {
+    public static int size(Address[] addrs) {
         int retval=Global.SHORT_SIZE; // number of elements
         if(addrs != null)
             for(Address addr : addrs)
@@ -1847,6 +1923,53 @@ public class Util {
         return retval;
     }
 
+    public static String addressToString(Address addr) {
+        if(addr == null)
+            return null;
+        if(addr.isSiteAddress()) { // SiteUUID
+            SiteUUID su=(SiteUUID)addr;
+            return String.format("%s%s:%s:%s", SITE_UUID_PREFIX, su.toStringLong(), su.getName(), su.getSite());
+        }
+        Class<? extends Address> cl=addr.getClass();
+        if(UUID.class.isAssignableFrom(cl)) // UUID, FlagsUUID and ExtendedUUID
+            return String.format("%s%s", UUID_PREFIX, ((UUID)addr).toStringLong());
+        if(IpAddress.class.equals(cl))
+            return String.format("%s%s", IP_PREFIX, addr);
+        return String.format("%s%s/%s", OTHER_ADDR, cl.getName(), addr);
+    }
+
+    public static Address addressFromString(String s) throws Exception {
+        if(s == null)
+            return null;
+        int index=s.indexOf(UUID_PREFIX);
+        if(index >= 0)
+            return UUID.fromString(s.substring(index+UUID_PREFIX.length()));
+        index=s.indexOf(SITE_UUID_PREFIX);
+        if(index >= 0) {
+            String[] tmp=s.substring(index + SITE_UUID_PREFIX.length()).split(":");
+            if(tmp.length == 1)
+                return UUID.fromString(tmp[0]);
+            UUID u=UUID.fromString(tmp[0]);
+            return new SiteUUID(u, tmp[1], tmp[2]);
+        }
+        index=s.indexOf(IP_PREFIX);
+        if(index >= 0)
+            return new IpAddress(s.substring(index + IP_PREFIX.length()));
+        index=s.indexOf(OTHER_ADDR);
+        if(index >= 0) {
+            int start=OTHER_ADDR.length() + index;
+            int end=s.indexOf('/', start);
+            if(end < 0)
+                throw new IllegalStateException(String.format("%s has no training '/'", OTHER_ADDR));
+            String classname=s.substring(start, end);
+            String data=s.substring(end+1);
+            Class<? extends Address> cl=(Class<? extends Address>)Util.loadClass(classname, Thread.currentThread().getContextClassLoader());
+            return cl.getConstructor(String.class).newInstance(data);
+        }
+        return null;
+
+
+    }
 
     public static void writeStreamable(Streamable obj,DataOutput out) throws IOException {
         if(obj == null) {
@@ -1867,31 +1990,17 @@ public class Util {
         return retval;
     }
 
-    public static int size(SizeStreamable s) {
-        int retval=Global.BYTE_SIZE;
-        if(s == null)
-            return retval;
-        retval+=Global.SHORT_SIZE; // magic number
-        short magic_number=ClassConfigurator.getMagicNumber(s.getClass());
-        if(magic_number == -1)
-            retval+=Bits.sizeUTF(s.getClass().getName());
-        return retval + s.serializedSize();
-    }
 
     public static void writeGenericStreamable(Streamable obj, DataOutput out) throws IOException {
-        short magic_number;
-        String classname;
-
         if(obj == null) {
             out.write(0);
             return;
         }
-
         out.write(1);
-        magic_number=ClassConfigurator.getMagicNumber(obj.getClass());
+        short magic_number=ClassConfigurator.getMagicNumber(obj.getClass());
         out.writeShort(magic_number);
         if(magic_number == -1) {
-            classname=obj.getClass().getName();
+            String classname=obj.getClass().getName();
             out.writeUTF(classname);
         }
         obj.writeTo(out); // write the contents
@@ -1918,7 +2027,33 @@ public class Util {
             clazz=ClassConfigurator.get(classname, loader);
             try {
                 retval=(T)clazz.getDeclaredConstructor().newInstance();
-            } catch (IllegalAccessException | InstantiationException | NoSuchMethodException | InvocationTargetException e) {
+            }
+            catch (IllegalAccessException | InstantiationException | NoSuchMethodException | InvocationTargetException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+        retval.readFrom(in);
+        return retval;
+    }
+
+
+    public static SizeStreamable readSizeStreamable(DataInput in, ClassLoader loader) throws IOException, ClassNotFoundException {
+        int b=in.readByte();
+        if(b == 0)
+            return null;
+
+        SizeStreamable retval=null;
+        short magic_number=in.readShort();
+        if(magic_number != -1) {
+            retval=ClassConfigurator.create(magic_number);
+        }
+        else {
+            String classname=in.readUTF();
+            Class<SizeStreamable> clazz=(Class<SizeStreamable>)ClassConfigurator.get(classname, loader);
+            try {
+                retval=clazz.getDeclaredConstructor().newInstance();
+            }
+            catch (IllegalAccessException | InstantiationException | NoSuchMethodException | InvocationTargetException e) {
                 throw new IllegalStateException(e);
             }
         }
@@ -1928,8 +2063,9 @@ public class Util {
     }
 
 
+
     public static <T extends Streamable> void write(T[] array, DataOutput out) throws IOException {
-        Bits.writeInt(array != null? array.length : 0, out);
+        Bits.writeIntCompressed(array != null? array.length : 0, out);
         if(array == null)
             return;
         for(T el: array)
@@ -1937,7 +2073,7 @@ public class Util {
     }
 
     public static <T extends Streamable> T[] read(Class<T> clazz, DataInput in) throws Exception {
-        int size=Bits.readInt(in);
+        int size=Bits.readIntCompressed(in);
         if(size == 0)
             return null;
         T[] retval=(T[])Array.newInstance(clazz, size);
@@ -1962,13 +2098,22 @@ public class Util {
 
 
     public static String readContents(InputStream input) {
+        return readContents(input, (char)0);
+    }
+
+    public static String readContents(InputStream input, char comment) {
         StringBuilder sb=new StringBuilder();
         int ch;
         while(true) {
             try {
                 ch=input.read();
-                if(ch != -1)
+                if(ch != -1) {
+                    if(comment != 0 && comment == ch) {
+                        skipUntilEndOfLine(input);
+                        continue;
+                    }
                     sb.append((char)ch);
+                }
                 else
                     break;
             }
@@ -1977,6 +2122,21 @@ public class Util {
             }
         }
         return sb.toString();
+    }
+
+    protected static void skipUntilEndOfLine(InputStream input) {
+        for(;;) {
+            try {
+                int ch=input.read();
+                if(ch == -1)
+                    break;
+                if(ch == '\n' || ch == '\r')
+                    break;
+            }
+            catch(IOException e) {
+                break;
+            }
+        }
     }
 
     public static byte[] readFileContents(InputStream input) throws IOException {
@@ -2023,11 +2183,31 @@ public class Util {
         return sb.length() > 0? sb.toString() : null;
     }
 
+    /** Returns all characters read from the current position until the next occurrence of 'c' has been read
+     * (including 'c'), or eof, whichever comes first */
+    public static String readTillMatchingCharacter(InputStream in, char c) throws IOException {
+        StringBuilder sb=new StringBuilder();
+        boolean eof=false;
+        for(;;) {
+            int ch=in.read();
+            if(ch == -1) {
+                eof=true;
+                break;
+            }
+            sb.append((char)ch);
+            if(ch == c)
+                break;
+        }
+
+        String retval=sb.toString().trim();
+        return eof && retval.isEmpty()? null : retval;
+    }
+
 
     public static String readStringFromStdin(String message) throws Exception {
         System.out.print(message);
         System.out.flush();
-        System.in.skip(System.in.available());
+        System.in.skip(available(System.in));
         BufferedReader reader=new BufferedReader(new InputStreamReader(System.in));
         String line=reader.readLine();
         return line != null? line.trim() : null;
@@ -2136,7 +2316,7 @@ public class Util {
 
         try {
             int ret=System.in.read();
-            System.in.skip(System.in.available());
+            System.in.skip(available(System.in));
             return ret;
         }
         catch(IOException e) {
@@ -2144,6 +2324,14 @@ public class Util {
         }
     }
 
+    public static int available(InputStream in) {
+        try {
+            return in.available();
+        }
+        catch(Exception ex) {
+            return 0;
+        }
+    }
 
     public static long micros() {
         return nanoTime() / 1000;
@@ -2207,6 +2395,17 @@ public class Util {
         E[] retval=(E[])Array.newInstance(arrays[0].getClass().getComponentType(), size);
         AtomicInteger index=new AtomicInteger();
         Stream.of(arrays).flatMap(Stream::of).forEach(el -> retval[index.getAndIncrement()]=el);
+        return retval;
+    }
+
+    @SafeVarargs
+    public static <E> E[] combine(Class<?> cl, E ... array) {
+        if(array == null)
+            return null;
+        int size=(int)Stream.of(array).filter(Objects::nonNull).count();
+        E[] retval=(E[])Array.newInstance(cl, size);
+        AtomicInteger index=new AtomicInteger();
+        Stream.of(array).filter(Objects::nonNull).forEach(el -> retval[index.getAndIncrement()]=el);
         return retval;
     }
 
@@ -2317,8 +2516,8 @@ public class Util {
 
     public static <T> Enumeration<T> enumerate(final T[] array, int offset, final int length) {
         return new Enumeration<>() {
-            protected final int end_pos=offset + length;
-            protected int pos=offset;
+            final int end_pos=offset + length;
+            int pos=offset;
 
             public boolean hasMoreElements() {
                 return pos < end_pos;
@@ -2335,8 +2534,8 @@ public class Util {
 
     public static <T,R> Enumeration<R> enumerate(final T[] array, int offset, final int length, Function<T,R> converter) {
         return new Enumeration<>() {
-            protected final int end_pos=offset + length;
-            protected int pos=offset;
+            final int end_pos=offset + length;
+            int pos=offset;
 
             public boolean hasMoreElements() {
                 return pos < end_pos;
@@ -2362,6 +2561,13 @@ public class Util {
         return range == 0? 1 : ThreadLocalRandom.current().nextLong(range) + 1;
     }
 
+    public static int random(int range) {
+        return range == 0? 1 : ThreadLocalRandom.current().nextInt(range) + 1;
+    }
+
+    public static int randomSplittable(int range) {
+        return RANDOM.nextInt(0, range) +1;
+    }
 
     /** Sleeps between floor and ceiling milliseconds, chosen randomly */
     public static void sleepRandom(long floor,long ceiling) {
@@ -2373,6 +2579,21 @@ public class Util {
         sleep(r);
     }
 
+    /** Returns true if (positive) numbers a and b are within a certain percentage, otherwise false */
+    public static boolean withinRange(double a, double b, double range) {
+        double diff=0.0, delta=0.0;
+        if(a == b)
+            return true;
+        if(b > a) {
+            diff=b-a;
+            delta=range * b;
+        }
+        else {
+            diff=a-b;
+            delta=range * a;
+        }
+        return diff <= delta;
+    }
 
     /**
      * Tosses a coin weighted with probability and returns true or false. Example: if probability=0.8,
@@ -2388,49 +2609,64 @@ public class Util {
         return r < cutoff;
     }
 
-
     public static String dumpThreads() {
-        StringBuilder sb=new StringBuilder();
         ThreadMXBean bean=ManagementFactory.getThreadMXBean();
-        long[] ids=bean.getAllThreadIds();
-        _printThreads(bean,ids,sb);
-        long[] deadlocks=bean.findDeadlockedThreads();
-        if(deadlocks != null && deadlocks.length > 0) {
-            sb.append("deadlocked threads:\n");
-            _printThreads(bean,deadlocks,sb);
-        }
+        ThreadInfo[] threads=bean.dumpAllThreads(true, true);
+        return Stream.of(threads).map(Util::dumpThreadInfo).collect(Collectors.joining("\n"));
+    }
 
-        deadlocks=bean.findMonitorDeadlockedThreads();
-        if(deadlocks != null && deadlocks.length > 0) {
-            sb.append("monitor deadlocked threads:\n");
-            _printThreads(bean,deadlocks,sb);
+    private static String dumpThreadInfo(ThreadInfo thread) { // copied from Infinispan
+        StringBuilder sb=new StringBuilder(String.format("\"%s\" #%s prio=0 tid=0x%x nid=NA %s%n", thread.getThreadName(), thread.getThreadId(),
+                                                         thread.getThreadId(), thread.getThreadState().toString().toLowerCase()));
+        sb.append(String.format("   java.lang.Thread.State: %s%n", thread.getThreadState()));
+        LockInfo blockedLock = thread.getLockInfo();
+        StackTraceElement[] s = thread.getStackTrace();
+        MonitorInfo[] monitors = thread.getLockedMonitors();
+        for (int i = 0; i < s.length; i++) {
+            StackTraceElement ste = s[i];
+            sb.append(String.format("\tat %s\n", ste));
+            if (i == 0 && blockedLock != null) {
+                boolean parking = ste.isNativeMethod() && ste.getMethodName().equals("park");
+                sb.append(String.format("\t- %s <0x%x> (a %s)%n", blockedState(thread, blockedLock, parking),
+                                        blockedLock.getIdentityHashCode(), blockedLock.getClassName()));
+            }
+            if (monitors != null) {
+                for (MonitorInfo monitor : monitors) {
+                    if (monitor.getLockedStackDepth() == i) {
+                        sb.append(String.format("\t- locked <0x%x> (a %s)%n", monitor.getIdentityHashCode(), monitor.getClassName()));
+                    }
+                }
+            }
+        }
+        sb.append('\n');
+
+        LockInfo[] synchronizers = thread.getLockedSynchronizers();
+        if (synchronizers != null && synchronizers.length > 0) {
+            sb.append("\n   Locked ownable synchronizers:\n");
+            for (LockInfo synchronizer : synchronizers) {
+                sb.append(String.format("\t- <0x%x> (a %s)%n", synchronizer.getIdentityHashCode(), synchronizer.getClassName()));
+            }
+            sb.append('\n');
         }
         return sb.toString();
     }
 
-    public static String printStackTrace(Thread t) {
-        if(t == null)
-            return "null";
-        return String.format("-- %s:\n%s", t, Stream.of(t.getStackTrace()).map(StackTraceElement::toString)
-          .collect(Collectors.joining("\n")));
-    }
-
-
-    protected static void _printThreads(ThreadMXBean bean,long[] ids,StringBuilder sb) {
-        ThreadInfo[] threads=bean.getThreadInfo(ids,100);
-        for(ThreadInfo info : threads) {
-            if(info == null)
-                continue;
-            sb.append(info.getThreadName()).append(":\n");
-            StackTraceElement[] stack_trace=info.getStackTrace();
-            for(StackTraceElement el : stack_trace) {
-                sb.append("    at ").append(el.getClassName()).append(".").append(el.getMethodName());
-                sb.append("(").append(el.getFileName()).append(":").append(el.getLineNumber()).append(")");
-                sb.append("\n");
+    private static String blockedState(ThreadInfo thread, LockInfo blockedLock, boolean parking) {
+        String state;
+        if (blockedLock != null) {
+            if (thread.getThreadState() == Thread.State.BLOCKED) {
+                state = "waiting to lock";
+            } else if (parking) {
+                state = "parking to wait for";
+            } else {
+                state = "waiting on";
             }
-            sb.append("\n\n");
+        } else {
+            state = null;
         }
+        return state;
     }
+
 
 
     public static boolean interruptAndWaitToDie(Thread t) {
@@ -2450,6 +2686,9 @@ public class Util {
         return t.isAlive();
     }
 
+    public static String printTime(double time) {
+        return printTime(time, TimeUnit.NANOSECONDS);
+    }
 
     public static String printTime(double time, TimeUnit unit) {
         switch(unit) {
@@ -2514,28 +2753,70 @@ public class Util {
     private static Tuple<String,Long> readBytes(String input) {
         input=input.trim().toLowerCase();
 
-        int index=-1;
+        int index;
         long factor=1;
 
         if((index=input.indexOf('k')) != -1)
             factor=1000;
         else if((index=input.indexOf("kb")) != -1)
             factor=1000;
+        else if((index=input.indexOf("kib")) != -1)
+            factor=1024;
         else if((index=input.indexOf('m')) != -1)
             factor=1_000_000;
         else if((index=input.indexOf("mb")) != -1)
             factor=1_000_000;
+        else if((index=input.indexOf("mib")) != -1)
+            factor=1_048_576;
         else if((index=input.indexOf('g')) != -1)
             factor=1_000_000_000;
         else if((index=input.indexOf("gb")) != -1)
             factor=1_000_000_000;
+        else if((index=input.indexOf("gib")) != -1)
+            factor=1_073_741_824;
+
+
+        String str=index != -1? input.substring(0,index) : input;
+        return new Tuple<>(str,factor);
+    }
+
+    public static long readDurationLong(String input, TimeUnit unit) {
+        Tuple<String,Long> tuple=readDuration(input);
+        BigDecimal num = new BigDecimal(tuple.getVal1());
+        return unit.convert(num.multiply(new BigDecimal(tuple.getVal2())).longValue(), TimeUnit.MILLISECONDS);
+    }
+
+    public static int readDurationInt(String input, TimeUnit unit) {
+        Tuple<String,Long> tuple=readDuration(input);
+        BigDecimal num = new BigDecimal(tuple.getVal1());
+        return (int)unit.convert(num.multiply(new BigDecimal(tuple.getVal2())).longValue(), TimeUnit.MILLISECONDS);
+    }
+
+    private static Tuple<String,Long> readDuration(String input) {
+        input=input.trim().toLowerCase();
+
+        int index;
+        long factor;
+
+        if((index=input.indexOf("ms")) != -1)
+            factor=1;
+        else if((index=input.indexOf("s")) != -1)
+            factor=1000;
+        else if((index=input.indexOf('m')) != -1)
+            factor=60_000;
+        else if((index=input.indexOf("h")) != -1)
+            factor=3_600_000;
+        else if((index=input.indexOf('d')) != -1)
+            factor=86_400_000;
+        else
+            factor=1;
 
         String str=index != -1? input.substring(0,index) : input;
         return new Tuple<>(str,factor);
     }
 
     /**
-     * MB nowadays doesn't mean 1024 * 1024 bytes, but 1 million bytes, see http://en.wikipedia.org/wiki/Megabyte
+     * MB nowadays doesn't mean 1024 * 1024 bytes, but 1 million bytes, see <a href="http://en.wikipedia.org/wiki/Megabyte">http://en.wikipedia.org/wiki/Megabyte</a>
      * @param bytes
      */
     public static String printBytes(double bytes) {
@@ -2568,8 +2849,6 @@ public class Util {
         if(path == null || path.isEmpty())
             return null;
         String[] tmp=path.split(separator + "+"); // multiple separators could be present
-        if(tmp == null)
-            return null;
         if(tmp.length == 0)
             return null;
 
@@ -2678,6 +2957,9 @@ public class Util {
         return true;
     }
 
+    public static <T> String printList(Collection<T> l) {
+        return printListWithDelimiter(l, ",");
+    }
 
     public static <T> String printListWithDelimiter(Collection<T> list,String delimiter) {
         return printListWithDelimiter(list,delimiter,MAX_LIST_PRINT_SIZE,true);
@@ -2770,7 +3052,7 @@ public class Util {
 
     public static <T> boolean contains(T key,T[] list) {
         if(list == null) return false;
-        for(T tmp : list)
+        for(T tmp: list)
             if(tmp == key || tmp.equals(key))
                 return true;
         return false;
@@ -2789,7 +3071,7 @@ public class Util {
     public static boolean containsId(short id,short[] ids) {
         if(ids == null)
             return false;
-        for(short tmp : ids)
+        for(short tmp: ids)
             if(tmp == id)
                 return true;
         return false;
@@ -2823,7 +3105,7 @@ public class Util {
             View view=map.get(coord);
             Collection<Address> mbrs=view != null? view.getMembers() : null;
             if(mbrs != null)
-                all_addrs.removeAll(mbrs);
+                mbrs.forEach(all_addrs::remove);
         }
         coords.addAll(all_addrs);
         return coords;
@@ -2907,7 +3189,7 @@ public class Util {
         return list.get(index);
     }
 
-    public static <T> T pickRandomElement(Set<T> set) {
+    public static <T> T pickRandomElement(Collection<T> set) {
         if(set == null || set.isEmpty()) return null;
         int size=set.size();
         int random=(int)Util.random(size)-1;
@@ -2931,7 +3213,6 @@ public class Util {
         if(list == null || obj == null)
             return null;
         int size=list.size();
-
         for(int i=0; i < size; i++) {
             T tmp=list.get(i);
             if(Objects.equals(tmp, obj))
@@ -2956,6 +3237,36 @@ public class Util {
         return retval;
     }
 
+    /** Returns the element before el. If el is the first element, returns the last element. Returns null
+     * if array.length < 2 */
+    public static <T> T pickPrevious(T[] array, T el) {
+        if(array == null || el == null || array.length < 2)
+            return null;
+        for(int i=0; i < array.length; i++) {
+            if(Objects.equals(el, array[i])) {
+                int prev_index=i-1;
+                if(prev_index < 0)
+                    prev_index=array.length-1;
+                return array[prev_index];
+            }
+        }
+        return null;
+    }
+
+    public static <T> T pickPrevious(List<T> list, T el) {
+        if(list == null || el == null || list.size() < 2)
+            return null;
+        for(int i=0; i < list.size(); i++) {
+            T tmp=list.get(i);
+            if(Objects.equals(el, tmp)) {
+                int prev_index=i-1;
+                if(prev_index < 0)
+                    prev_index=list.size()-1;
+                return list.get(prev_index);
+            }
+        }
+        return null;
+    }
 
     public static byte[] generateArray(int length) {
         byte[] array=new byte[length];
@@ -3087,9 +3398,9 @@ public class Util {
      */
     public static Class<?> loadClass(String classname, ClassLoader preferredLoader) throws ClassNotFoundException {
         ClassNotFoundException exception = null;
-        List<ClassLoader> list=preferredLoader != null?
-          Arrays.asList(preferredLoader, Thread.currentThread().getContextClassLoader(), ClassLoader.getSystemClassLoader()) :
-          Arrays.asList(Thread.currentThread().getContextClassLoader(), ClassLoader.getSystemClassLoader());
+        List<ClassLoader> list = Stream.of(preferredLoader, Thread.currentThread().getContextClassLoader(), ClassLoader.getSystemClassLoader())
+              .filter(Objects::nonNull)
+              .collect(Collectors.toList());
         for(ClassLoader loader: list) {
             try {
                 return loader.loadClass(classname);
@@ -3104,47 +3415,29 @@ public class Util {
 
     public static Class<? extends Protocol> loadProtocolClass(String protocol_name, Class<?> cl) throws Exception {
         String defaultProtocolName=Global.PREFIX + protocol_name;
-        Class<? extends Protocol> clazz=null;
         try {
-            clazz=(Class<? extends Protocol>)Util.loadClass(defaultProtocolName, cl);
+            return (Class<? extends Protocol>) Util.loadClass(defaultProtocolName, cl);
         }
-        catch(ClassNotFoundException e) {
-        }
-        if(clazz == null) {
+        catch(ClassNotFoundException ignored1) {
             try {
-                clazz=(Class<? extends Protocol>)Util.loadClass(protocol_name, cl);
-            }
-            catch(ClassNotFoundException e) {
-            }
-            if(clazz == null)
+                return (Class<? extends Protocol>)Util.loadClass(protocol_name, cl);
+            } catch (ClassNotFoundException ignored2) {
                 throw new Exception(String.format(Util.getMessage("ProtocolLoadError"), protocol_name, defaultProtocolName));
+            }
         }
-        return clazz;
     }
 
     @SafeVarargs
     public static Field[] getAllDeclaredFieldsWithAnnotations(final Class<?> clazz, Class<? extends Annotation>... annotations) {
         List<Field> list=new ArrayList<>(30);
         for(Class<?> curr=clazz; curr != null; curr=curr.getSuperclass()) {
-            Field[] fields=curr.getDeclaredFields();
-            if(fields != null) {
-                for(Field field: fields) {
-                    if(annotations != null && annotations.length > 0) {
-                        for(Class<? extends Annotation> annotation : annotations) {
-                            if(field.isAnnotationPresent(annotation))
-                                list.add(field);
-                        }
-                    }
-                    else
-                        list.add(field);
+            for(Field field: curr.getDeclaredFields()) {
+                if(annotations == null || annotations.length == 0 || hasAnyAnnotation(field, annotations)) {
+                    list.add(field);
                 }
             }
         }
-
-        Field[] retval=new Field[list.size()];
-        for(int i=0; i < list.size(); i++)
-            retval[i]=list.get(i);
-        return retval;
+        return list.toArray(Field[]::new);
     }
 
 
@@ -3186,28 +3479,25 @@ public class Util {
     @SafeVarargs
     public static Method[] getAllDeclaredMethodsWithAnnotations(final Class<?> clazz, Class<? extends Annotation>... annotations) {
         List<Method> list=new ArrayList<>(30);
+        Set<String> added=new HashSet<>(30);
         for(Class<?> curr=clazz; curr != null; curr=curr.getSuperclass()) {
-            Method[] methods=curr.getDeclaredMethods();
-            if(methods != null) {
-                for(Method method : methods) {
-                    if(annotations != null && annotations.length > 0) {
-                        for(Class<? extends Annotation> annotation : annotations) {
-                            if(method.isAnnotationPresent(annotation))
-                                list.add(method);
-                        }
-                    }
-                    else
+            for(Method method : curr.getDeclaredMethods()) {
+                if(annotations == null || annotations.length == 0 || hasAnyAnnotation(method, annotations)) {
+                    if (added.add(method.getName() + Arrays.toString(method.getParameterTypes())))
                         list.add(method);
                 }
             }
         }
-
-        Method[] retval=new Method[list.size()];
-        for(int i=0; i < list.size(); i++)
-            retval[i]=list.get(i);
-        return retval;
+        return list.toArray(Method[]::new);
     }
 
+    private static boolean hasAnyAnnotation(AnnotatedElement element, Class<? extends Annotation>[] annotations) {
+        for(Class<? extends Annotation> annotation : annotations) {
+            if(element.isAnnotationPresent(annotation))
+                return true;
+        }
+        return false;
+    }
 
     public static <A extends Annotation> A getAnnotation(Class<?> clazz, Class<A> annotationClass) {
         for(Class<?> curr=clazz; curr != null; curr=curr.getSuperclass()) {
@@ -3268,6 +3558,10 @@ public class Util {
         }
     }
 
+    public static Object getField(Object target, String fieldname) throws NoSuchFieldException {
+        Field field=getField(target.getClass(), fieldname, true);
+        return getField(field, target);
+    }
 
     public static Field findField(Object target,List<String> possible_names) {
         if(target == null)
@@ -3312,6 +3606,51 @@ public class Util {
         return retval;
     }
 
+    public static Method findMethod2(Class<?> target_class, String method_name, Object[] args) throws Exception {
+        int len=args != null? args.length : 0;
+        Method retval=null;
+        Method[] methods=getAllMethods(target_class);
+        for(int i=0; i < methods.length; i++) {
+            Method m=methods[i];
+            if(m.getName().equals(method_name)) {
+                Class<?>[] parameter_types=m.getParameterTypes();
+                if(parameter_types.length == len) {
+                    boolean all_args_match=true;
+                    // now check if actual and parameter types match:
+                    for(int j=0; j < parameter_types.length; j++) {
+                        Class<?> parameter=parameter_types[j];
+                        Class<?> actual=args[j] != null? args[j].getClass() : null;
+                        if(actual != null && !isAssignableFrom(parameter, actual)) {
+                            all_args_match=false;
+                            break;
+                        }
+                    }
+                    if(all_args_match)
+                        return m;
+                }
+            }
+        }
+        return retval;
+    }
+
+    public static boolean isAssignableFrom(Class<?> left, Class<?> right) {
+        if(left == null)
+            return false;
+        if(right == null)
+            return left == null || !left.isPrimitive();
+        if(left == right)
+            return true;
+        // at this point, left and right are not null
+        if(left.isAssignableFrom(right))
+            return true;
+        return ResourceDMBean.isNumber(left) && ResourceDMBean.isNumber(right);
+    }
+
+    public static Object invoke(Object target, String method_name, Object... args) throws Exception {
+        Method method=Util.findMethod2(target.getClass(), method_name, args);
+        return method.invoke(target, args);
+    }
+
     /**
      * The method walks up the class hierarchy and returns <i>all</i> methods of this class
      * and those inherited from superclasses and superinterfaces.
@@ -3325,7 +3664,7 @@ public class Util {
                 Method[] m = superclass.getDeclaredMethods();
                 Collections.addAll(methods, m);
 
-                // find the default methods of all interfaces (https://issues.jboss.org/browse/JGRP-2247)
+                // find the default methods of all interfaces (https://issues.redhat.com/browse/JGRP-2247)
                 Class<?>[] interfaces=superclass.getInterfaces();
                 if(interfaces != null) {
                     for(Class<?> cl: interfaces) {
@@ -3341,7 +3680,7 @@ public class Util {
             }
             catch(SecurityException e) {
                 // if it runs in an applet context, it won't be able to retrieve methods from superclasses that belong
-                // to the java VM and it will raise a security exception, so we catch it here.
+                // to the java VM, and it will raise a security exception, so we catch it here.
                 superclass=null;
             }
         }
@@ -3351,6 +3690,75 @@ public class Util {
         for(Method m: methods)
             result[index++]=m;
         return result;
+    }
+
+    /**
+     * Returns the non-null values of all fields of target annotated with @Component
+     */
+    public static List<Object> getComponents(Object target) {
+        if(target == null)
+            return null;
+        Field[] fields=Util.getAllDeclaredFieldsWithAnnotations(target.getClass(), Component.class);
+        if(fields == null || fields.length == 0)
+            return null;
+        List<Object> components=new ArrayList<>(fields.length);
+        for(Field f: fields) {
+            Object comp=Util.getField(f, target);
+            if(comp != null)
+                components.add(comp);
+        }
+        return components;
+    }
+
+    public static List<Class<?>> getComponents(Class<?> clazz) {
+        if(clazz == null)
+            return null;
+        Field[] fields=Util.getAllDeclaredFieldsWithAnnotations(clazz, Component.class);
+        if(fields == null || fields.length == 0)
+            return null;
+        List<Class<?>> components=new ArrayList<>(fields.length);
+        for(Field f: fields)
+            components.add(f.getType());
+        return components;
+    }
+
+    /**
+     * Applies a function to all fields annotated with @Component
+     * @param target The target object
+     * @param func The function accepting the value of the field and the component name (prefix)
+     */
+    public static void forAllComponents(Object target, BiConsumer<Object,String> func) {
+        if(target == null)
+            return;
+        Field[] fields=Util.getAllDeclaredFieldsWithAnnotations(target.getClass(), Component.class);
+        if(fields == null)
+            return;
+        for(Field f: fields) {
+            Object comp=Util.getField(f, target);
+            if(comp != null) {
+                Component ann=f.getAnnotation(Component.class);
+                String name=ann.name();
+                if(name == null || name.trim().isEmpty())
+                    name=f.getName();
+                func.accept(comp, name);
+            }
+        }
+    }
+
+    public static void forAllComponentTypes(Class<?> cl, BiConsumer<Class<?>,String> func) {
+        if(cl == null)
+            return;
+        Field[] fields=Util.getAllDeclaredFieldsWithAnnotations(cl, Component.class);
+        if(fields == null)
+            return;
+        for(Field f: fields) {
+            Class<?> type=f.getType();
+            Component ann=f.getAnnotation(Component.class);
+            String name=ann.name();
+            if(name == null || name.trim().isEmpty())
+                name=f.getName();
+            func.accept(type, name);
+        }
     }
 
 
@@ -3368,7 +3776,7 @@ public class Util {
     }
 
     public static boolean isPrimitiveType(Object obj) {
-        return (obj instanceof Class<?>? TYPES.get(obj) : TYPES.get(obj.getClass())) != null;
+        return obj == null || (obj instanceof Class<?>? TYPES.get(obj) : TYPES.get(obj.getClass())) != null;
     }
 
     public static Method findMethod(Object target,List<String> possible_names,Class<?>... parameter_types) {
@@ -3416,27 +3824,49 @@ public class Util {
     }
 
 
-    public static <T> Set<Class<T>> findClassesAssignableFrom(String packageName,Class<T> assignableFrom)
+    public static Set<Class<?>> findClassesAssignableFrom(String packageName,Class<?> assignableFrom, ClassLoader cl)
       throws IOException, ClassNotFoundException {
-        ClassLoader loader=Thread.currentThread().getContextClassLoader();
-        Set<Class<T>> classes=new HashSet<>();
         String path=packageName.replace('.','/');
-        URL resource=loader.getResource(path);
-        if(resource != null) {
-            String filePath=resource.getFile();
-            if(filePath != null && new File(filePath).isDirectory()) {
-                for(String file : new File(filePath).list()) {
-                    if(file.endsWith(".class")) {
-                        String name=packageName + '.' + file.substring(0,file.indexOf(".class"));
-                        Class<T> clazz=(Class<T>)Class.forName(name);
-                        if(assignableFrom.isAssignableFrom(clazz))
+        return findClassesAssignableFromPath(path, assignableFrom, cl);
+    }
+
+
+    public static Set<Class<?>> findClassesAssignableFromPath(String packagePath,Class<?> assignableFrom, ClassLoader cl)
+      throws IOException, ClassNotFoundException {
+        Set<Class<?>> classes=new HashSet<>();
+        URL resource=cl.getResource(packagePath);
+        if(resource == null)
+            return classes;
+        String filePath=resource.getFile();
+        if(filePath == null)
+            return classes;
+        File f=new File(filePath);
+        if(f.isDirectory()) {
+            for(String file: f.list()) {
+                File ff=new File(f, file);
+                if(ff.isDirectory()) {
+                    String dirname=packagePath + File.separator + file;
+                    Set<Class<?>> clazzes=findClassesAssignableFromPath(dirname, assignableFrom, cl);
+                    classes.addAll(clazzes);
+                    continue;
+                }
+                if(file.endsWith(".class")) {
+                    String name=packagePath + File.separator + file.substring(0,file.indexOf(".class"));
+                    name=name.replace(File.separator, ".");
+                    try {
+                        Class<?> clazz=Class.forName(name);
+                        if(!assignableFrom.equals(clazz) && assignableFrom.isAssignableFrom(clazz))
                             classes.add(clazz);
+                    }
+                    catch(ClassNotFoundException ignored) {
+
                     }
                 }
             }
         }
         return classes;
     }
+
 
     public static List<Class<?>> findClassesAnnotatedWith(String packageName,Class<? extends Annotation> a) throws IOException, ClassNotFoundException {
         List<Class<?>> classes=new ArrayList<>();
@@ -3572,13 +4002,13 @@ public class Util {
     }
 
 
-    /** e.g. "bela,jeannette,michelle" --> List{"bela", "jeannette", "michelle"} */
+    /** e.g. "A,B,C" --> List{"A", "B", "C"} */
     public static List<String> parseCommaDelimitedStrings(String l) {
         return parseStringList(l,",");
     }
 
     /**
-     * Input is "daddy[8880],sindhu[8880],camille[5555]. Returns a list of IpAddresses
+     * Input is "daddy[8880],sindhu[8880],camille[5555]". Returns a list of IpAddresses
      */
     public static List<PhysicalAddress> parseCommaDelimitedHosts(String hosts,int port_range) throws UnknownHostException {
         StringTokenizer tok=hosts != null? new StringTokenizer(hosts,",") : null;
@@ -3602,10 +4032,52 @@ public class Util {
         return new LinkedList<>(retval);
     }
 
+    /**
+     * Parses a string into a list of IpAddresses
+     * @param list The list to which to add parsed elements
+     * @param hosts The string with host:port pairs
+     * @param unresolved_hosts A list of unresolved hosts
+     * @param port_range The port range to consider
+     * @return True if all hostnames resolved fine, false otherwise
+     */
+    public static boolean parseCommaDelimitedHostsInto(Collection<PhysicalAddress> list,
+                                                       Collection<String> unresolved_hosts,
+                                                       String hosts, int default_port, int port_range,
+                                                       StackType stack_type) {
+        StringTokenizer tok=hosts != null? new StringTokenizer(hosts, " \t\n\r\f,") : null;
+        boolean all_resolved=true;
+        while(tok != null && tok.hasMoreTokens()) {
+            String t=tok.nextToken().trim();
+            int left_index=t.indexOf('['), right_index=t.indexOf(']');
+            String host=left_index != -1? t.substring(0, left_index) : t;
+            host=host.trim();
+            int port=left_index != -1? Integer.parseInt(t.substring(left_index+1, right_index)) : default_port;
+            try {
+                InetAddress[] resolvedAddresses=InetAddress.getAllByName(host);
+                for(int i=0; i < resolvedAddresses.length; i++) {
+                    for(int p=port; p <= port + port_range; p++) {
+                        InetAddress inet=resolvedAddresses[i];
+                        boolean add=(inet == null && stack_type==StackType.Dual)
+                          || (inet instanceof Inet6Address && stack_type == StackType.IPv6)
+                          || (inet instanceof Inet4Address && stack_type == StackType.IPv4);
+                        if(add) {
+                            IpAddress addr=new IpAddress(inet, p);
+                            list.add(addr);
+                        }
+                    }
+                }
+            }
+            catch(UnknownHostException ex) {
+                all_resolved=false;
+                unresolved_hosts.add(host);
+            }
+        }
+        return all_resolved;
+    }
 
     /**
-     * Input is "daddy[8880],sindhu[8880],camille[5555]. Return List of
-     * InetSocketAddress
+     * Input is "daddy[8880],sindhu[8880],camille[5555]". Returns a list of InetSocketAddress. If a hostname doesn't
+     * resolve, then we'll use the hostname to create an address: new InetSocketAddress(host, port)
      */
     public static List<InetSocketAddress> parseCommaDelimitedHosts2(String hosts,int port_range) throws UnknownHostException {
 
@@ -3619,15 +4091,38 @@ public class Util {
             String host=t.substring(0,t.indexOf('['));
             host=host.trim();
             int port=Integer.parseInt(t.substring(t.indexOf('[') + 1,t.indexOf(']')));
-            InetAddress[] resolvedAddresses=InetAddress.getAllByName(host);
-            for(int i=0; i < resolvedAddresses.length; i++) {
+
+            InetAddress[] resolvedAddresses=null;
+            try {
+                resolvedAddresses=InetAddress.getAllByName(host);
+            }
+            catch(Exception ex) {
+            }
+            if(resolvedAddresses != null) {
+                for(int i=0; i < resolvedAddresses.length; i++) {
+                    for(int p=port; p <= port + port_range; p++) {
+                        addr=new InetSocketAddress(resolvedAddresses[i],p);
+                        retval.add(addr);
+                    }
+                }
+            }
+            else {
                 for(int p=port; p <= port + port_range; p++) {
-                    addr=new InetSocketAddress(resolvedAddresses[i], p);
+                    addr=new InetSocketAddress(host,p);
                     retval.add(addr);
                 }
             }
         }
         return new LinkedList<>(retval);
+    }
+
+    /** Parses a host:IP string into an InetSocketAddress */
+    public static InetSocketAddress parseHost(String s) {
+        s=s.trim();
+        int index=s.lastIndexOf(":");
+        String host=index > -1? s.substring(0, index) : s;
+        String port_str=index > -1? s.substring(index+1) : "0";
+        return new InetSocketAddress(host, Integer.parseInt(port_str));
     }
 
     public static List<String> parseStringList(String l,String separator) {
@@ -3641,14 +4136,22 @@ public class Util {
         return tmp;
     }
 
+    public static String[] parseStringArray(String s, String separator) {
+        if(s == null || s.isEmpty())
+            return new String[]{};
+        String[] list=s.split(separator != null? separator : ",");
+        List<String> tmp=Stream.of(list).map(String::trim).filter(Objects::nonNull).collect(Collectors.toList());
+        String[] retval=new String[tmp.size()];
+        for(int i=0; i < tmp.size(); i++)
+            retval[i]=tmp.get(i);
+        return retval;
+    }
 
     /**
-     * Reads a line of text.  A line is considered to be terminated by any one
-     * of a line feed ('\n'), a carriage return ('\r'), or a carriage return
-     * followed immediately by a linefeed.
-     * @return A String containing the contents of the line, not including
-     * any line-termination characters, or null if the end of the
-     * stream has been reached
+     * Reads a line of text.  A line is considered to be terminated by any one of a line feed ('\n'), a carriage
+     * return ('\r'), or a carriage return followed immediately by a linefeed.
+     * @return A String containing the contents of the line, not including any line-termination characters, or
+     * null if the end of the stream has been reached
      * @throws IOException If an I/O error occurs
      */
     public static String readLine(InputStream in) throws IOException {
@@ -3658,7 +4161,7 @@ public class Util {
         while(true) {
             ch=in.read();
             if(ch == -1)
-                return sb.toString();
+                return sb.length() == 0? null : sb.toString();
             if(ch == '\r')
                 ;
             else {
@@ -3672,6 +4175,26 @@ public class Util {
         return sb.toString();
     }
 
+    /** Reads all bytes from an input stream, until eof (-1) is reached */
+    public static ByteArray readBytes(InputStream in) throws IOException {
+        byte[] retval=new byte[in.available()];
+        int index=0;
+        while(true) {
+            int ch=in.read();
+            switch(ch) {
+                //case '\r':
+                  //  break;
+                case '\n':
+                case -1:
+                    return new ByteArray(retval, 0, index);
+                default:
+                    if(index+1 >= retval.length)
+                        retval=Arrays.copyOf(retval, retval.length+5);
+                    retval[index++]=(byte)ch;
+                    break;
+            }
+        }
+    }
 
     /**
      * @param s
@@ -3720,78 +4243,6 @@ public class Util {
             return hostname;
     }
 
-    /**
-     * Performs the flush of the given channel for the specified flush participants and the given
-     * number of attempts along with random sleep time after each such attempt.
-     * @param c                         the channel
-     * @param flushParticipants         the flush participants in this flush attempt
-     * @param numberOfAttempts          the number of flush attempts
-     * @param randomSleepTimeoutFloor   the minimum sleep time between attempts in ms
-     * @param randomSleepTimeoutCeiling the maximum sleep time between attempts in ms
-     * @return true if channel was flushed successfully, false otherwise
-     * @see JChannel#startFlush(List,boolean)
-     */
-    public static boolean startFlush(JChannel c,List<Address> flushParticipants,
-                                     int numberOfAttempts,long randomSleepTimeoutFloor,long randomSleepTimeoutCeiling) {
-        int attemptCount=0;
-        while(attemptCount < numberOfAttempts) {
-            try {
-                c.startFlush(flushParticipants,false);
-                return true;
-            }
-            catch(Exception e) {
-                Util.sleepRandom(randomSleepTimeoutFloor,randomSleepTimeoutCeiling);
-                attemptCount++;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Performs the flush of the given channel and the specified flush participants
-     * @param c                 the channel
-     * @param flushParticipants the flush participants in this flush attempt
-     * @see JChannel#startFlush(List,boolean)
-     */
-    public static boolean startFlush(JChannel c,List<Address> flushParticipants) {
-        return startFlush(c,flushParticipants,4,1000,5000);
-    }
-
-    /**
-     * Performs the flush of the given channel within the specfied number of attempts along with random
-     * sleep time after each such attempt.
-     * @param c                         the channel
-     * @param numberOfAttempts          the number of flush attempts
-     * @param randomSleepTimeoutFloor   the minimum sleep time between attempts in ms
-     * @param randomSleepTimeoutCeiling the maximum sleep time between attempts in ms
-     * @return true if channel was flushed successfully, false otherwise
-     * @see JChannel#startFlush(boolean)
-     */
-    public static boolean startFlush(JChannel c,int numberOfAttempts,long randomSleepTimeoutFloor,long randomSleepTimeoutCeiling) {
-        int attemptCount=0;
-        while(attemptCount < numberOfAttempts) {
-            try {
-                c.startFlush(false);
-                return true;
-            }
-            catch(Exception e) {
-                Util.sleepRandom(randomSleepTimeoutFloor,randomSleepTimeoutCeiling);
-                attemptCount++;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Performs the flush of the given channel
-     * @param c the channel
-     * @return true if channel was flushed successfully, false otherwise
-     * @see JChannel#startFlush(boolean)
-     */
-    public static boolean startFlush(JChannel c) {
-        return startFlush(c,4,1000,5000);
-    }
-
     public static String shortName(InetAddress hostname) {
         if(hostname == null) return null;
         return hostname.getHostAddress();
@@ -3800,7 +4251,8 @@ public class Util {
     public static String generateLocalName() {
         String retval=null;
         try {
-            retval=shortName(InetAddress.getLocalHost().getHostName());
+            InetAddress host=LOCALHOST != null? LOCALHOST : InetAddress.getLocalHost();
+            retval=shortName(host.getHostName());
         }
         catch(Throwable ignored) {
         }
@@ -3831,7 +4283,7 @@ public class Util {
     }
 
     public static ServerSocket createServerSocket(SocketFactory factory, String service_name, InetAddress bind_addr,
-                                                  int start_port, int end_port, int recv_buf_size) {
+                                                  int start_port, int end_port, int recv_buf_size) throws Exception {
         ServerSocket ret=null;
         try {
             ret=factory.createServerSocket(service_name);
@@ -3842,7 +4294,7 @@ public class Util {
         }
         catch(Exception e) {
             Util.close(ret);
-            return null;
+            throw e; // return null;
         }
     }
 
@@ -4048,7 +4500,7 @@ public class Util {
         else
             bind_addr=getAddress(bind_intf, AddressScope.NON_LOOPBACK, ip_version);
 
-        //http://jira.jboss.org/jira/browse/JGRP-739
+        //https://issues.redhat.com/browse/JGRP-739
         //check all bind_address against NetworkInterface.getByInetAddress() to see if it exists on the machine
         //in some Linux setups NetworkInterface.getByInetAddress(InetAddress.getLocalHost()) returns null, so skip
         //the check in that case
@@ -4081,11 +4533,20 @@ public class Util {
         return contains("java.vm.vendor", "android");
     }
 
-    public static boolean checkForMac() {return checkForPresence("os.name", "mac");}
+    public static boolean checkForMac() {return checkForPresence("os.name", "mac", "macosx", "osx", "darwin");}
+
+    private static boolean checkForPresence(String key, String ...values) {
+        if(values == null)
+            return false;
+        for(String val: values)
+            if(checkForPresence(key, val))
+                return true;
+        return false;
+    }
 
     private static boolean checkForPresence(String key,String value) {
         try {
-            String tmp=SecurityActions.getProperty(key);
+            String tmp=System.getProperty(key);
             return tmp != null && tmp.trim().toLowerCase().startsWith(value);
         }
         catch(Throwable t) {
@@ -4095,7 +4556,7 @@ public class Util {
 
     private static boolean contains(String key,String value) {
         try {
-            String tmp=SecurityActions.getProperty(key);
+            String tmp=System.getProperty(key);
             return tmp != null && tmp.trim().toLowerCase().contains(value.trim().toLowerCase());
         }
         catch(Throwable t) {
@@ -4168,7 +4629,9 @@ public class Util {
         }
         catch(Throwable ignored) {
         }
-
+        // https://issues.redhat.com/browse/JGRP-2897
+        if(value.toUpperCase().startsWith("USE-LOCALHOST") || value.toUpperCase().startsWith("USE_LOCALHOST"))
+            return LOCALHOST;
         if(value.startsWith("match"))
             return Util.getAddressByPatternMatch(value, ip_version);
         if(value.startsWith("custom:"))
@@ -4285,7 +4748,7 @@ public class Util {
                             if(matcher.matches()) {
                                 if((addr instanceof Inet4Address && (ip_version == StackType.IPv4 || ip_version == StackType.Dual)) ||
                                   (addr instanceof Inet6Address && ip_version == StackType.IPv6))
-                                return addr;
+                                    return addr;
                                 if(first == null)
                                     first=addr;
                             }
@@ -4322,12 +4785,7 @@ public class Util {
 
 
 
-    /**
-     * A function to check if an interface supports an IP version (i.e has addresses
-     * defined for that IP version).
-     * @param intf
-     * @return
-     */
+    /** A function to check if an interface supports an IP version (i.e. has addresses defined for that IP version) */
     public static boolean interfaceHasIPAddresses(NetworkInterface intf,StackType ip_version) throws UnknownHostException {
         boolean supportsVersion=false;
         if(intf != null) {
@@ -4362,7 +4820,7 @@ public class Util {
      * if the type cannot be detected
      */
     private static StackType _getIpStackType() {
-        Collection<InetAddress> all_addresses=getAllAvailableAddresses(null);
+        Collection<InetAddress> all_addresses=getAllAvailableAddresses();
         for(InetAddress addr: all_addresses) {
             if(addr instanceof Inet4Address)
                 ipv4_stack_available=true;
@@ -4386,7 +4844,7 @@ public class Util {
 
 
     public static boolean isStackAvailable(boolean ipv4) {
-        Collection<InetAddress> all_addrs=getAllAvailableAddresses(null);
+        Collection<InetAddress> all_addrs=getAllAvailableAddresses();
         for(InetAddress addr : all_addrs)
             if(ipv4 && addr instanceof Inet4Address || (!ipv4 && addr instanceof Inet6Address))
                 return true;
@@ -4395,39 +4853,73 @@ public class Util {
 
 
     public static List<NetworkInterface> getAllAvailableInterfaces() throws SocketException {
+        List<NetworkInterface> cached_interfaces=CACHED_INTERFACES;
+        if(cached_interfaces != null)
+            return cached_interfaces;
+
         List<NetworkInterface> retval=new ArrayList<>(10);
         for(Enumeration<NetworkInterface> en=NetworkInterface.getNetworkInterfaces(); en.hasMoreElements(); ) {
-            retval.add(en.nextElement());
+            NetworkInterface intf=en.nextElement();
+            retval.add(intf);
+            for(Enumeration<NetworkInterface> subs=intf.getSubInterfaces(); subs.hasMoreElements();) {
+                NetworkInterface sub=subs.nextElement();
+                if(sub != null)
+                    retval.add(sub);
+            }
         }
-        return retval;
+        return CACHED_INTERFACES=retval;
     }
 
+    public static void resetCachedAddresses(boolean reset_interfaces, boolean reset_addresses) {
+        if(reset_interfaces)
+            CACHED_INTERFACES=null;
+        if(reset_addresses)
+            CACHED_ADDRESSES=null;
+    }
+
+    /** This is a workaround for use within android. Sometimes the standard java methods do not return all the addresses. 
+     * This will allow for setting in android via the conectivity manager without needing to pass in the context.
+     * Also will allow android to update as connectivity changes.
+     */
+    public static void setCachedAddresses(List<NetworkInterface> interfaces, List<InetAddress> addresses) {
+        CACHED_INTERFACES=interfaces;
+        CACHED_ADDRESSES=addresses;
+    }
     /** Returns all addresses of all interfaces (that are up) that satisfy a given filter (ignored if null) */
     public static Collection<InetAddress> getAllAvailableAddresses(Predicate<InetAddress> filter) {
-        Set<InetAddress> retval=new HashSet<>();
+        Collection<InetAddress> cached_addresses=getAllAvailableAddresses();
+        assert cached_addresses != null;
+        return filter == null ?
+                cached_addresses :
+                cached_addresses.stream().filter(filter).collect(Collectors.toList());
+    }
+
+    private static synchronized Collection<InetAddress> getAllAvailableAddresses() {
+        if(CACHED_ADDRESSES != null)
+            return CACHED_ADDRESSES;
+        Set<InetAddress> addresses=new HashSet<>();
         try {
             List<NetworkInterface> interfaces=getAllAvailableInterfaces();
             for(NetworkInterface intf: interfaces) {
                 if(!isUp(intf)  /*!intf.isUp()*/)
                     continue;
-                Enumeration<InetAddress> addrs=intf.getInetAddresses();
-                while(addrs.hasMoreElements()) {
-                    InetAddress addr=addrs.nextElement();
-                    if(filter == null || filter.test(addr))
-                        retval.add(addr);
+                Enumeration<InetAddress> inetAddresses=intf.getInetAddresses();
+                while(inetAddresses.hasMoreElements()) {
+                    addresses.add(inetAddresses.nextElement());
                 }
             }
         }
         catch(SocketException e) {
         }
-        return retval;
+        // immutable list
+        return CACHED_ADDRESSES=List.copyOf(addresses);
     }
 
     public static void checkIfValidAddress(InetAddress bind_addr,String prot_name) throws Exception {
         // N.B. bind_addr.isAnyLocalAddress() is not OK
         if (bind_addr.isLoopbackAddress())
             return;
-        Collection<InetAddress> addrs=getAllAvailableAddresses(null);
+        Collection<InetAddress> addrs=getAllAvailableAddresses();
         for(InetAddress addr : addrs) {
             if(addr.equals(bind_addr))
                 return;
@@ -4461,7 +4953,7 @@ public class Util {
                 prop=system_props[i];
                 if(prop != null) {
                     try {
-                        tmp=SecurityActions.getProperty(prop);
+                        tmp=System.getProperty(prop);
                         if(tmp != null)
                             return tmp;
                     }
@@ -4544,7 +5036,7 @@ public class Util {
      * @param p
      * @return A string with vars replaced, or the same string if no vars found
      */
-    public static String substituteVariable(String val, Properties p) {
+    public static String substituteVariableOld(String val, Properties p) {
         if(val == null)
             return val;
         String retval=val, prev;
@@ -4556,6 +5048,59 @@ public class Util {
                 break;
         }
         return retval;
+    }
+
+    /**
+     * Replaces variables in a string.
+     * @param input The input string
+     * @param p A Properties hashmap, may be null
+     * @return The string with replaced variables, might be the same string as the input string if no substitution took place.
+     */
+    public static String substituteVariable(String input, Properties p) {
+        if(input == null)
+            return input;
+        StringBuilder sb=new StringBuilder(input.length()), cache=null;
+        for(int i=0; i < input.length(); i++) {
+            char ch=input.charAt(i);
+            switch(ch) {
+                case '$':
+                    char next=nextChar(input, i+1);
+                    if(next == 0) { // end of string
+                        sb.append(ch);
+                        continue; // will terminate
+                    }
+                    if(next == '{') { // found '${'
+                        i++;
+                        if(cache != null) // we've already encountered a '${', but it is ignored
+                            sb.append(cache);
+                        cache=new StringBuilder(input.length()).append(ch).append(next);
+                    }
+                    else
+                        sb.append(ch); // .append(next);
+                    break;
+                case '}':
+                    if(cache != null) {
+                        String val=cache.substring(2);
+                        String tmp=getProperty(val, p);
+                        if(tmp != null)
+                            sb.append(tmp);
+                        cache=null;
+                    }
+                    else
+                        sb.append(ch);
+                    break;
+                default:
+                    Objects.requireNonNullElse(cache, sb).append(ch);
+                    break;
+            }
+        }
+        if(cache != null)
+            sb.append(cache);
+        return sb.length() == 0? null : sb.toString();
+    }
+
+    protected static char nextChar(String s, int index) {
+        return index >= s.length()? 0 : s.charAt(index);
     }
 
     private static String _substituteVar(String val, Properties p) {
@@ -4616,9 +5161,9 @@ public class Util {
             try {
                 if(p != null && (retval=p.getProperty(prop)) != null)
                     return retval;
-                if((retval=SecurityActions.getProperty(prop)) != null)
+                if((retval=System.getProperty(prop)) != null)
                     return retval;
-                if((retval=SecurityActions.getEnv(prop)) != null)
+                if((retval=System.getenv(prop)) != null)
                     return retval;
             }
             catch(Throwable ignored) {
@@ -4638,9 +5183,13 @@ public class Util {
 
         // Pattern p=Pattern.compile("[A-Z]+");
         Matcher m=METHOD_NAME_TO_ATTR_NAME_PATTERN.matcher(name);
-        StringBuffer sb=new StringBuffer(); // todo: switch to StringBuilder when the JDK version is >= 9
+        // Fix android platform NoSuchMethodException: Matcher.appendReplacement(StringBuffer, String);
+        //noinspection StringBufferMayBeStringBuilder
+        StringBuffer sb=new StringBuffer();
+        int start=0, end=0;
         while(m.find()) {
-            int start=m.start(), end=m.end();
+            start=m.start();
+            end=m.end();
             String str=name.substring(start,end).toLowerCase();
             if(str.length() > 1) {
                 String tmp1=str.substring(0,str.length() - 1);
@@ -4653,7 +5202,9 @@ public class Util {
             else
                 m.appendReplacement(sb,"_" + str);
         }
-        m.appendTail(sb);
+        // m.appendTail(sb); // https://issues.redhat.com/browse/JGRP-2670
+        sb.append(name, end, name.length());
+
         return sb.length() > 0? sb.toString() : methodName;
     }
 
@@ -4679,11 +5230,16 @@ public class Util {
         if(attr_name.contains("_")) {
             // Pattern p=Pattern.compile("_.");
             Matcher m=ATTR_NAME_TO_METHOD_NAME_PATTERN.matcher(attr_name);
-            StringBuffer sb=new StringBuffer(); // todo: switch to StringBuilder when the JDK version is >= 9
+            // Fix android platform NoSuchMethodException: Matcher.appendReplacement(StringBuffer, String);
+            //noinspection StringBufferMayBeStringBuilder
+            StringBuffer sb=new StringBuffer();
+            int end=0;
             while(m.find()) {
+                end=m.end();
                 m.appendReplacement(sb,attr_name.substring(m.end() - 1,m.end()).toUpperCase());
             }
-            m.appendTail(sb);
+            // m.appendTail(sb); // https://issues.redhat.com/browse/JGRP-2670
+            sb.append(attr_name, end, attr_name.length());
             char first=sb.charAt(0);
             if(Character.isLowerCase(first)) {
                 sb.setCharAt(0,Character.toUpperCase(first));
@@ -4701,8 +5257,50 @@ public class Util {
     }
 
 
+    public static Map<String,List<Address>> getSites(View bridge_view, String excluding_site) {
+        Map<String,List<Address>> m=new HashMap<>();
+        if(bridge_view == null)
+            return m;
+        for(Address a: bridge_view) {
+            if(a instanceof SiteUUID) {
+                String sitename=((SiteUUID)a).getSite();
+                if(sitename == null || sitename.equals(excluding_site))
+                    continue;
+                List<Address> site_addrs=m.computeIfAbsent(sitename, FUNC);
+                site_addrs.add(a);
+            }
+        }
+        return m;
+    }
+
+    /**
+     * Returns the sites of the view (all addresses are SiteUUIDs) minus the given site, Example:
+     * bridge_view=A:net1,B:net1,X:net2,Y:net2, excluding_site=net1 -> ["net2"]
+     * @param bridge_view
+     * @param excluding_site
+     * @return the sites of members who are _not_ in excluding_site; each site is returned onlt once
+     */
+    public static Collection<String> otherSites(View bridge_view, String excluding_site) {
+        if(bridge_view == null)
+            return Collections.emptySet();
+        Set<String> ret=new HashSet<>(bridge_view.size());
+        Address[] members=bridge_view.getMembersRaw();
+        for(Address addr: members) {
+            if(addr instanceof SiteUUID) {
+                String site=((SiteUUID)addr).getSite();
+                if(site != null && !site.equals(excluding_site))
+                    ret.add(site);
+            }
+        }
+        return ret;
+    }
+
+    public static String utcNow() {
+        return UTF_FORMAT.format(LocalDateTime.now(ZoneOffset.UTC));
+    }
+
+    public static String utcEpoch(long milliseconds) {
+        return UTF_FORMAT.format(LocalDateTime.ofInstant(Instant.ofEpochMilli(milliseconds), ZoneOffset.UTC));
+    }
+
 }
-
-
-
-

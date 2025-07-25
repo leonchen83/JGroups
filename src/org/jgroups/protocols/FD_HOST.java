@@ -9,7 +9,6 @@ import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.annotations.ManagedOperation;
 import org.jgroups.annotations.Property;
 import org.jgroups.conf.AttributeType;
-import org.jgroups.stack.IpAddress;
 import org.jgroups.stack.Protocol;
 import org.jgroups.util.*;
 
@@ -31,7 +30,7 @@ import java.util.concurrent.TimeUnit;
  * <p/>
  * This protocol would typically be used when multiple cluster members are running on the same physical box.
  * <p/>
- * JIRA:  https://issues.jboss.org/browse/JGRP-1855
+ * JIRA:  https://issues.redhat.com/browse/JGRP-1855
  * @author  Bela Ban
  * @version 3.5, 3.4.5
  */
@@ -69,8 +68,6 @@ public class FD_HOST extends Protocol {
     protected volatile boolean                           has_suspected_mbrs;
 
     protected final BoundedList<Tuple<InetAddress,Long>> suspect_history=new BoundedList<>(20);
-
-    protected Address                                    local_addr;
     protected InetAddress                                local_host;
     protected final List<Address>                        members=new ArrayList<>();
 
@@ -110,7 +107,7 @@ public class FD_HOST extends Protocol {
     public String printSuspectHistory() {
         StringBuilder sb=new StringBuilder();
         for(Tuple<InetAddress,Long> tmp: suspect_history) {
-            sb.append(new Date(tmp.getVal2())).append(": ").append(tmp.getVal1()).append("\n");
+            sb.append(Util.utcEpoch(tmp.getVal2())).append(": ").append(tmp.getVal1()).append("\n");
         }
         return sb.toString();
     }
@@ -181,13 +178,8 @@ public class FD_HOST extends Protocol {
                 View view=evt.getArg();
                 handleView(view);
                 break;
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                break;
             case Event.CONNECT:
-            case Event.CONNECT_USE_FLUSH:
             case Event.CONNECT_WITH_STATE_TRANSFER:
-            case Event.CONNECT_WITH_STATE_TRANSFER_USE_FLUSH:
                 local_host=getHostFor(local_addr);
                 break;
             case Event.DISCONNECT:
@@ -246,7 +238,7 @@ public class FD_HOST extends Protocol {
 
     protected InetAddress getHostFor(Address mbr) {
         PhysicalAddress phys_addr=getPhysicalAddress(mbr);
-        return phys_addr instanceof IpAddress? ((IpAddress)phys_addr).getIpAddress() : null;
+        return phys_addr != null? phys_addr.getIpAddress() : null;
     }
 
     protected boolean isPinger(Address mbr) {
@@ -414,12 +406,12 @@ public class FD_HOST extends Protocol {
         }
 
         public boolean isAlive(InetAddress host, long timeout) throws Exception {
-            return CommandExecutor2.execute(cmd + " " + host.getHostAddress()) == 0;
+            return CommandExecutor2.execute(cmd, host.getHostAddress()) == 0;
         }
     }
 
     public static class CommandExecutor2 {
-        public static int execute(String command) throws Exception {
+        public static int execute(String... command) throws Exception {
             Process p=Runtime.getRuntime().exec(command);
             return p.waitFor();
         }

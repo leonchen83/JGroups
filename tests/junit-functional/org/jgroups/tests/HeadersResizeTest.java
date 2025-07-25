@@ -16,7 +16,7 @@ import java.util.List;
 import static org.jgroups.Message.Flag.OOB;
 
 /**
- * Tests unnecessary resizing of headers (https://issues.jboss.org/browse/JGRP-2120)
+ * Tests unnecessary resizing of headers (https://issues.redhat.com/browse/JGRP-2120)
  * @author Bela Ban
  * @since  4.0
  */
@@ -39,8 +39,6 @@ public class HeadersResizeTest {
 
     public void testResizing() throws Exception {
         BatchingBundler bundler=new BatchingBundler();
-        TP transport=a.getProtocolStack().getTransport();
-        bundler.init(transport);
         a.getProtocolStack().getTransport().setBundler(bundler);
 
         MyReceiver receiver=new MyReceiver();
@@ -54,13 +52,7 @@ public class HeadersResizeTest {
         }
         bundler.release(); // sends all bundled messages as a batch
 
-        for(int i=0; i < 10; i++) {
-            if(receiver.num_msgs >= 5)
-                break;
-            Util.sleep(200);
-        }
-        System.out.printf("Number of transport headers: %d\n", receiver.num_transport_headers);
-        assert receiver.num_transport_headers == 0;
+        Util.waitUntil(5000, 100, () -> receiver.num_msgs >= 5 && receiver.num_transport_headers == 5);
     }
 
 

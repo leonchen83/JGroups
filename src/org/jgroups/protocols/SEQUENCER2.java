@@ -7,11 +7,15 @@ import org.jgroups.annotations.MBean;
 import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.annotations.ManagedOperation;
 import org.jgroups.stack.Protocol;
-import org.jgroups.util.*;
+import org.jgroups.util.Bits;
+import org.jgroups.util.MessageBatch;
+import org.jgroups.util.Table;
+import org.jgroups.util.Util;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.BlockingQueue;
@@ -36,7 +40,6 @@ import java.util.function.Supplier;
 @Experimental
 @MBean(description="Implementation of total order protocol using a sequencer (unicast-unicast-multicast)")
 public class SEQUENCER2 extends Protocol {
-    protected Address                           local_addr;
     protected volatile Address                  coord;
     protected volatile View                     view;
     protected volatile boolean                  is_coord=false;
@@ -72,7 +75,6 @@ public class SEQUENCER2 extends Protocol {
     @ManagedAttribute
     public boolean isCoordinator()   {return is_coord;}
     public Address getCoordinator()  {return coord;}
-    public Address getLocalAddress() {return local_addr;}
 
     @ManagedAttribute(description="Number of messages in the forward-queue")
     public int getFwdQueueSize() {return fwd_queue.size();}
@@ -103,10 +105,6 @@ public class SEQUENCER2 extends Protocol {
 
             case Event.TMP_VIEW:
                 handleTmpView(evt.getArg());
-                break;
-
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
                 break;
         }
         return down_prot.down(evt);
@@ -261,7 +259,7 @@ public class SEQUENCER2 extends Protocol {
     }*/
 
     public void up(MessageBatch batch) {
-        MessageIterator it=batch.iterator();
+        Iterator<Message> it=batch.iterator();
         while(it.hasNext()) {
             Message msg=it.next();
             if(msg.isFlagSet(Message.Flag.NO_TOTAL_ORDER) || msg.isFlagSet(Message.Flag.OOB) || msg.getHeader(id) == null)
@@ -462,14 +460,14 @@ public class SEQUENCER2 extends Protocol {
         @Override
         public void writeTo(DataOutput out) throws IOException {
             out.writeByte(type);
-            Bits.writeLong(seqno,out);
+            Bits.writeLongCompressed(seqno, out);
             out.writeShort(num_seqnos);
         }
 
         @Override
         public void readFrom(DataInput in) throws IOException {
             type=in.readByte();
-            seqno=Bits.readLong(in);
+            seqno=Bits.readLongCompressed(in);
             num_seqnos=in.readUnsignedShort();
         }
 

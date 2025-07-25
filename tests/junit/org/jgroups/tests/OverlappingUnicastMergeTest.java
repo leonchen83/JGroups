@@ -1,6 +1,8 @@
 package org.jgroups.tests;
 
 import org.jgroups.*;
+import org.jgroups.protocols.TCP;
+import org.jgroups.protocols.TP;
 import org.jgroups.stack.ProtocolStack;
 import org.jgroups.util.Util;
 import org.testng.annotations.AfterMethod;
@@ -8,13 +10,12 @@ import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Tests overlapping merges, e.g. A: {A,B}, B: {A,B} and C: {A,B,C}. Tests unicast tables<br/>
- * Related JIRA: https://jira.jboss.org/jira/browse/JGRP-940
+ * Related JIRA: https://issues.redhat.com/browse/JGRP-940
  * @author Bela Ban
  */
 @Test(groups=Global.STACK_DEPENDENT,singleThreaded=true)
@@ -25,23 +26,18 @@ public class OverlappingUnicastMergeTest extends ChannelTestBase {
     @BeforeMethod
     void start() throws Exception {
         ra=new MyReceiver("A"); rb=new MyReceiver("B"); rc=new MyReceiver("C");
-        a=createChannel(true, 3, "A");
-        a.setReceiver(ra);
+        a=createChannel().name("A").setReceiver(ra);
+        b=createChannel().name("B").setReceiver(rb);
+        c=createChannel().name("C").setReceiver(rc);
 
-        b=createChannel(a, "B");
-        b.setReceiver(rb);
-
-        c=createChannel(a, "C");
-        c.setReceiver(rc);
-
+        makeUnique(a,b,c);
         modifyConfigs(a, b, c);
 
         a.connect("OverlappingUnicastMergeTest");
         b.connect("OverlappingUnicastMergeTest");
         c.connect("OverlappingUnicastMergeTest");
 
-        View view=c.getView();
-        assertEquals("view is " + view, 3, view.size());
+        Util.waitUntilAllChannelsHaveSameView(5000, 500, a,b,c);
     }
 
     @AfterMethod
@@ -76,9 +72,9 @@ public class OverlappingUnicastMergeTest extends ChannelTestBase {
         // Inject view {B,C} into B and C:
         View new_view=View.create(b.getAddress(), 10, b.getAddress(), c.getAddress());
         injectView(new_view, b, c);
-        assertEquals("A's view is " + a.getView(), 3, a.getView().size());
-        assertEquals("B's view is " + b.getView(), 2, b.getView().size());
-        assertEquals("C's view is " + c.getView(), 2, c.getView().size());
+        assert 3 == a.getView().size();
+        assert 2 == b.getView().size();
+        assert 2 == c.getView().size();
         sendAndCheckMessages(5, a, b, c);
     }
 
@@ -97,11 +93,36 @@ public class OverlappingUnicastMergeTest extends ChannelTestBase {
     }
 
     public void testWithEveryoneHavingASingletonView() throws Exception {
-        // Inject view {A} into A, B and C:
-        injectView(View.create(a.getAddress(), 10, a.getAddress()), a);
-        injectView(View.create(b.getAddress(), 10, b.getAddress()), b);
-        injectView(View.create(c.getAddress(), 10, c.getAddress()), c);
+        // Inject view {A} into A, {B} into B and {C} into C, then send unicasts: unicast messages should be
+        // received despite the members not being in the same view
+        for(JChannel ch: List.of(a,b,c))
+            injectView(View.create(ch.getAddress(), 10, ch.getAddress()), ch);
+        if(a.getProtocolStack().findProtocol(TCP.class) != null)
+            Util.waitUntil(5000, 500, () -> getNumberOfConnections(a, b, c) == 0,
+                           () -> String.format("number of connections != 0: %s\n", printConnections(a, b, c)));
         sendAndCheckMessages(5, a, b, c);
+    }
+
+    protected static String printConnections(JChannel... channels) {
+        StringBuilder sb=new StringBuilder();
+        for(JChannel ch: channels) {
+            TCP tcp=(TCP)ch.getProtocolStack().getTransport();
+            sb.append(String.format("%s: %s\n", ch.getAddress(), tcp.printConnections()));
+        }
+        return sb.toString();
+    }
+
+    protected static int getNumberOfConnections(JChannel... channels) {
+        int retval=0;
+        for(JChannel ch: channels) {
+            TP tp=ch.getProtocolStack().getTransport();
+            if(tp instanceof TCP) {
+                retval+=((TCP)tp).getOpenConnections();
+            }
+            else
+                retval--;
+        }
+        return retval;
     }
 
 
@@ -120,7 +141,7 @@ public class OverlappingUnicastMergeTest extends ChannelTestBase {
     private void sendAndCheckMessages(int num_msgs, JChannel ... channels) throws Exception {
         ra.clear(); rb.clear(); rc.clear();
         // 1. send unicast messages
-        Set<Address> mbrs=new HashSet<>(channels.length);
+        List<Address> mbrs=new ArrayList<>(channels.length);
         for(JChannel ch: channels)
             mbrs.add(ch.getAddress());
 
@@ -128,7 +149,7 @@ public class OverlappingUnicastMergeTest extends ChannelTestBase {
             Address addr=ch.getAddress();
             for(Address dest: mbrs) {
                 for(int i=1; i <= num_msgs; i++)
-                    ch.send(dest, addr + ":" + i);
+                    ch.send(dest, String.format("%s%d", addr, i));
             }
         }
         int total_msgs=num_msgs * channels.length;
@@ -153,20 +174,21 @@ public class OverlappingUnicastMergeTest extends ChannelTestBase {
                 break;
             Util.sleep(500);
         }
+
         for(MyReceiver receiver: receivers) {
             List<Message> ucasts=receiver.getUnicasts();
             int ucasts_received=ucasts.size();
             System.out.println("receiver " + receiver + ": ucasts=" + ucasts_received);
-            assertEquals("ucasts for " + receiver + ": " + print(ucasts), num_ucasts, ucasts_received);
+        }
+        for(MyReceiver receiver: receivers) {
+            List<Message> ucasts=receiver.getUnicasts();
+            int ucasts_received=ucasts.size();
+            assert num_ucasts == ucasts_received : "ucasts for " + receiver + ": " + print(ucasts);
         }
     }
 
     static String print(List<Message> list) {
-        StringBuilder sb=new StringBuilder();
-        for(Message msg: list) {
-            sb.append(msg.getSrc()).append(": ").append((Object)msg.getObject()).append(" ");
-        }
-        return sb.toString();
+        return list.stream().map(m -> (String)m.getObject()).collect(Collectors.joining(", "));
     }
 
     private static void modifyConfigs(JChannel ... channels) throws Exception {
@@ -196,13 +218,8 @@ public class OverlappingUnicastMergeTest extends ChannelTestBase {
             }
         }
 
-        public void viewAccepted(View new_view) {
-            // System.out.println("[" + name + "] " + new_view);
-        }
-
         public List<Message> getUnicasts() { return ucasts; }
         public void clear() {ucasts.clear();}
-
         public String toString() {
             return name;
         }

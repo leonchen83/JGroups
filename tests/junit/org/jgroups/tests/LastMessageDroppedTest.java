@@ -1,8 +1,14 @@
 package org.jgroups.tests;
 
-import org.jgroups.*;
+import org.jgroups.Global;
+import org.jgroups.JChannel;
+import org.jgroups.Message;
+import org.jgroups.Receiver;
 import org.jgroups.conf.ClassConfigurator;
 import org.jgroups.protocols.DISCARD;
+import org.jgroups.protocols.NAKACK4;
+import org.jgroups.protocols.NakAckHeader;
+import org.jgroups.protocols.ReliableMulticast;
 import org.jgroups.protocols.pbcast.NAKACK2;
 import org.jgroups.protocols.pbcast.NakAckHeader2;
 import org.jgroups.protocols.pbcast.STABLE;
@@ -23,18 +29,20 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 @Test(groups=Global.STACK_DEPENDENT,singleThreaded=true)
 public class LastMessageDroppedTest extends ChannelTestBase {
     protected JChannel a, b;
-    protected static final short NAKACK2_ID;
+    protected static final short NAKACK2_ID, NAKACK4_ID;
 
     static {
         NAKACK2_ID=ClassConfigurator.getProtocolId(NAKACK2.class);
+        NAKACK4_ID=ClassConfigurator.getProtocolId(NAKACK4.class);
     }
 
     @BeforeMethod void init() throws Exception {
-        a=createChannel(true, 2).name("A");
-        b=createChannel(a).name("B");
-        changeNAKACK2(a,b);
+        a=createChannel().name("A");
+        b=createChannel().name("B");
+        makeUnique(a,b);
+        changeNAKACK(a, b);
         // it should take between 0 and 6s to retransmit the last missing msg. if dropped, may have to run multiple times
-        changeDesiredGossipTime(3000, a,b);
+        changeDesiredGossipTime(2000, a,b);
         a.connect("LastMessageDroppedTest");
         b.connect("LastMessageDroppedTest");
         Util.waitUntilAllChannelsHaveSameView(10000, 500, a, b);
@@ -46,8 +54,10 @@ public class LastMessageDroppedTest extends ChannelTestBase {
     }
 
     public void testLastMessageDropped() throws Exception {
+        if(!retransmissionAvailable(a, b))
+            return;
         DISCARD discard=new DISCARD();
-        a.getProtocolStack().insertProtocol(discard,ProtocolStack.Position.BELOW,NAKACK2.class);
+        a.getProtocolStack().insertProtocol(discard, ProtocolStack.Position.BELOW, NAKACK2.class, NAKACK4.class);
 
         MyReceiver receiver=new MyReceiver();
         b.setReceiver(receiver);
@@ -57,12 +67,8 @@ public class LastMessageDroppedTest extends ChannelTestBase {
         a.send(null, 3);
 
         Collection<Integer> list=receiver.getMsgs();
-        for(int i=0; i < 20 && list.size() < 3; i++)  {
-            System.out.println("list=" + list);
-            Util.sleep(1000);
-        }
+        Util.waitUntil(20000, 500, () -> list.size() == 3, () -> String.format("list: %s", list));
         System.out.println("list=" + list);
-        assert list.size() == 3 : "list=" + list;
     }
 
     /**
@@ -70,40 +76,56 @@ public class LastMessageDroppedTest extends ChannelTestBase {
      * a timeout of 5s should make sure that B eventually does get message 3.
      */
     public void testLastMessageAndLastSeqnoDropped() throws Exception {
+        if(!retransmissionAvailable(a,b))
+            return;
         DISCARD discard=new DISCARD();
         ProtocolStack stack=a.getProtocolStack();
-        stack.insertProtocol(discard,ProtocolStack.Position.BELOW,NAKACK2.class);
+        stack.insertProtocol(discard, ProtocolStack.Position.BELOW, NAKACK2.class, NAKACK4.class);
 
         MyReceiver receiver=new MyReceiver();
         b.setReceiver(receiver);
         a.send(null, 1);
         a.send(null, 2);
         discard.dropDownMulticasts(1); // drop the next multicast
-        stack.insertProtocol(new LastSeqnoDropper(1), ProtocolStack.Position.BELOW, NAKACK2.class);
+        stack.insertProtocol(new LastSeqnoDropper(1), ProtocolStack.Position.BELOW, NAKACK2.class, NAKACK4.class);
         a.send(null, 3);
 
         Collection<Integer> list=receiver.getMsgs();
-        for(int i=0; i < 20 && list.size() < 3; i++)  {
-            System.out.println("list=" + list);
-            Util.sleep(1000);
-        }
+        Util.waitUntil(20000, 500, () -> list.size() == 3, () -> String.format("list: %s", list));
         System.out.println("list=" + list);
         assert list.size() == 3 : "list=" + list;
     }
 
-    protected static void changeNAKACK2(JChannel ... channels) {
+    protected static void changeNAKACK(JChannel ... channels) {
         for(JChannel ch: channels) {
             NAKACK2 nak=ch.getProtocolStack().findProtocol(NAKACK2.class);
-            nak.setResendLastSeqno(true);
-            nak.setResendLastSeqnoMaxTimes(1);
+            if(nak != null) {
+                nak.setResendLastSeqno(true);
+                nak.setResendLastSeqnoMaxTimes(1);
+            }
         }
     }
 
     protected static void changeDesiredGossipTime(long avg_desired_gossip, JChannel ... channels) {
         for(JChannel ch: channels) {
             STABLE stable=ch.getProtocolStack().findProtocol(STABLE.class);
-            stable.setDesiredAverageGossip(avg_desired_gossip);
+            if(stable != null)
+                stable.setDesiredAverageGossip(avg_desired_gossip);
         }
+    }
+
+    protected static boolean retransmissionAvailable(JChannel... channels) {
+        for(JChannel ch: channels) {
+            ProtocolStack stack=ch.getProtocolStack();
+            Protocol nak=stack.findProtocol(NAKACK2.class);
+            if(nak != null)
+                continue;
+            nak=stack.findProtocol(ReliableMulticast.class);
+            if(nak != null)
+                continue;
+            return false;
+        }
+        return true;
     }
 
     /** Drop {@link org.jgroups.protocols.pbcast.NakAckHeader2#HIGHEST_SEQNO} headers, needs to be inserted below NAKACK2 */
@@ -121,6 +143,12 @@ public class LastMessageDroppedTest extends ChannelTestBase {
                 count++;
                 return null;
             }
+            NakAckHeader hdr4=msg.getHeader(NAKACK4_ID);
+            if(hdr4 != null && count < num_times) {
+                count++;
+                return null;
+            }
+
             return down_prot.down(msg);
         }
     }

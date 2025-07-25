@@ -6,6 +6,7 @@ import org.jgroups.Global;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 import java.util.function.Supplier;
@@ -53,6 +54,13 @@ public class SeqnoList extends FixedSizeBitSet implements SizeStreamable, Iterab
         return this;
     }
 
+    public SeqnoList add(Collection<Long> seqnos) {
+        if(seqnos != null)
+            for(long seqno: seqnos)
+                add(seqno);
+        return this;
+    }
+
     /** Adds a seqno range */
     public SeqnoList add(long from, long to) {
         super.set(index(from), index(to));
@@ -61,21 +69,34 @@ public class SeqnoList extends FixedSizeBitSet implements SizeStreamable, Iterab
 
 
     /** Removes all seqnos > seqno */
-    public void removeHigherThan(long max_seqno) {
-        int from=index(max_seqno + 1), to=size-1;
+    public SeqnoList removeHigherThan(long seqno) {
+        int from=index(seqno + 1), to=size-1;
+        if(from < 0)
+            from=0;
         if(from <= to && from >= 0)
             super.clear(from, to);
+        return this;
+    }
+
+    /** Removes all seqnos < seqno */
+    public SeqnoList removeLowerThan(long seqno) {
+        int to=index(seqno-1);
+        if(to >= 0)
+            super.clear(0, to);
+        return this;
     }
 
 
-
-    /** Returns the last seqno, this should also be the highest seqno in the list as we're supposed to add seqnos
-     * in order
-     * @return
-     */
+    /** Returns the last seqno, this is also the highest seqno in the list as we add seqnos in order */
     public long getLast() {
         int index=previousSetBit(size - 1);
         return index == -1? -1 : seqno(index);
+    }
+
+    /** Returns the first seqno, this is also the lowest seqno in the list as we add seqnos in order */
+    public long getFirst() {
+        int index=nextSetBit(0);
+        return index < 0? -1 : seqno(index);
     }
 
     @Override
@@ -113,32 +134,45 @@ public class SeqnoList extends FixedSizeBitSet implements SizeStreamable, Iterab
     public String toString() {
         if(isEmpty())
             return "{}";
-        StringBuilder sb=new StringBuilder("(").append(cardinality()).append("): {");
+        StringBuilder sb=new StringBuilder("(").append(size()).append("): {");
 
         boolean first=true;
         int num=Util.MAX_LIST_PRINT_SIZE;
-        for(int i=nextSetBit(0); i >= 0; i=nextSetBit(i + 1)) {
-            int endOfRun=nextClearBit(i);
+        int next_set_bit=0;
+        for(;;) {
+            next_set_bit=nextSetBit(next_set_bit);
+            if(next_set_bit == -1)
+                break;
+            int endOfRun=nextClearBit(next_set_bit);
             if(first)
                 first=false;
             else
                 sb.append(", ");
 
-            if(endOfRun != -1 && endOfRun-1 != i) {
-                sb.append(seqno(i)).append('-').append(seqno(endOfRun-1));
-                i=endOfRun;
+            if(endOfRun == -1) {
+                long last=getLast(), current=seqno(next_set_bit);
+                if(last == current)
+                    sb.append(last);
+                else
+                    sb.append(current).append('-').append(last);
+                break;
             }
-            else
-                sb.append(seqno(i));
+            else {
+                if(endOfRun-1 == next_set_bit)
+                    sb.append(seqno(next_set_bit));
+                else
+                    sb.append(seqno(next_set_bit)).append('-').append(seqno(endOfRun - 1));
+            }
+            next_set_bit=endOfRun;
             if(--num <= 0) {
                 sb.append(", ... ");
                 break;
             }
         }
-
         sb.append('}');
         return sb.toString();
     }
+
 
     public Iterator<Long> iterator() {
         return new SeqnoListIterator();

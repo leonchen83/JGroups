@@ -5,14 +5,12 @@
   author: Bela Ban
 -->
 
-<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-        xmlns="urn:org:jgroups"
-        xsi:schemaLocation="urn:org:jgroups http://www.jgroups.org/schema/jgroups.xsd"
-        >
-    <UDP/>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="urn:org:jgroups"
+        xsi:schemaLocation="urn:org:jgroups http://www.jgroups.org/schema/jgroups.xsd">
+    <include file="${transport-config:udp-default.xml}" />
     <PING/>
     <MERGE3/>
-    <FD_SOCK/>
+    <FD_SOCK2/>
     <FD_ALL3/>
     <VERIFY_SUSPECT/>
     <BARRIER/>
@@ -25,5 +23,4 @@
     <!-- SEQUENCER could also be placed just under GMS, if messages and views need to be totally ordered -->
     <SEQUENCER />
     <FRAG2/>
-    <pbcast.STATE_TRANSFER />
 </config>

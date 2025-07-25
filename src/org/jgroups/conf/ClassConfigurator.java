@@ -8,14 +8,9 @@ import org.jgroups.Header;
 import org.jgroups.util.IntHashMap;
 import org.jgroups.util.Triple;
 import org.jgroups.util.Util;
-import org.w3c.dom.Document;
-import org.w3c.dom.NamedNodeMap;
-import org.w3c.dom.Node;
-import org.w3c.dom.NodeList;
 
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.FileInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.*;
 import java.util.function.Supplier;
@@ -29,12 +24,16 @@ import java.util.function.Supplier;
  * @author Bela Ban
  */
 public class ClassConfigurator {
-    public static final String MAGIC_NUMBER_FILE = "jg-magic-map.xml";
-    public static final String PROTOCOL_ID_FILE  = "jg-protocol-ids.xml";
-    private static final int   MAX_MAGIC_VALUE=100;
-    private static final int   MAX_PROT_ID_VALUE=256;
-    private static final short MIN_CUSTOM_MAGIC_NUMBER=1024;
-    private static final short MIN_CUSTOM_PROTOCOL_ID=512;
+    public static final String    MAGIC_NUMBER_FILE = "jg-magic-map.xml";
+    public static final String    PROTOCOL_ID_FILE  = "jg-protocol-ids.xml";
+    protected static final String CLASS             = "<class";
+    protected static final String ID                = "id";
+    protected static final String NAME              = "name";
+    protected static final String EXTERNAL          = "external";
+    private static final int      MAX_MAGIC_VALUE=124;
+    private static final int      MAX_PROT_ID_VALUE=256;
+    private static final short    MIN_CUSTOM_MAGIC_NUMBER=1024;
+    private static final short    MIN_CUSTOM_PROTOCOL_ID=512;
 
     // this is where we store magic numbers; contains data from jg-magic-map.xml;  key=Class, value=magic number
     private static final Map<Class<?>,Short> classMap=new IdentityHashMap<>(MAX_MAGIC_VALUE);
@@ -138,7 +137,7 @@ public class ClassConfigurator {
         if(id >= MIN_CUSTOM_MAGIC_NUMBER) {
             Object val=magicMapUser.get(id);
             if(val == null)
-                throw new ClassNotFoundException("Class for magic number " + id + " cannot be found");
+                throw new ClassNotFoundException("Class for magic number " + id + " cannot be found, map: "+ magicMapUser);
             if (val instanceof Supplier) {
                 return ((Supplier<T>) val).get();
             }
@@ -149,6 +148,9 @@ public class ClassConfigurator {
                 throw new IllegalStateException(e);
             }
         }
+        if(id < 0 || id > MAX_MAGIC_VALUE)
+            throw new IllegalArgumentException(String.format("invalid magic number %d; needs to be in range [0..%d]",
+                                                             id, MAX_MAGIC_VALUE));
         Supplier<?> supplier=magicMap[id];
         if(supplier == null)
             throw new ClassNotFoundException("Class for magic number " + id + " cannot be found");
@@ -209,9 +211,6 @@ public class ClassConfigurator {
 
 
     protected static void init() throws Exception {
-        // make sure we have a class for DocumentBuilderFactory
-        Util.loadClass("javax.xml.parsers.DocumentBuilderFactory", ClassConfigurator.class);
-
         String magic_number_file=null, protocol_id_file=null;
         try { // PropertyPermission not granted if running in an untrusted environment with JNLP
             magic_number_file=Util.getProperty(new String[]{Global.MAGIC_NUMBER_FILE, "org.jgroups.conf.magicNumberFile"},
@@ -219,7 +218,7 @@ public class ClassConfigurator {
             protocol_id_file=Util.getProperty(new String[]{Global.PROTOCOL_ID_FILE, "org.jgroups.conf.protocolIDFile"},
                                               null, null, PROTOCOL_ID_FILE);
         }
-        catch (SecurityException ex){
+        catch (SecurityException ignored) {
         }
 
         // Read jg-magic-map.xml
@@ -309,45 +308,89 @@ public class ClassConfigurator {
      * try to read the magic number configuration file as a Resource form the classpath using getResourceAsStream
      * if this fails this method tries to read the configuration file from mMagicNumberFile using a FileInputStream (not in classpath but somewhere else in the disk)
      *
-     * @return an array of ClassMap objects that where parsed from the file (if found) or an empty array if file not found or had en exception
+     * @return a list of ClassMap objects that where parsed from the file (if found) or an empty array if file not found or had en exception
      */
     protected static List<Triple<Short,String,Boolean>> readMappings(String name) throws Exception {
-        InputStream stream;
-        stream=Util.getResourceAsStream(name, ClassConfigurator.class);
+        InputStream stream=Util.getResourceAsStream(name, ClassConfigurator.class);
         // try to load the map from file even if it is not a Resource in the class path
         if(stream == null)
             stream=new FileInputStream(name);
         return parse(stream);
     }
 
-    protected static List<Triple<Short,String,Boolean>> parse(InputStream stream) throws Exception {
-        DocumentBuilderFactory factory=DocumentBuilderFactory.newInstance();
-        factory.setValidating(false); // for now
-        DocumentBuilder builder=factory.newDocumentBuilder();
-        Document document=builder.parse(stream);
-        NodeList class_list=document.getElementsByTagName("class");
-        List<Triple<Short,String,Boolean>> list=new LinkedList<>();
-        for(int i=0; i < class_list.getLength(); i++) {
-            if(class_list.item(i).getNodeType() == Node.ELEMENT_NODE) {
-                list.add(parseClassData(class_list.item(i)));
+    protected static List<Triple<Short,String,Boolean>> parse(InputStream in) throws Exception {
+        List<String> lines=parseLines(in);
+        List<Triple<Short,String,Boolean>> retval=new ArrayList<>();
+
+        for(String line: lines) {
+            short   id;
+            String  name;
+            boolean external=false;
+
+            int index=line.indexOf(ID);
+            if(index == -1)
+                notFound(ID, line);
+            index+=ID.length()+1;
+            id=Short.parseShort(parseNextString(line, index));
+
+            index=line.indexOf(NAME);
+            if(index == -1)
+                notFound(NAME, line);
+            index+=NAME.length()+1;
+            name=parseNextString(line, index);
+
+            index=line.indexOf(EXTERNAL);
+            if(index >= 0) {
+                index+=EXTERNAL.length()+1;
+                external=Boolean.parseBoolean(parseNextString(line, index));
+            }
+            Triple<Short,String,Boolean> t=new Triple<>(id, name, external);
+            retval.add(t);
+        }
+
+        return retval;
+    }
+
+    protected static void notFound(String id, String line) {
+        throw new IllegalStateException(String.format("%s not found in line %s", id, line));
+    }
+
+    protected static String parseNextString(String line, int index) {
+        int start=line.indexOf("\"", index);
+        if(index == -1)
+            notFound("\"", line.substring(index));
+        int end=line.indexOf("\"", start+1);
+        if(index == -1)
+            notFound("\"", line.substring(index+1));
+        return line.substring(start+1, end);
+    }
+
+    protected static List<String> parseLines(InputStream in) throws IOException {
+        List<String> lines=new LinkedList<>();
+        for(;;) {
+            String token=Util.readToken(in);
+            if(token == null)
+                break;
+            token=token.trim();
+            if(token.startsWith(CLASS)) {
+                String line=token + " " + readTillMatchingParens(in);
+                lines.add(line);
             }
         }
-        return list;
+        return lines;
     }
 
-    protected static Triple<Short,String,Boolean> parseClassData(Node protocol) {
-        protocol.normalize();
-        NamedNodeMap attrs=protocol.getAttributes();
-        boolean external=false;
-
-        String magicnumber=attrs.getNamedItem("id").getNodeValue();
-        String clazzname=attrs.getNamedItem("name").getNodeValue();
-
-        Node tmp=attrs.getNamedItem("external");
-        if(tmp != null)
-            external=Boolean.parseBoolean(tmp.getNodeValue());
-        return new Triple<>(Short.valueOf(magicnumber), clazzname,external);
+    protected static String readTillMatchingParens(InputStream in) throws IOException {
+        StringBuilder sb=new StringBuilder();
+        for(;;) {
+            int ch=in.read();
+            if(ch == -1)
+                break;
+            sb.append((char)ch);
+            if(ch == '>')
+                break;
+        }
+        return sb.toString();
     }
-
 
 }

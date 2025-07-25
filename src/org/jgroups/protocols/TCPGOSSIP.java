@@ -2,11 +2,11 @@
 package org.jgroups.protocols;
 
 import org.jgroups.*;
+import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.annotations.ManagedOperation;
 import org.jgroups.annotations.Property;
 import org.jgroups.conf.AttributeType;
 import org.jgroups.conf.PropertyConverters;
-import org.jgroups.stack.IpAddress;
 import org.jgroups.stack.RouterStub;
 import org.jgroups.stack.RouterStubManager;
 import org.jgroups.util.NameCache;
@@ -71,6 +71,16 @@ public class TCPGOSSIP extends Discovery implements RouterStub.MembersNotificati
         return true;
     }
 
+    @ManagedAttribute(description="The list of GossipRouters to connect to")
+    public String initialHosts() {
+        return initial_hosts.toString();
+    }
+
+    public long      sockConnTimeout()         {return sock_conn_timeout;}
+    public TCPGOSSIP sockConnTimeout(int t)    {sock_conn_timeout=t; return this;}
+    public long      reconnectInterval()       {return reconnect_interval;}
+    public TCPGOSSIP reconnectInterval(long r) {reconnect_interval=r; return this;}
+
     /* --------------------------------------------- Fields ------------------------------------------------------ */
 
     
@@ -83,8 +93,8 @@ public class TCPGOSSIP extends Discovery implements RouterStub.MembersNotificati
 
     public void init() throws Exception {
         super.init();
-        stubManager = RouterStubManager.emptyGossipClientStubManager(this).useNio(this.use_nio);
-        // we cannot use TCPGOSSIP together with TUNNEL (https://jira.jboss.org/jira/browse/JGRP-1101)
+        stubManager=RouterStubManager.emptyGossipClientStubManager(log, timer).useNio(this.use_nio);
+        // we cannot use TCPGOSSIP together with TUNNEL (https://issues.redhat.com/browse/JGRP-1101)
         TP tp=getTransport();
         if(tp instanceof TUNNEL)
             throw new IllegalStateException("TCPGOSSIP cannot be used with TUNNEL; use either TUNNEL:PING or " +
@@ -97,7 +107,8 @@ public class TCPGOSSIP extends Discovery implements RouterStub.MembersNotificati
     }
 
     public void destroy() {
-        stubManager.destroyStubs();
+        if(stubManager != null)
+            stubManager.destroyStubs();
         super.destroy();
     }
 
@@ -109,9 +120,12 @@ public class TCPGOSSIP extends Discovery implements RouterStub.MembersNotificati
             log.trace("registering " + local_addr + " under " + cluster_name + " with GossipRouter");
             stubManager.destroyStubs();
             PhysicalAddress physical_addr = (PhysicalAddress) down_prot.down(new Event(Event.GET_PHYSICAL_ADDRESS, local_addr));
-            stubManager = new RouterStubManager(this, cluster_name, local_addr, NameCache.get(local_addr), physical_addr, reconnect_interval).useNio(this.use_nio);
-            for (InetSocketAddress host : initial_hosts) {
-                RouterStub stub=stubManager.createAndRegisterStub(new IpAddress(bind_addr, 0), new IpAddress(host.getAddress(), host.getPort()));
+            stubManager=new RouterStubManager(log, timer, cluster_name, local_addr, NameCache.get(local_addr), physical_addr, reconnect_interval)
+              .useNio(this.use_nio);
+            for (InetSocketAddress host: initial_hosts) {
+                InetSocketAddress target=host.isUnresolved()? new InetSocketAddress(host.getHostString(), host.getPort())
+                  : new InetSocketAddress(host.getAddress(), host.getPort());
+                RouterStub stub=stubManager.createAndRegisterStub(new InetSocketAddress(bind_addr, 0), target);
                 stub.socketConnectionTimeout(sock_conn_timeout);
             }
             stubManager.connectStubs();
@@ -172,7 +186,7 @@ public class TCPGOSSIP extends Discovery implements RouterStub.MembersNotificati
                 continue;
             // the message needs to be DONT_BUNDLE, see explanation above
             Message msg=new BytesMessage(physical_addr).putHeader(this.id, hdr).setArray(marshal(data))
-              .setFlag(Message.Flag.INTERNAL, Message.Flag.DONT_BUNDLE, Message.Flag.OOB);
+              .setFlag(Message.Flag.DONT_BUNDLE, Message.Flag.OOB);
             log.trace("%s: sending discovery request to %s", local_addr, msg.getDest());
             down_prot.down(msg);
         }
@@ -187,14 +201,14 @@ public class TCPGOSSIP extends Discovery implements RouterStub.MembersNotificati
         InetSocketAddress isa = new InetSocketAddress(hostname, port);
         initial_hosts.add(isa);
 
-        stubManager.createAndRegisterStub(null, new IpAddress(isa.getAddress(), isa.getPort()));
+        stubManager.createAndRegisterStub(null, new InetSocketAddress(isa.getAddress(), isa.getPort()));
         stubManager.connectStubs(); // tries to connect all unconnected stubs
     }
 
     @ManagedOperation
     public boolean removeInitialHost(String hostname, int port) {
         InetSocketAddress isa = new InetSocketAddress(hostname, port);
-        stubManager.unregisterStub(new IpAddress(isa.getAddress(), isa.getPort()));
+        stubManager.unregisterStub(new InetSocketAddress(isa.getAddress(), isa.getPort()));
         return initial_hosts.remove(isa);
     }
 

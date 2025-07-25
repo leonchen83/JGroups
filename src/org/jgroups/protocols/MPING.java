@@ -42,7 +42,7 @@ public class MPING extends PING implements Runnable {
     protected int                    ip_ttl=8;
 
     @Property(description="Multicast address to be used for discovery", name="mcast_addr", systemProperty=Global.MPING_MCAST_ADDR,
-              defaultValueIPv4="230.5.6.7", defaultValueIPv6="ff0e::5:6:7")
+              defaultValueIPv4="232.5.6.7", defaultValueIPv6="ff0e::5:6:7")
     protected InetAddress            mcast_addr;
 
 
@@ -134,7 +134,7 @@ public class MPING extends PING implements Runnable {
     public void start() throws Exception {
         if(bind_addr == null)
             bind_addr=getTransport().getBindAddr();
-        if(Util.can_bind_to_mcast_addr) // https://jira.jboss.org/jira/browse/JGRP-836 - prevent cross talking on Linux
+        if(Util.can_bind_to_mcast_addr) // https://issues.redhat.com/browse/JGRP-836 - prevent cross talking on Linux
             mcast_receive_sock=Util.createMulticastSocket(getSocketFactory(), "jgroups.mping.mcast_sock", mcast_addr, mcast_port, log);
         else
             mcast_receive_sock=getSocketFactory().createMulticastSocket("jgroups.mping.mcast_sock", mcast_port);
@@ -215,6 +215,7 @@ public class MPING extends PING implements Runnable {
         MulticastSocket retval=getSocketFactory().createMulticastSocket(service_name, null); // causes *no* binding !
         if(bind_addr != null)
             setInterface(bind_addr, retval);
+        retval.setTimeToLive(ip_ttl);
         retval.setReuseAddress(false); // so we get a conflict if binding to the same port and increment the port
         retval.bind(new InetSocketAddress(bind_addr, port));
         return retval;
@@ -234,9 +235,9 @@ public class MPING extends PING implements Runnable {
 
     protected void bindToInterfaces(List<NetworkInterface> interfaces, MulticastSocket s, InetAddress mcast_addr) throws IOException {
         SocketAddress tmp_mcast_addr=new InetSocketAddress(mcast_addr, mcast_port);
-        for(Iterator it=interfaces.iterator(); it.hasNext();) {
+        for(Iterator<NetworkInterface> it=interfaces.iterator(); it.hasNext();) {
             NetworkInterface i=(NetworkInterface)it.next();
-            for(Enumeration en2=i.getInetAddresses(); en2.hasMoreElements();) {
+            for(Enumeration<InetAddress> en2=i.getInetAddresses(); en2.hasMoreElements();) {
                 InetAddress addr=(InetAddress)en2.nextElement();
                 if ((Util.getIpStackType() == StackType.IPv4 && addr instanceof Inet4Address)
                   || (Util.getIpStackType() == StackType.IPv6 && addr instanceof Inet6Address)) {

@@ -102,6 +102,11 @@ public class ASYM_ENCRYPT extends Encrypt<KeyStore.PrivateKeyEntry> {
     }
 
     public void init() throws Exception {
+        SecretKey k=createSecretKey();
+        byte[] encoded=k.getEncoded();
+        if(encoded == null)
+            throw new IllegalArgumentException(String.format("secret key %s/%s does not support encoding (FIPS enabled?)",
+                                                             k.getAlgorithm(), k.getFormat()));
         send_group_keys=false;
         initKeyPair();
         super.init();
@@ -158,7 +163,7 @@ public class ASYM_ENCRYPT extends Encrypt<KeyStore.PrivateKeyEntry> {
     }
 
     public void up(MessageBatch batch) {
-        MessageIterator it=batch.iterator();
+        Iterator<Message> it=batch.iterator();
         while(it.hasNext()) {
             Message msg=it.next();
             if(dropMulticastMessageFromNonMember(msg)) {
@@ -343,7 +348,7 @@ public class ASYM_ENCRYPT extends Encrypt<KeyStore.PrivateKeyEntry> {
             return Processing.DROP; // the encrypted msg was already sent; no need to send the un-encrypted msg
         }
         catch(Exception ex) {
-            log.warn("%s: unable to send message down: %s", local_addr, ex.getMessage());
+            log.warn("%s: unable to send message to %s: %s", msg.getDest() == null? "all" : msg.getDest(), local_addr, ex);
             return Processing.PROCESS;
         }
     }
@@ -558,7 +563,7 @@ public class ASYM_ENCRYPT extends Encrypt<KeyStore.PrivateKeyEntry> {
             cacheGroupKey(sym_version);
         }
         catch(Exception ex) {
-            log.error("%s: failed creating group key and initializing ciphers", local_addr, ex);
+            log.error("%s: failed creating group key and initializing ciphers: %s", local_addr, ex);
         }
     }
 

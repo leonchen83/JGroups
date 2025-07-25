@@ -24,7 +24,7 @@ import java.util.function.Predicate;
  * message at its offset and length. When all fragments have been received, the full message is passed up.<br/>
  * Only the first fragment carries the headers and dest and src addresses. When received, its src/dest addresses and
  * the headers will be set in the full message.<br/>
- * For details see https://issues.jboss.org/browse/JGRP-2154
+ * For details see https://issues.redhat.com/browse/JGRP-2154
  * <br/>
  * Requirement: lossless delivery (e.g. NAKACK2 or UNICAST3). No requirement on ordering. Works for both unicast and
  * multicast messages.<br/>
@@ -45,8 +45,6 @@ public class FRAG3 extends Fragmentation {
 
     protected final List<Address> members=new ArrayList<>(11);
 
-    protected MessageFactory      msg_factory;
-
     protected final AverageMinMax avg_size_down=new AverageMinMax();
     protected final AverageMinMax avg_size_up=new AverageMinMax();
 
@@ -66,11 +64,10 @@ public class FRAG3 extends Fragmentation {
             throw new Exception("frag_size=" + old_frag_size + ", new frag_size=" + frag_size + ": new frag_size is invalid");
 
         TP transport=getTransport();
-        int max_bundle_size=transport.getMaxBundleSize();
+        int max_bundle_size=transport.getBundler().getMaxSize();
         if(frag_size >= max_bundle_size)
             throw new IllegalArgumentException("frag_size (" + frag_size + ") has to be < TP.max_bundle_size (" +
                                                  max_bundle_size + ")");
-        msg_factory=transport.getMessageFactory();
         Map<String,Object> info=new HashMap<>(1);
         info.put("frag_size", frag_size);
         down_prot.down(new Event(Event.CONFIG, info));
@@ -135,13 +132,13 @@ public class FRAG3 extends Fragmentation {
     }
 
     public void up(MessageBatch batch) {
-        MessageIterator it=batch.iteratorWithFilter(HAS_FRAG_HEADER);
+        FastArray<Message>.FastIterator it=(FastArray<Message>.FastIterator)batch.iterator(HAS_FRAG_HEADER);
         while(it.hasNext()) {
             Message msg=it.next();
             Frag3Header hdr=msg.getHeader(this.id);
             Message assembled_msg=unfragment(msg, hdr);
             if(assembled_msg != null) {
-                // the reassembled msg has to be add in the right place (https://issues.jboss.org/browse/JGRP-1648),
+                // the reassembled msg has to be add in the right place (https://issues.redhat.com/browse/JGRP-1648),
                 // and canot be added to the tail of the batch !
                 assembled_msg.setSrc(batch.sender());
                 it.replace(assembled_msg);
@@ -225,7 +222,9 @@ public class FRAG3 extends Fragmentation {
                 // don't copy the buffer, only src, dest and headers. Only copy the headers for the first fragment!
                 Message frag_msg=null;
                 if(serialize)
-                    frag_msg=new BytesMessage(msg.getDest());
+                    frag_msg=new BytesMessage(msg.getDest())
+                      .setFlag(msg.getFlags(true), true)
+                      .setFlag(msg.getFlags(false), false);
                 else
                     frag_msg=msg.copy(false, i == 0);
 
@@ -349,7 +348,7 @@ public class FRAG3 extends Fragmentation {
          * @return the complete message in one buffer
          */
         protected Message assembleMessage() throws Exception {
-            return needs_deserialization? Util.messageFromBuffer(buffer, 0, buffer.length, msg_factory)
+            return needs_deserialization? Util.messageFromBuffer(buffer, 0, buffer.length)
               : msg.setArray(buffer, 0, buffer.length);
         }
 

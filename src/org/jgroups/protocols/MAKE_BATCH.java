@@ -11,10 +11,8 @@ import org.jgroups.util.AsciiString;
 import org.jgroups.util.MessageBatch;
 import org.jgroups.util.TimeScheduler;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
@@ -32,26 +30,29 @@ public class MAKE_BATCH extends Protocol {
     @Property(description="handle unicast messages")
     protected boolean unicasts=false;
 
+    @Property(description="Do not add OOB messages to a batch if true")
+    protected boolean skip_oob=true;
+
     @Property(description="Time to sleep (in ms) from the reception of the first message to sending a batch up",
       type=AttributeType.TIME)
     protected long sleep_time=100;
 
     // all maps have sender and msg list pairs
-    protected final Map<Address,List<Message>> reg_map_mcast=new HashMap<>();
-    protected final Map<Address,List<Message>> reg_map_ucast=new HashMap<>();
+    protected final Map<Address,List<Message>> reg_map_mcast=new ConcurrentHashMap<>();
+    protected final Map<Address,List<Message>> reg_map_ucast=new ConcurrentHashMap<>();
 
-    protected final Map<Address,List<Message>> oob_map_mcast=new HashMap<>();
-    protected final Map<Address,List<Message>> oob_map_ucast=new HashMap<>();
+    protected final Map<Address,List<Message>> oob_map_mcast=new ConcurrentHashMap<>();
+    protected final Map<Address,List<Message>> oob_map_ucast=new ConcurrentHashMap<>();
 
     protected TimeScheduler                     timer;
     protected AsciiString                       cluster_name;
-    protected Address                           local_addr;
     protected Future<?>                         batcher;
 
-    public MAKE_BATCH localAddress(Address a)  {local_addr=a;         return this;}
     public MAKE_BATCH multicasts(boolean flag) {this.multicasts=flag; return this;}
     public MAKE_BATCH unicasts(boolean flag)   {this.unicasts=flag;   return this;}
     public MAKE_BATCH sleepTime(long time)     {this.sleep_time=time; return this;}
+    public boolean    skipOOB()                {return skip_oob;}
+    public MAKE_BATCH skipOOB(boolean s)       {this.skip_oob=s; return this;}
 
 
     public void start() throws Exception {
@@ -68,20 +69,15 @@ public class MAKE_BATCH extends Protocol {
     public Object down(Event evt) {
         switch(evt.getType()) {
             case Event.CONNECT:
-            case Event.CONNECT_USE_FLUSH:
             case Event.CONNECT_WITH_STATE_TRANSFER:
-            case Event.CONNECT_WITH_STATE_TRANSFER_USE_FLUSH:
                 cluster_name=new AsciiString((String)evt.getArg());
-                break;
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
                 break;
         }
         return down_prot.down(evt);
     }
 
     public Object up(Message msg) {
-        if(msg.isFlagSet(Message.Flag.OOB) && msg.isFlagSet(Message.Flag.INTERNAL))
+        if(msg.isFlagSet(Message.Flag.OOB) && skip_oob)
             return up_prot.up(msg);
 
         if((msg.getDest() == null && multicasts) || (msg.getDest() != null && unicasts)) {
@@ -92,15 +88,16 @@ public class MAKE_BATCH extends Protocol {
     }
 
     public void up(MessageBatch batch) {
-        for(Message msg: batch) {
-            if(msg.isFlagSet(Message.Flag.OOB) && msg.isFlagSet(Message.Flag.INTERNAL)) {
+        for(Iterator<Message> it=batch.iterator(); it.hasNext();) {
+            Message msg=it.next();
+            if(msg.isFlagSet(Message.Flag.OOB) && skip_oob) {
                 up_prot.up(msg);
-                batch.remove(msg);
+                it.remove();
                 continue;
             }
             if((msg.dest() == null && multicasts) || (msg.dest() != null && unicasts)) {
                 queue(msg);
-                batch.remove(msg);
+                it.remove();
             }
         }
         if(!batch.isEmpty())
@@ -119,18 +116,20 @@ public class MAKE_BATCH extends Protocol {
         list.add(msg);
     }
 
-    public synchronized void startBatcher() {
+    public synchronized MAKE_BATCH startBatcher() {
         if(timer == null)
             timer=getTransport().getTimer();
         if(batcher == null || batcher.isDone())
             batcher=timer.scheduleWithFixedDelay(new Batcher(), sleep_time, sleep_time, TimeUnit.MILLISECONDS);
+        return this;
     }
 
-    protected synchronized void stopBatcher() {
+    protected synchronized MAKE_BATCH stopBatcher() {
         if(batcher != null) {
             batcher.cancel(true);
             batcher=null;
         }
+        return this;
     }
 
     protected class Batcher implements Runnable {

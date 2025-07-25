@@ -8,6 +8,7 @@ import org.jgroups.annotations.Property;
 import org.jgroups.conf.AttributeType;
 import org.jgroups.stack.DiagnosticsHandler;
 import org.jgroups.stack.Protocol;
+import org.jgroups.util.MessageBatch;
 import org.jgroups.util.Util;
 
 import java.io.*;
@@ -81,6 +82,10 @@ public class SOS extends Protocol {
         task.cancel(true);
     }
 
+    public void up(MessageBatch batch) {
+        up_prot.up(batch);
+    }
+
     @ManagedOperation(description="Dumps attributes / invokes operations from given protocols")
     public String exec() {
         StringTokenizer t=new StringTokenizer(cmd);
@@ -102,7 +107,7 @@ public class SOS extends Protocol {
     protected String getMetadata() {
         TP tp=stack.getTransport();
         return String.format("\nDate: %s, member: %s (%s), version: %s\nview: %s\n",
-                             new Date(), tp.getLocalAddress(), tp.getPhysicalAddress(),
+              Util.utcNow(), tp.getAddress(), tp.getPhysicalAddress(),
                              Version.printVersion(), tp.view());
     }
 
@@ -110,8 +115,6 @@ public class SOS extends Protocol {
         InputStream input=Util.getResourceAsStream(name, getClass());
         if(input == null)
             input=new FileInputStream(name);
-        if(input == null)
-            throw new IllegalArgumentException(String.format("config file %s not found", name));
         return input;
     }
 
@@ -123,13 +126,13 @@ public class SOS extends Protocol {
                 out.write(dump.getBytes());
             }
             catch(Exception e) {
-                log.error("%s: failed dumping SOS information to %s: %s", getTransport().getLocalAddress(), filename, e);
+                log.error("%s: failed dumping SOS information to %s: %s", getTransport().getAddress(), filename, e);
             }
         }
 
         public String toString() {
             return String.format("%s: %s (%s)", SOS.class.getSimpleName(), getClass().getSimpleName(),
-                                 getTransport().getLocalAddress());
+                                 getTransport().getAddress());
         }
     }
 }

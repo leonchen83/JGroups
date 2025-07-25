@@ -15,12 +15,12 @@ import java.util.List;
 import java.util.function.Consumer;
 
 /**
- * Tests use cases for {@link SYM_ENCRYPT} described in https://issues.jboss.org/browse/JGRP-2021.
+ * Tests use cases for {@link SYM_ENCRYPT} described in https://issues.redhat.com/browse/JGRP-2021.
  * Make sure you create the keystore before running this test (ant make-keystore).
  * @author Bela Ban
  * @since  4.0
  */
-@Test(groups={Global.FUNCTIONAL,Global.ENCRYPT},singleThreaded=true)
+@Test(groups=Global.ENCRYPT,singleThreaded=true)
 public class SYM_ENCRYPT_Test extends EncryptTest {
     protected static final String DEF_PWD="changeit";
 

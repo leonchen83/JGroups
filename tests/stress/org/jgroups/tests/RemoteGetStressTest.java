@@ -25,7 +25,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Tests https://issues.jboss.org/browse/JGRP-1675
+ * Tests https://issues.redhat.com/browse/JGRP-1675
  * @author Bela Ban
  * @since  3.5
  */
@@ -98,8 +98,10 @@ public class RemoteGetStressTest {
     }
 
     protected static JChannel createChannel(String name) throws Exception {
+        SHARED_LOOPBACK sl=new SHARED_LOOPBACK();
+        sl.getThreadPool().setMinThreads(1).setMaxThreads(5);
         Protocol[] protocols={
-          new SHARED_LOOPBACK().setThreadPoolMinThreads(1).setThreadPoolMaxThreads(5),
+          sl,
           new SHARED_LOOPBACK_PING(),
           new NAKACK2(),
           new UNICAST3(),

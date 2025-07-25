@@ -4,6 +4,7 @@ import org.jgroups.Address;
 import org.jgroups.EmptyMessage;
 import org.jgroups.Global;
 import org.jgroups.Message;
+import org.jgroups.annotations.Experimental;
 import org.jgroups.util.*;
 
 import java.util.Objects;
@@ -15,9 +16,11 @@ import java.util.concurrent.locks.LockSupport;
 
 /**
  * Lockless bundler using a reader thread which is unparked by (exactly one) writer thread.
+ * TODO: needs to be changed to support loopback (https://issues.redhat.com/browse/JGRP-2831)
  * @author Bela Ban
  * @since 4.0
  */
+@Experimental
 public class RingBufferBundlerLockless2 extends BaseBundler {
     protected Message[]             buf;
     protected final AtomicInteger   read_index; // shared by reader and writers (reader only writes it)
@@ -71,6 +74,9 @@ public class RingBufferBundlerLockless2 extends BaseBundler {
         bundler_thread.stop();
     }
 
+    public void renameThread() {
+        transport.getThreadFactory().renameThread(THREAD_NAME, bundler_thread.getThread());
+    }
 
     public void send(Message msg) throws Exception {
         if(msg == null)
@@ -97,7 +103,7 @@ public class RingBufferBundlerLockless2 extends BaseBundler {
 
     protected void unparkIfNeeded(int size) {
         long acc_bytes=size > 0? accumulated_bytes.addAndGet(size) : accumulated_bytes.get();
-        boolean size_exceeded=acc_bytes >= transport.getMaxBundleSize() && accumulated_bytes.compareAndSet(acc_bytes, 0);
+        boolean size_exceeded=acc_bytes >= max_size && accumulated_bytes.compareAndSet(acc_bytes, 0);
         boolean no_other_threads=num_threads.decrementAndGet() == 0;
 
         boolean unpark=size_exceeded || no_other_threads;
@@ -156,7 +162,6 @@ public class RingBufferBundlerLockless2 extends BaseBundler {
 
     /** Read and send messages in range [read-index+1 .. write_index-1] */
     protected int sendBundledMessages(final Message[] buf, final int read_index, final int write_index) {
-        int       max_bundle_size=transport.getMaxBundleSize();
         byte[]    cluster_name=transport.cluster_name.chars();
         int       sent_msgs=0;
 
@@ -175,7 +180,7 @@ public class RingBufferBundlerLockless2 extends BaseBundler {
                 // remember the position at which the number of messages (an int) was written, so we can later set the
                 // correct value (when we know the correct number of messages)
                 int size_pos=output.position() - Global.INT_SIZE;
-                int num_msgs=marshalMessagesToSameDestination(dest, buf, i, write_index, max_bundle_size);
+                int num_msgs=marshalMessagesToSameDestination(dest, buf, i, write_index, max_size);
                 sent_msgs+=num_msgs;
                 if(num_msgs > 1) {
                     int current_pos=output.position();
@@ -184,11 +189,10 @@ public class RingBufferBundlerLockless2 extends BaseBundler {
                     output.position(current_pos);
                 }
                 transport.doSend(output.buffer(), 0, output.position(), dest);
-                if(transport.statsEnabled())
-                    transport.incrBatchesSent(num_msgs);
+                transport.getMessageStats().incrNumBatchesSent(num_msgs);
             }
             catch(Exception ex) {
-                log.error("failed to send message(s)", ex);
+                log.trace("failed to send message(s)", ex);
             }
         }
         return sent_msgs;
@@ -205,13 +209,14 @@ public class RingBufferBundlerLockless2 extends BaseBundler {
         for(int i=start_index; i != end_index; i=increment(i)) {
             Message msg=buf[i];
             if(msg != null && msg != NULL_MSG && Objects.equals(dest, msg.getDest())) {
-                int msg_size=msg.size();
+                int msg_size=msg.sizeNoAddrs(msg.getSrc()) + Global.SHORT_SIZE;
                 if(bytes + msg_size > max_bundle_size)
                     break;
                 bytes+=msg_size;
                 num_msgs++;
                 buf[i]=NULL_MSG;
-                msg.writeToNoAddrs(msg.getSrc(), output, transport.getId());
+                output.writeShort(msg.getType());
+                msg.writeToNoAddrs(msg.getSrc(), output);
             }
         }
         return num_msgs;

@@ -1,13 +1,14 @@
 package org.jgroups.demos;
 
 import org.jgroups.Address;
-import org.jgroups.Global;
-import org.jgroups.blocks.cs.*;
+import org.jgroups.blocks.cs.BaseServer;
+import org.jgroups.blocks.cs.NioServer;
+import org.jgroups.blocks.cs.Receiver;
+import org.jgroups.blocks.cs.TcpServer;
 import org.jgroups.jmx.JmxConfigurator;
 import org.jgroups.logging.Log;
 import org.jgroups.logging.LogFactory;
 import org.jgroups.stack.IpAddress;
-import org.jgroups.util.Bits;
 import org.jgroups.util.DefaultSocketFactory;
 import org.jgroups.util.DefaultThreadFactory;
 import org.jgroups.util.Util;
@@ -30,9 +31,11 @@ public class PubServer implements Receiver {
     protected void start(InetAddress bind_addr, int port, boolean nio, int recv_buf_size) throws Exception {
         server=nio?
           new NioServer(new DefaultThreadFactory("pubsrv", false), new DefaultSocketFactory(),
-                        bind_addr, port, port+50, null, 0, recv_buf_size)
+                        bind_addr, port, port+50, null, 0, recv_buf_size,
+                        "jgroups.nio.pubserver")
           : new TcpServer(new DefaultThreadFactory("pubsrv", false), new DefaultSocketFactory(),
-                          bind_addr, port, port+50, null, 0, recv_buf_size);
+                          bind_addr, port, port+50, null, 0, recv_buf_size,
+                          "jgroups.tcp.pubserver");
         server.receiver(this);
         server.start();
         JmxConfigurator.register(server, Util.getMBeanServer(), "pub:name=pub-server");
@@ -61,11 +64,9 @@ public class PubServer implements Receiver {
         }
     }
 
-    public void receive(Address sender, DataInput in) throws Exception {
-        int len=in.readInt();
-        byte[] buf=new byte[len + Global.INT_SIZE];
-        Bits.writeInt(len, buf, 0);
-        in.readFully(buf, Global.INT_SIZE, len);
+    public void receive(Address sender, DataInput in, int length) throws Exception {
+        byte[] buf=new byte[length];
+        in.readFully(buf, 0, length);
         server.send(null, buf, 0, buf.length);
     }
 

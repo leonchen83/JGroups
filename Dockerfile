@@ -8,6 +8,17 @@
 # Build: docker build -f Dockerfile -t belaban/jgrp .
 # Push: docker push belaban/jgrp
 
+# Multi-arch images with podman:
+# First, initialise the manifest
+# (optionally) podman manifest remove belaban/jgrp
+# podman manifest create belaban/jgrp
+
+# Build the image attaching them to the manifest
+# podman build --platform linux/amd64,linux/arm64  --manifest belaban/jgrp  .
+
+# Finally publish the manifest
+# podman manifest push belaban/jgrp
+
 
 FROM adoptopenjdk/openjdk11:jre as build-stage
 RUN apt-get update ; apt-get install -y git ant net-tools netcat iputils-ping
@@ -26,7 +37,6 @@ WORKDIR /opt/jgroups
 
 COPY --from=build-stage /bin/ping /bin/netstat /bin/nc /bin/
 COPY --from=build-stage /sbin/ifconfig /sbin/
-COPY README $JGROUPS_HOME/
 COPY ./classes $JGROUPS_HOME/classes
 COPY ./lib $JGROUPS_HOME/lib
 COPY ./bin $JGROUPS_HOME/bin
@@ -37,6 +47,6 @@ RUN chown -R jgroups.jgroups $HOME/*
 USER jgroups
 
 RUN chmod u+x $HOME/*
-CMD clear && cat $HOME/JGroups/README && /bin/bash
+CMD /bin/bash
 
 

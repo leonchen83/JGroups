@@ -22,12 +22,12 @@ import java.util.stream.Stream;
 /**
  * Tests graceful leaves of multiple members, especially coord and next-in-line.
  * Nodes are leaving gracefully so no merging is expected.<br/>
- * Reproducer for https://issues.jboss.org/browse/JGRP-2293.
+ * Reproducer for https://issues.redhat.com/browse/JGRP-2293.
  *
  * @author Radoslav Husar
  * @author Bela Ban
  */
-@Test(groups={Global.FUNCTIONAL,Global.ENCRYPT},singleThreaded=true)
+@Test(groups=Global.ENCRYPT,singleThreaded=true)
 public abstract class BaseLeaveTest {
     protected final String      cluster_name=getClass().getSimpleName();
     protected static final int  NUM=10;
@@ -280,7 +280,7 @@ public abstract class BaseLeaveTest {
                 System.out.printf("-- sorted requests from %s to: %s\n", requests, l);
                 requests.clear();
                 requests.addAll(l);
-                process(requests);
+                process();
             }
             return false;
         }

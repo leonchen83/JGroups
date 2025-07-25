@@ -75,7 +75,6 @@ public class NioMessage extends BaseMessage {
     public boolean           isDirect()                 {return buf != null && buf.isDirect();}
     public int               getOffset()                {return hasArray()? buf.arrayOffset()+buf.position() : 0;}
     public int               getLength()                {return buf != null? buf.remaining() : 0;}
-    public <T> T             getPayload()               {return (T)buf;}
 
 
     public byte[] getArray() {
@@ -122,8 +121,10 @@ public class NioMessage extends BaseMessage {
      * @return The object
      */
     public <T extends Object> T getObject(ClassLoader loader) {
+        if(buf == null)
+            return null;
         try {
-            return buf != null? Util.objectFromByteBuffer(buf, loader) : null;
+            return isFlagSet(Flag.SERIALIZED)? Util.objectFromByteBuffer(buf, loader) : (T)getArray();
         }
         catch(Exception ex) {
             throw new IllegalArgumentException(ex);
@@ -136,6 +137,11 @@ public class NioMessage extends BaseMessage {
      * Externalizable or Streamable, or be a basic type (e.g. Integer, Short etc)).
      */
     public NioMessage setObject(Object obj) {
+        clearFlag(Flag.SERIALIZED);
+        if(obj == null) {
+            buf=null;
+            return this;
+        }
         if(obj instanceof byte[])
             return setArray((byte[])obj, 0, ((byte[])obj).length);
         if(obj instanceof ByteArray)
@@ -144,6 +150,7 @@ public class NioMessage extends BaseMessage {
             return setBuf((ByteBuffer)obj);
         try {
             ByteArray tmp=Util.objectToBuffer(obj);
+            setFlag(Flag.SERIALIZED);
             return setArray(tmp);
         }
         catch(Exception ex) {
@@ -172,8 +179,6 @@ public class NioMessage extends BaseMessage {
 
     /* ----------------------------------- Interface Streamable  ------------------------------- */
 
-    public int size() {return super.size() +sizeOfPayload();}
-
     public String toString() {
         return String.format("%s %s", super.toString(), use_direct_memory_for_allocations? "(direct)" : "");
     }
@@ -184,7 +189,7 @@ public class NioMessage extends BaseMessage {
         return copy;
     }
 
-    protected int sizeOfPayload() {
+    @Override protected int payloadSize() {
         return Global.INT_SIZE + getLength() + Global.BYTE_SIZE; // for use_direct_memory_for_allocations
     }
 
@@ -192,7 +197,7 @@ public class NioMessage extends BaseMessage {
         out.writeBoolean(use_direct_memory_for_allocations);
         out.writeInt(buf != null? getLength() : -1);
         if(buf != null) {
-            if(!isDirect()) {
+            if(buf.hasArray()) {
                 byte[] buffer=buf.array();
                 int offset=buf.arrayOffset() + buf.position(), length=buf.remaining();
                 out.write(buffer, offset, length);

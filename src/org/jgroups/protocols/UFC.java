@@ -70,6 +70,11 @@ public class UFC extends FlowControl {
         sent.values().forEach(cred -> cred.increment(max_credits, max_credits));
     }
 
+    public long getSenderCreditsFor(Address mbr) {
+        Credit credits=sent.get(mbr);
+        return credits == null? 0 : credits.get();
+    }
+
     @ManagedAttribute(description="Number of times flow control blocks sender",type=AttributeType.SCALAR)
     public int getNumberOfBlockings() {
         int retval=0;
@@ -97,7 +102,7 @@ public class UFC extends FlowControl {
     }
 
     @Override
-    protected Object handleDownMessage(final Message msg) {
+    protected Object handleDownMessage(final Message msg, int length) {
         Address dest=msg.getDest();
         if(dest == null) { // 2nd line of defense, not really needed
             log.error("%s doesn't handle multicast messages; passing message down", getClass().getSimpleName());
@@ -108,12 +113,9 @@ public class UFC extends FlowControl {
         if(cred == null)
             return down_prot.down(msg);
 
-        int length=msg.getLength();
-        long block_time=max_block_times != null? getMaxBlockTime(length) : max_block_time;
-        
         while(running && sent.containsKey(dest)) {
-            boolean rc=cred.decrementIfEnoughCredits(msg, length, block_time);
-            if(rc || !running || max_block_times != null)
+            boolean rc=cred.decrementIfEnoughCredits(msg, length, max_block_time);
+            if(rc || !running)
                 break;
 
             if(cred.needToSendCreditRequest(max_block_time))

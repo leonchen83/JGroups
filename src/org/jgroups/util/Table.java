@@ -3,32 +3,29 @@ package org.jgroups.util;
 import org.jgroups.annotations.GuardedBy;
 
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+
 /**
- * A store for elements (typically messages) to be retransmitted or delivered. Used on sender and receiver side,
- * as a replacement for HashMap. Table should use less memory than HashMap, as HashMap.Entry has 4 fields,
- * plus arrays for storage.
- * <p/>
- * Table maintains a matrix (an array of arrays) of elements, which are stored in the matrix by mapping
- * their seqno to an index. E.g. when we have 10 rows of 1000 elements each, and first_seqno is 3000, then an element
- * with seqno=5600, will be stored in the 3rd row, at index 600.
- * <p/>
- * Rows are removed when all elements in that row have been received.
- * <p/>
- * Table started out as a copy of RetransmitTable, but is synchronized and maintains its own low, hd and hr
- * pointers, so it can be used as a replacement for NakReceiverWindow. The idea is to put messages into Table,
- * deliver them in order of seqnos, and periodically scan over all tables in NAKACK2 to do retransmission.
- * <p/>
+ * A store for elements (typically messages) to be retransmitted or delivered. Used on sender and receiver side.
+ * <br/>
+ * Table maintains a matrix (an array of arrays) of elements, which are stored by mapping their seqno to an index.
+ * E.g. when we have 10 rows of 1000 elements each, and first_seqno is 3000, then an element with seqno=5600, will
+ * be stored in the 3rd row, at index 600.
+ * <br/>
+ * Rows are removed when all elements in that row have been delivered.
+ * <br/>
  * @author Bela Ban
  * @version 3.1
  */
@@ -54,17 +51,17 @@ public class Table<T> implements Iterable<T> {
     protected long                 hd;
 
     /** Time (in nanoseconds) after which a compaction should take place. 0 disables compaction */
-    protected long                 max_compaction_time=TimeUnit.NANOSECONDS.convert(DEFAULT_MAX_COMPACTION_TIME, TimeUnit.MILLISECONDS);
+    protected long                 max_compaction_time=NANOSECONDS.convert(DEFAULT_MAX_COMPACTION_TIME, MILLISECONDS);
 
     /** The time when the last compaction took place. If a {@link #compact()} takes place and sees that the
      * last compaction is more than max_compaction_time nanoseconds ago, a compaction will take place */
-    protected long                 last_compaction_timestamp=0;
+    protected long                 last_compaction_timestamp;
 
     protected final Lock           lock=new ReentrantLock();
 
     protected final AtomicInteger  adders=new AtomicInteger(0);
 
-    protected int                  num_compactions=0, num_resizes=0, num_moves=0, num_purges=0;
+    protected int                  num_compactions, num_resizes, num_moves, num_purges;
     
     protected static final long    DEFAULT_MAX_COMPACTION_TIME=10000; // in milliseconds
 
@@ -108,14 +105,14 @@ public class Table<T> implements Iterable<T> {
      * @param num_rows the number of rows in the matrix
      * @param elements_per_row the number of elements per row
      * @param offset the seqno before the first seqno to be inserted. E.g. if 0 then the first seqno will be 1
-     * @param resize_factor teh factor with which to increase the number of rows
+     * @param resize_factor the factor with which to increase the number of rows
      * @param max_compaction_time the max time in milliseconds after we attempt a compaction
      */
     public Table(int num_rows, int elements_per_row, long offset, double resize_factor, long max_compaction_time) {
         this.num_rows=num_rows;
         this.elements_per_row=Util.getNextHigherPowerOfTwo(elements_per_row);
         this.resize_factor=resize_factor;
-        this.max_compaction_time=TimeUnit.NANOSECONDS.convert(max_compaction_time, TimeUnit.MILLISECONDS);
+        this.max_compaction_time=NANOSECONDS.convert(max_compaction_time, MILLISECONDS);
         this.offset=this.low=this.hr=this.hd=offset;
         matrix=(T[][])new Object[num_rows][];
         if(resize_factor <= 1)
@@ -143,7 +140,7 @@ public class Table<T> implements Iterable<T> {
     public long getHighestReceived()     {return hr;}
     public long getMaxCompactionTime()   {return max_compaction_time;}
     public Table<T> setMaxCompactionTime(long max_compaction_time) {
-        this.max_compaction_time=TimeUnit.NANOSECONDS.convert(max_compaction_time, TimeUnit.MILLISECONDS);
+        this.max_compaction_time=NANOSECONDS.convert(max_compaction_time, MILLISECONDS);
         return this;
     }
     public int  getNumRows()             {return matrix.length;}
@@ -277,6 +274,51 @@ public class Table<T> implements Iterable<T> {
                     it.remove();
             }
             return added;
+        }
+        finally {
+            lock.unlock();
+        }
+    }
+
+
+    public boolean add(MessageBatch batch, Function<T,Long> seqno_getter) {
+        return add(batch, seqno_getter, false, null);
+    }
+
+    /**
+     * Adds all messages from the given batch to the table
+     * @param batch The batch
+     * @param seqno_getter A function to return the sequence number (seqno) of a given Message. Must be non-null. If
+     *                     the function return -1, then the message won't be added
+     * @param remove_from_batch If true, the message is removed <pre>regardless</pre> of whether it was added
+     *                          successfully or not
+     * @param const_value If non-null, this value should be used rather than the values of the list tuples
+     * @return True if at least 1 element was added successfully, false otherwise.
+     */
+    public boolean add(MessageBatch batch, Function<T,Long> seqno_getter, boolean remove_from_batch, T const_value) {
+        if(batch == null || batch.isEmpty())
+            return false;
+        Objects.requireNonNull(seqno_getter);
+        boolean retval=false;
+        // find the highest seqno (unfortunately, the list is not ordered by seqno)
+        long highest_seqno=findHighestSeqno(batch, seqno_getter);
+        lock.lock();
+        try {
+            if(highest_seqno != -1 && computeRow(highest_seqno) >= matrix.length)
+                resize(highest_seqno);
+
+            for(Iterator<?> it=batch.iterator(); it.hasNext();) {
+                T msg=(T)it.next();
+                long seqno=seqno_getter.apply(msg);
+                if(seqno < 0)
+                    continue;
+                T element=const_value != null? const_value : msg;
+                boolean added=_add(seqno, element, false, null);
+                retval=retval || added;
+                if(!added || remove_from_batch)
+                    it.remove();
+            }
+            return retval;
         }
         finally {
             lock.unlock();
@@ -496,7 +538,7 @@ public class Table<T> implements Iterable<T> {
 
         for(int i=0; i < distance; i++) {
             T element=current_row == null? null : current_row[column];
-            if(!visitor.visit(from, element, row, column))
+            if(visitor != null && !visitor.visit(from, element, row, column))
                 break;
 
             from++;
@@ -543,7 +585,7 @@ public class Table<T> implements Iterable<T> {
             size++;
             if(seqno - hr > 0)
                 hr=seqno;
-            if(remove_filter != null && hd +1 == seqno) {
+            if(remove_filter != null && seqno-hd > 0) {
                 forEach(hd + 1, hr,
                         (seq, msg, r, c) -> {
                             if(msg == null || !remove_filter.test(msg))
@@ -564,6 +606,19 @@ public class Table<T> implements Iterable<T> {
         long seqno=-1;
         for(LongTuple<T> tuple: list) {
             long val=tuple.getVal1();
+            if(val - seqno > 0)
+                seqno=val;
+        }
+        return seqno;
+    }
+
+    protected static <T> long findHighestSeqno(MessageBatch batch, Function<T,Long> seqno_getter) {
+        long seqno=-1;
+        for(Iterator<?> it=batch.iterator(); it.hasNext();) {
+            T msg=(T)it.next();
+            long val=seqno_getter.apply(msg);
+            if(val < 0)
+                continue;
             if(val - seqno > 0)
                 seqno=val;
         }
@@ -591,7 +646,7 @@ public class Table<T> implements Iterable<T> {
             move(num_rows_to_purge);
         }
 
-        offset+=(num_rows_to_purge * elements_per_row);
+        offset+=((long)num_rows_to_purge * elements_per_row);
     }
 
 
@@ -627,7 +682,7 @@ public class Table<T> implements Iterable<T> {
             T[][] new_matrix=(T[][])new Object[new_size][];
             System.arraycopy(matrix, from, new_matrix, 0, range);
             matrix=new_matrix;
-            offset+=from * elements_per_row;
+            offset+=(long)from * elements_per_row;
             num_compactions++;
         }
     }

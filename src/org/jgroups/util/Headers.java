@@ -1,16 +1,18 @@
 package org.jgroups.util;
 
-import org.jgroups.BaseMessage;
 import org.jgroups.Global;
 import org.jgroups.Header;
 import org.jgroups.conf.ClassConfigurator;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Helper class providing functions to manipulate the {@link BaseMessage#headers} array. The headers are stored
- * in the array as follows:
+ * Helper class providing functions to manipulate the headers array in {@link org.jgroups.BaseMessage}.
+ * The headers are stored in the array as follows:
  * <pre>
  * Headers:  hdr-1 | hdr-2 | hdr-3 | ... | hdr-n |
  * </pre>
@@ -22,15 +24,21 @@ import java.util.Map;
  * putting a new key/header are operations with O(n) cost, so this implementation is <em>not</em> recommended for
  * a large number of elements.
  * <br/>
- * This class is synchronized for writes (put(), resize()), but not for reads (size(), get())
+ * This class is unsynchronized.
  * @author Bela Ban
  */
 public final class Headers {
     private static final int RESIZE_INCR=3;
+    private static String BEGIN_DELIM=null, END_DELIM=null;
 
 	private Headers() {
 		throw new InstantiationError( "Must not instantiate this class" );
 	}
+
+    public static void delimiters(String begin, String end) {
+        BEGIN_DELIM=begin;
+        END_DELIM=end;
+    }
 
     /**
      * Returns the header associated with an ID
@@ -69,7 +77,6 @@ public final class Headers {
         return null;
     }
 
-
     public static Map<Short,Header> getHeaders(final Header[] hdrs) {
         if(hdrs == null)
             return new HashMap<>();
@@ -95,13 +102,17 @@ public final class Headers {
                 first=false;
             else
                 sb.append(", ");
-            Class clazz=ClassConfigurator.getProtocol(id);
+            Class<?> clazz=ClassConfigurator.getProtocol(id);
             String name=clazz != null? clazz.getSimpleName() : Short.toString(id);
-            sb.append(name).append(": ").append(hdr);
+            sb.append(name).append(": ");
+            if(BEGIN_DELIM != null)
+                sb.append(BEGIN_DELIM);
+            sb.append(hdr);
+            if(END_DELIM != null)
+                sb.append(END_DELIM);
         }
         return sb.toString();
     }
-
 
     /**
      * Adds hdr at the next available slot. If none is available, the headers array passed in will be copied and the copy
@@ -109,7 +120,7 @@ public final class Headers {
      * @param headers The headers array
      * @param id The protocol ID of the header
      * @param hdr The header
-     * @param replace_if_present Whether or not to overwrite an existing header
+     * @param replace_if_present Whether to overwrite an existing header
      * @return A new copy of headers if the array needed to be expanded, or null otherwise
      */
     public static Header[] putHeader(final Header[] headers, short id, Header hdr, boolean replace_if_present) {
@@ -136,9 +147,34 @@ public final class Headers {
         throw new IllegalStateException("unable to add element " + id + ", index=" + i); // we should never come here
     }
 
-    /**
-     * Increases the capacity of the array and copies the contents of the old into the new array
-     */
+    public static void writeHeaders(Header[] hdrs, DataOutput out) throws IOException {
+        int size=Headers.size(hdrs);
+        out.writeShort(size);
+        if(size > 0) {
+            for(Header hdr: hdrs) {
+                if(hdr == null)
+                    break;
+                short id=hdr.getProtId();
+                out.writeShort(id);
+                writeHeader(hdr, out);
+            }
+        }
+    }
+
+    public static Header[] readHeaders(DataInput in) throws IOException, ClassNotFoundException {
+        int len=in.readShort();
+        if(len == 0)
+            return new Header[Util.DEFAULT_HEADERS];
+        Header[] headers=new Header[len];
+        for(int i=0; i < len; i++) {
+            short id=in.readShort();
+            Header hdr=readHeader(in).setProtId(id);
+            headers[i]=hdr;
+        }
+        return headers;
+    }
+
+    /** Increases the capacity of the array and copies the contents of the old into the new array */
     public static Header[] resize(final Header[] headers) {
         int new_capacity=headers.length + RESIZE_INCR;
         Header[] new_hdrs=new Header[new_capacity];
@@ -179,7 +215,7 @@ public final class Headers {
         return retval;
     }
 
-    public static int size(Header[] hdrs, short... excluded_ids) {
+    /*public static int size(Header[] hdrs, short... excluded_ids) {
         int retval=0;
         if(hdrs == null)
             return retval;
@@ -190,7 +226,19 @@ public final class Headers {
                 retval++;
         }
         return retval;
+    }*/
+
+    private static void writeHeader(Header hdr, DataOutput out) throws IOException {
+        short magic_number=hdr.getMagicId();
+        out.writeShort(magic_number);
+        hdr.writeTo(out);
     }
 
+    private static Header readHeader(DataInput in) throws IOException, ClassNotFoundException {
+        short magic_number=in.readShort();
+        Header hdr=ClassConfigurator.create(magic_number);
+        hdr.readFrom(in);
+        return hdr;
+    }
 
 }

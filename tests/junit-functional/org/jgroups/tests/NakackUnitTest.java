@@ -8,17 +8,22 @@ import org.jgroups.protocols.pbcast.STABLE;
 import org.jgroups.stack.Protocol;
 import org.jgroups.util.Util;
 import org.testng.annotations.AfterMethod;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static org.jgroups.Message.TransientFlag.DONT_LOOPBACK;
 
 /**
  * Tests NAKACK2 functionality, especially flag {@link Message.TransientFlag#DONT_LOOPBACK}.
  * @author Bela Ban
  * @since  3.5
  */
-@Test(groups=Global.FUNCTIONAL)
+@Test(groups=Global.FUNCTIONAL,singleThreaded=true,dataProvider="create")
 public class NakackUnitTest {
     protected JChannel   a, b;
     protected MyReceiver ra, rb;
@@ -26,16 +31,51 @@ public class NakackUnitTest {
 
     @AfterMethod  protected void tearDown() throws Exception {Util.close(b, a);}
 
+    @DataProvider
+    static Object[][] create() {
+        return new Object[][]{
+          {NAKACK2.class},
+          {NAKACK3.class},
+          {NAKACK4.class}
+        };
+    }
+
+
     // @Test(invocationCount=10)
-    public void testMessagesToAllWithDontLoopback() throws Exception {
-        a=create("A", false); b=create("B", false);
+    public void testMessagesToAllWithDontLoopback(Class<Protocol> cl) throws Exception {
+        a=create(cl, "A", false); b=create(cl, "B", false);
         createReceivers();
         _testMessagesToAllWithDontLoopback();
     }
 
+    /**
+     * Tests NAKACK4: when more messages than send-buf.capacity() are sent; senders block when DONT_LOOPBACK is
+     * set, probably because the local member doesn't ACK them.
+     */
+    public void testMessagesToAllWithDontLoopbackDontBlock(Class<Protocol> cl) throws Exception {
+        if(!cl.equals(NAKACK4.class))
+            return;
+        int NUM_MSGS=200;
+        a=createNAKACK4("A", 128);
+        b=createNAKACK4("B", 128);
+        createReceivers();
+        connect();
+        for(int i=1; i <= NUM_MSGS; i++) {
+            Message msg=new ObjectMessage(null, i).setFlag(DONT_LOOPBACK);
+            a.send(msg);
+        }
+        // A should receive 0 messages
+        // B should receive 200 messages (from A)
+        Util.waitUntil(1000, 500, () -> ra.size() == 0 && rb.size() == NUM_MSGS);
+        System.out.printf("A: %d, B: %d\n", ra.size(), rb.size());
+        assert ra.size() == 0 && rb.size() == NUM_MSGS;
+        List<Integer> expected=IntStream.rangeClosed(1, NUM_MSGS).boxed().collect(Collectors.toList());
+        assert expected.equals(rb.list);
+    }
+
     // @Test(invocationCount=10)
-    public void testMessagesToOtherBatching() throws Exception {
-        a=create("A", true); b=create("B", true);
+    public void testMessagesToOtherBatching(Class<Protocol> cl) throws Exception {
+        a=create(cl, "A", true); b=create(cl, "B", true);
         createReceivers();
         _testMessagesToAllWithDontLoopback();
     }
@@ -46,14 +86,14 @@ public class NakackUnitTest {
           msg(),
           msg().setFlag(Message.Flag.OOB),
           msg().setFlag(Message.Flag.OOB),
-          msg().setFlag(Message.Flag.OOB).setFlag(Message.TransientFlag.DONT_LOOPBACK),
-          msg().setFlag(Message.TransientFlag.DONT_LOOPBACK),
+          msg().setFlag(Message.Flag.OOB).setFlag(DONT_LOOPBACK),
+          msg().setFlag(DONT_LOOPBACK),
           msg().setFlag(Message.Flag.OOB),
           msg().setFlag(Message.Flag.OOB),
-          msg().setFlag(Message.Flag.OOB).setFlag(Message.TransientFlag.DONT_LOOPBACK),
-          msg().setFlag(Message.Flag.OOB).setFlag(Message.TransientFlag.DONT_LOOPBACK),
-          msg().setFlag(Message.Flag.OOB).setFlag(Message.TransientFlag.DONT_LOOPBACK),
-          msg().setFlag(Message.Flag.OOB).setFlag(Message.TransientFlag.DONT_LOOPBACK),
+          msg().setFlag(Message.Flag.OOB).setFlag(DONT_LOOPBACK),
+          msg().setFlag(Message.Flag.OOB).setFlag(DONT_LOOPBACK),
+          msg().setFlag(Message.Flag.OOB).setFlag(DONT_LOOPBACK),
+          msg().setFlag(Message.Flag.OOB).setFlag(DONT_LOOPBACK),
           msg().setFlag(Message.Flag.OOB)
         };
 
@@ -92,16 +132,27 @@ public class NakackUnitTest {
 
     protected static Message msg() {return new BytesMessage(null);}
 
-    protected static JChannel create(String name, boolean use_batching) throws Exception {
+    protected static JChannel create(Class<Protocol> cl, String name, boolean use_batching) throws Exception {
         Protocol[] protocols={
           new SHARED_LOOPBACK(),
           new SHARED_LOOPBACK_PING(),
           new MAKE_BATCH().sleepTime(100).multicasts(use_batching),
-          new NAKACK2(),
+          cl.getConstructor().newInstance(),
           new UNICAST3(),
           new STABLE(),
           new GMS(),
           new FRAG2().setFragSize(8000),
+        };
+        return new JChannel(protocols).name(name);
+    }
+
+    protected static JChannel createNAKACK4(String name, int capacity) throws Exception {
+        Protocol[] protocols={
+          new SHARED_LOOPBACK(),
+          new SHARED_LOOPBACK_PING(),
+          new NAKACK4().capacity(capacity).sendAtomically(false),
+          new UNICAST3(),
+          new GMS(),
         };
         return new JChannel(protocols).name(name);
     }
@@ -116,7 +167,8 @@ public class NakackUnitTest {
     protected static class MyReceiver implements Receiver {
         protected final List<Integer> list=new ArrayList<>();
 
-        public List<Integer> list()       {return list;}
+        public List<Integer> list() {return list;}
+        public int           size() {return list.size();}
 
         public void receive(Message msg) {
             Integer num=msg.getObject();

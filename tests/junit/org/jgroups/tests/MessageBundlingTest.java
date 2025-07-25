@@ -37,12 +37,16 @@ public class MessageBundlingTest extends ChannelTestBase {
 
     @BeforeMethod
     protected void createChannels() throws Exception {
-        a=createChannel(true, 2, "A");
+        a=createChannel().name("A");
         setBundling(a,MAX_BYTES);
-        a.connect("MessageBundlingTest");
-        b=createChannel(a, "B");
+
+        b=createChannel().name("B");
         r2=new SimpleReceiver(promise);
         b.setReceiver(r2);
+
+        makeUnique(a,b);
+
+        a.connect("MessageBundlingTest");
         b.connect("MessageBundlingTest");
         Util.waitUntilAllChannelsHaveSameView(10000, 1000, a, b);
     }
@@ -93,8 +97,8 @@ public class MessageBundlingTest extends ChannelTestBase {
         }
         for(int i=0; i < times.length; i++)
             System.out.printf("latency for %d: %s\n", i, print(times[i]));
-        System.out.printf("\nmin/max/avg (us): %.2f  / %.2f / %.2f\n", min / 1000.0, max / 1000.0, avg.getAverage() / 1000.0);
-        assert avg.getAverage() < LATENCY_NS;
+        System.out.printf("\nmin/max/avg (us): %.2f  / %.2f / %.2f\n", min / 1000.0, max / 1000.0, avg.average() / 1000.0);
+        assert avg.average() < LATENCY_NS;
     }
 
 
@@ -110,7 +114,7 @@ public class MessageBundlingTest extends ChannelTestBase {
         promise.getResult(SLEEP);
         long diff=System.nanoTime() - time;
         System.out.printf("latency: %s\n", print(diff));
-        assertTrue(String.format("latency (%s) should be less than %d ms", print(diff), LATENCY), diff <= LATENCY_NS);
+        assert diff <= LATENCY_NS : String.format("latency (%s) should be less than %d ms", print(diff), LATENCY);
     }
 
 
@@ -122,7 +126,7 @@ public class MessageBundlingTest extends ChannelTestBase {
     private static void setBundling(JChannel ch, int max_bytes) {
         ProtocolStack stack=ch.getProtocolStack();
         TP transport=stack.getTransport();
-        transport.setMaxBundleSize(max_bytes);
+        transport.getBundler().setMaxSize(max_bytes);
         GMS gms=stack.findProtocol(GMS.class);
         gms.setViewAckCollectionTimeout(LATENCY * 2);
         gms.setJoinTimeout(LATENCY * 2);

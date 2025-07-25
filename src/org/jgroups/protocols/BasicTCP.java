@@ -5,21 +5,26 @@ import org.jgroups.Event;
 import org.jgroups.Global;
 import org.jgroups.PhysicalAddress;
 import org.jgroups.annotations.LocalAddress;
+import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.annotations.Property;
+import org.jgroups.blocks.cs.Connection;
+import org.jgroups.blocks.cs.ConnectionListener;
 import org.jgroups.blocks.cs.Receiver;
 import org.jgroups.conf.AttributeType;
 
 import java.net.InetAddress;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * Shared base class for TCP protocols
  * @author Scott Marlow
  * @author Bela Ban
  */
-public abstract class BasicTCP extends TP implements Receiver {
+public abstract class BasicTCP extends TP implements Receiver, ConnectionListener {
 
     /* -----------------------------------------    Properties     -------------------------------------------------- */
     
@@ -40,15 +45,21 @@ public abstract class BasicTCP extends TP implements Receiver {
     
     @Property(description="Max time to block on reading of peer address",type=AttributeType.TIME)
     protected int         peer_addr_read_timeout=1000; // max time to block on reading of peer address
-    
-    @Property(description="Should TCP no delay flag be turned on")
-    protected boolean     tcp_nodelay=true; // should be true by default as message bundling makes delaying packets moot
-    
-    @Property(description="SO_LINGER in msec. Default of -1 disables it")
-    protected int         linger=-1; // SO_LINGER (number of ms, -1 disables it)
 
-    // @Property(description="Sets socket option SO_REUSEADDR (https://issues.jboss.org/browse/JGRP-2009)")
-    // protected boolean     reuse_addr;
+    @Property(description="The max number of bytes a message can have. If greater, an exception will be " +
+      "thrown. 0 disables this", type=AttributeType.BYTES)
+    protected int         max_length;
+    
+    @Property(description="Should TCP no delay flag be turned on. True: nagling is OFF, false: nagling is ON")
+    protected boolean     tcp_nodelay=false; // https://issues.redhat.com/browse/JGRP-2781
+
+    @Property(description="SO_LINGER in seconds. Default of -1 disables it")
+    protected int         linger=-1; // SO_LINGER (number of seconds, -1 disables it)
+
+    @Property(description="Wait for an ack from the server when a connection is established " +
+      "(https://issues.redhat.com/browse/JGRP-2684)",deprecatedMessage="will be ignored (JGRP-2866)")
+    @Deprecated(since="5.4.4",forRemoval=true)
+    protected boolean     use_acks;
 
     @LocalAddress
     @Property(name="client_bind_addr",
@@ -63,6 +74,15 @@ public abstract class BasicTCP extends TP implements Receiver {
     @Property(description="If true, client sockets will not explicitly bind to bind_addr but will defer to the native socket")
     protected boolean     defer_client_bind_addr;
 
+    @Property(description="Log a stack trace when a connection is closed")
+    protected boolean     log_details=true;
+
+    @Property(description="When true, a SUSPECT(P) event is passed up when a connection is closed by the peer P. " +
+      "This is not recommended when connection reaping is enabled. https://issues.redhat.com/browse/JGRP-2869")
+    protected boolean     enable_suspect_events;
+
+    @ManagedAttribute(description="Number of suspect events sent up the stack due to peers closing connections")
+    protected final LongAdder num_suspect_events=new LongAdder();
 
     /* --------------------------------------------- Fields ------------------------------------------------------ */
     
@@ -71,39 +91,53 @@ public abstract class BasicTCP extends TP implements Receiver {
         super();        
     }
 
-    public boolean  supportsMulticasting()           {return false;}
-    public long     getReaperInterval()              {return reaper_interval;}
-    public BasicTCP setReaperInterval(long interval) {this.reaper_interval=interval; return this;}
-    public BasicTCP reaperInterval(long interval)    {this.reaper_interval=interval; return this;}
-    public long     getConnExpireTime()              {return conn_expire_time;}
-    public BasicTCP setConnExpireTime(long time)     {this.conn_expire_time=time; return this;}
+    public boolean     supportsMulticasting()           {return false;}
 
-    public int getRecvBufSize() {return recv_buf_size;}
-    public BasicTCP setRecvBufSize(int r) {this.recv_buf_size=r; return this;}
+    public long        getReaperInterval()              {return reaper_interval;}
+    public BasicTCP    setReaperInterval(long interval) {this.reaper_interval=interval; return this;}
+    public BasicTCP    reaperInterval(long interval)    {this.reaper_interval=interval; return this;}
 
-    public int getSendBufSize() {return send_buf_size;}
-    public BasicTCP setSendBufSize(int s) {this.send_buf_size=s; return this;}
+    public long        getConnExpireTime()              {return conn_expire_time;}
+    public BasicTCP    setConnExpireTime(long time)     {this.conn_expire_time=time; return this;}
 
-    public int getSockConnTimeout() {return sock_conn_timeout;}
-    public BasicTCP setSockConnTimeout(int s) {this.sock_conn_timeout=s; return this;}
+    public int         getRecvBufSize()                 {return recv_buf_size;}
+    public BasicTCP    setRecvBufSize(int r)            {this.recv_buf_size=r; return this;}
 
-    public int getPeerAddrReadTimeout() {return peer_addr_read_timeout;}
-    public BasicTCP setPeerAddrReadTimeout(int p) {this.peer_addr_read_timeout=p; return this;}
+    public int         getSendBufSize()                 {return send_buf_size;}
+    public BasicTCP    setSendBufSize(int s)            {this.send_buf_size=s; return this;}
 
-    public boolean tcpNodelay() {return tcp_nodelay;}
-    public BasicTCP tcpNodelay(boolean t) {this.tcp_nodelay=t; return this;}
+    public int         getSockConnTimeout()             {return sock_conn_timeout;}
+    public BasicTCP    setSockConnTimeout(int s)        {this.sock_conn_timeout=s; return this;}
 
-    public int getLinger() {return linger;}
-    public BasicTCP setLinger(int l) {this.linger=l; return this;}
+    public int         getMaxLength()                   {return max_length;}
+    public BasicTCP    setMaxLength(int len)            {max_length=len; return this;}
 
-    public InetAddress getClientBindAddr() {return client_bind_addr;}
-    public BasicTCP setClientBindAddr(InetAddress c) {this.client_bind_addr=c; return this;}
+    public int         getPeerAddrReadTimeout()         {return peer_addr_read_timeout;}
+    public BasicTCP    setPeerAddrReadTimeout(int p)    {this.peer_addr_read_timeout=p; return this;}
 
-    public int getClientBindPort() {return client_bind_port;}
-    public BasicTCP setClientBindPort(int c) {this.client_bind_port=c; return this;}
+    public boolean     tcpNodelay()                     {return tcp_nodelay;}
+    public BasicTCP    tcpNodelay(boolean t)            {this.tcp_nodelay=t; return this;}
 
-    public boolean deferClientBindAddr() {return defer_client_bind_addr;}
-    public BasicTCP deferClientBindAddr(boolean d) {this.defer_client_bind_addr=d; return this;}
+    public int         getLinger()                      {return linger;}
+    public BasicTCP    setLinger(int l)                 {this.linger=l; return this;}
+
+    public static boolean useAcks()                     {return false;}
+    public BasicTCP    useAcks(boolean ignored)         {return this;}
+
+    public InetAddress getClientBindAddr()              {return client_bind_addr;}
+    public BasicTCP    setClientBindAddr(InetAddress c) {this.client_bind_addr=c; return this;}
+
+    public int         getClientBindPort()              {return client_bind_port;}
+    public BasicTCP    setClientBindPort(int c)         {this.client_bind_port=c; return this;}
+
+    public boolean     deferClientBindAddr()            {return defer_client_bind_addr;}
+    public BasicTCP    deferClientBindAddr(boolean d)   {this.defer_client_bind_addr=d; return this;}
+
+    public boolean     logDetails()                     {return log_details;}
+    public BasicTCP    logDetails(boolean l)            {log_details=l; return this;}
+
+    public boolean     enableSuspectEvents()            {return enable_suspect_events;}
+    public BasicTCP    enableSuspectEvents(boolean b)   {enable_suspect_events=b; return this;}
 
 
 
@@ -116,6 +150,8 @@ public abstract class BasicTCP extends TP implements Receiver {
                                                      ", as no dynamic discovery protocol (e.g. MPING or TCPGOSSIP) has been detected.");
         }
         if(reaper_interval > 0 || conn_expire_time > 0) {
+            if(enable_suspect_events)
+                log.warn("reaping is enabled, but also suspect events; this is not recommended");
             if(conn_expire_time == 0 && reaper_interval > 0) {
                 log.warn("reaper interval (%d) set, but not conn_expire_time, disabling reaping", reaper_interval);
                 reaper_interval=0;
@@ -127,11 +163,6 @@ public abstract class BasicTCP extends TP implements Receiver {
         }
     }
 
-
-    public void sendMulticast(byte[] data, int offset, int length) throws Exception {
-        sendToMembers(members, data, offset, length);
-    }
-
     public void sendUnicast(PhysicalAddress dest, byte[] data, int offset, int length) throws Exception {
         send(dest, data, offset, length);
     }
@@ -140,12 +171,17 @@ public abstract class BasicTCP extends TP implements Receiver {
         return String.format("connections: %s\n", printConnections());
     }
 
-
     public abstract String printConnections();
 
     public abstract void send(Address dest, byte[] data, int offset, int length) throws Exception;
 
     public abstract void retainAll(Collection<Address> members);
+
+    @Override
+    public void resetStats() {
+        super.resetStats();
+        num_suspect_events.reset();
+    }
 
     @Override
     public Object down(Event evt) {
@@ -160,5 +196,26 @@ public abstract class BasicTCP extends TP implements Receiver {
             retainAll(physical_mbrs); // remove all connections which are not members
         }
         return ret;
+    }
+
+    @Override
+    public void connectionClosed(Connection conn) {
+        if(!enable_suspect_events)
+            return;
+        Address peer_ip=conn.peerAddress();
+        Address peer=peer_ip != null? logical_addr_cache.getByValue((PhysicalAddress)peer_ip) : null;
+        if(peer != null) {
+            if(log.isDebugEnabled())
+                log.debug("%s: connection closed by peer %s (IP=%s), sending up a suspect event",
+                          local_addr, peer, peer_ip);
+            Event suspect=new Event(Event.SUSPECT, List.of(peer));
+            up_prot.up(suspect);
+            num_suspect_events.increment();
+        }
+    }
+
+    @Override
+    public void connectionEstablished(Connection conn) {
+
     }
 }

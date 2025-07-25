@@ -3,7 +3,6 @@ package org.jgroups.util;
 import org.jgroups.Address;
 import org.jgroups.Message;
 import org.jgroups.logging.Log;
-import org.jgroups.protocols.MsgStats;
 import org.jgroups.protocols.TP;
 import org.jgroups.protocols.TpHeader;
 import org.jgroups.stack.MessageProcessingPolicy;
@@ -20,47 +19,74 @@ public class SubmitToThreadPool implements MessageProcessingPolicy {
     protected short tp_id;
     protected Log   log;
 
+    protected TP getTransport() {return tp;}
+
     public void init(TP transport) {
         this.tp=transport;
         this.tp_id=tp.getId();
         this.log=tp.getLog();
     }
 
-    public void loopback(Message msg, boolean oob, boolean internal) {
-        tp.submitToThreadPool(() -> tp.passMessageUp(msg, null, false, msg.getDest() == null, false), internal);
+    public boolean loopback(Message msg, boolean oob) {
+        return tp.getThreadPool().execute(new SingleLoopbackHandler(msg));
     }
 
-    public void process(Message msg, boolean oob, boolean internal) {
-        tp.submitToThreadPool(new SingleMessageHandler(msg), internal);
+    public boolean loopback(MessageBatch batch, boolean oob) {
+        if(oob) {
+            boolean removed=removeAndDispatchNonBundledMessages(batch, true);
+            if(removed && batch.isEmpty())
+                return true;
+        }
+        return tp.getThreadPool().execute(new BatchHandler(batch, true));
     }
 
-    public void process(MessageBatch batch, boolean oob, boolean internal) {
-        if(oob)
-            removeAndDispatchNonBundledMessages(batch);
-        tp.submitToThreadPool(new BatchHandler(batch), internal);
+    public boolean process(Message msg, boolean oob) {
+        return tp.getThreadPool().execute(new SingleMessageHandler(msg));
+    }
+
+    public boolean process(MessageBatch batch, boolean oob) {
+        if(oob) {
+            boolean removed=removeAndDispatchNonBundledMessages(batch, false);
+            if(removed && batch.isEmpty())
+                return true;
+        }
+        return tp.getThreadPool().execute(new BatchHandler(batch, false));
     }
 
 
     /**
      * Removes messages with flags DONT_BUNDLE and OOB set and executes them in the oob or internal thread pool. JGRP-1737
+     * Returns true if at least one message was removed
      */
-    protected void removeAndDispatchNonBundledMessages(MessageBatch oob_batch) {
+    protected boolean removeAndDispatchNonBundledMessages(MessageBatch oob_batch, boolean loopback) {
         if(oob_batch == null)
-            return;
+            return false;
         AsciiString tmp=oob_batch.clusterName();
         byte[] cname=tmp != null? tmp.chars() : null;
+        boolean removed=false;
         for(Iterator<Message> it=oob_batch.iterator(); it.hasNext();) {
             Message msg=it.next();
             if(msg.isFlagSet(Message.Flag.DONT_BUNDLE) && msg.isFlagSet(Message.Flag.OOB)) {
-                boolean internal=msg.isFlagSet(Message.Flag.INTERNAL);
                 it.remove();
-                if(tp.statsEnabled())
-                    tp.getMessageStats().incrNumOOBMsgsReceived(1);
-                tp.submitToThreadPool(new SingleMessageHandlerWithClusterName(msg, cname), internal);
+                Runnable handler=loopback? new SingleLoopbackHandler(msg) : new SingleMessageHandlerWithClusterName(msg, cname);
+                tp.getThreadPool().execute(handler);
+                removed=true;
             }
         }
+        return removed;
     }
 
+    public class SingleLoopbackHandler implements Runnable {
+        protected final Message msg;
+
+        public SingleLoopbackHandler(Message msg) {
+            this.msg=msg;
+        }
+
+        public void run() {
+            tp.passMessageUp(msg, null, false, msg.getDest() == null, false);
+        }
+    }
 
     public class SingleMessageHandler implements Runnable {
         protected final Message msg;
@@ -75,19 +101,6 @@ public class SubmitToThreadPool implements MessageProcessingPolicy {
             Address dest=msg.getDest();
             boolean multicast=dest == null;
             try {
-                if(tp.statsEnabled()) {
-                    MsgStats msg_stats=tp.getMessageStats();
-                    boolean oob=msg.isFlagSet(Message.Flag.OOB), internal=msg.isFlagSet(Message.Flag.INTERNAL);
-                    if(oob || internal) {
-                        if(oob)
-                            msg_stats.incrNumOOBMsgsReceived(1);
-                        if(internal)
-                            msg_stats.incrNumInternalMsgsReceived(1);
-                    }
-                    else
-                        msg_stats.incrNumMsgsReceived(1);
-                    msg_stats.incrNumBytesReceived(msg.getLength());
-                }
                 byte[] cname=getClusterName();
                 tp.passMessageUp(msg, cname, true, multicast, true);
             }
@@ -98,7 +111,7 @@ public class SubmitToThreadPool implements MessageProcessingPolicy {
 
         protected byte[] getClusterName() {
             TpHeader hdr=msg.getHeader(tp_id);
-            return hdr.getClusterName();
+            return hdr.clusterName();
         }
     }
 
@@ -117,37 +130,21 @@ public class SubmitToThreadPool implements MessageProcessingPolicy {
 
     public class BatchHandler implements Runnable {
         protected MessageBatch batch;
+        protected boolean      loopback;
 
-        public BatchHandler(final MessageBatch batch) {
+        public BatchHandler(final MessageBatch batch, boolean loopback) {
             this.batch=batch;
+            this.loopback=loopback;
         }
 
-        public MessageBatch getBatch() {return batch;}
-
         public void run() {
-            if(batch == null || (!batch.multicast() && tp.unicastDestMismatch(batch.dest())))
+            if(batch == null || batch.isEmpty() || (!batch.multicast() && tp.unicastDestMismatch(batch.dest())))
                 return;
-            if(tp.statsEnabled()) {
-                int batch_size=batch.size();
-                MsgStats msg_stats=tp.getMessageStats();
-                boolean oob=batch.getMode() == MessageBatch.Mode.OOB, internal=batch.getMode() == MessageBatch.Mode.INTERNAL;
-                if(oob || internal) {
-                    if(oob)
-                        msg_stats.incrNumOOBMsgsReceived(batch_size);
-                    if(internal)
-                        msg_stats.incrNumInternalMsgsReceived(batch_size);
-                }
-                else
-                    msg_stats.incrNumMsgsReceived(batch_size);
-                msg_stats.incrNumBatchesReceived(1);
-                msg_stats.incrNumBytesReceived(batch.length());
-                tp.avgBatchSize().add(batch_size);
-            }
             passBatchUp();
         }
 
         protected void passBatchUp() {
-            tp.passBatchUp(batch, true, true);
+            tp.passBatchUp(batch, !loopback, !loopback);
         }
     }
 

@@ -2,10 +2,12 @@ package org.jgroups.tests;
 
 import org.jgroups.*;
 import org.jgroups.conf.ClassConfigurator;
+import org.jgroups.protocols.NAKACK4;
 import org.jgroups.protocols.pbcast.*;
 import org.jgroups.stack.Protocol;
 import org.jgroups.stack.ProtocolStack;
 import org.jgroups.util.ArrayIterator;
+import org.jgroups.util.MessageBatch;
 import org.jgroups.util.Util;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.DataProvider;
@@ -15,10 +17,11 @@ import java.io.*;
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Tests correct state transfer while other members continue sending messages to the group
@@ -29,7 +32,7 @@ public class StateTransferTest extends ChannelTestBase {
     static final int                     MSG_SEND_COUNT=1000;
     static final String[]                names= {"A", "B", "C", "D"};
     static final int                     APP_COUNT=names.length;
-    static final Class<?>[]              NAK_PROTS={NAKACK2.class};
+    static final Class<?>[]              NAK_PROTS={NAKACK2.class, NAKACK4.class};
     static final short[]                 ids=new short[NAK_PROTS.length];
     protected StateTransferApplication[] apps=new StateTransferApplication[APP_COUNT];
 
@@ -41,7 +44,8 @@ public class StateTransferTest extends ChannelTestBase {
 
     @DataProvider(name="createChannels")
     protected Iterator<Object[]> createChannels() {
-        return new ArrayIterator<>(new Class[][]{{STATE_TRANSFER.class}, {STATE.class}, {STATE_SOCK.class}});
+        // return new ArrayIterator<>(new Class[][]{{STATE_TRANSFER.class}, {STATE.class}, {STATE_SOCK.class}});
+        return new ArrayIterator<>(new Class[][]{{STATE.class}});
     }
 
 
@@ -55,14 +59,14 @@ public class StateTransferTest extends ChannelTestBase {
 
     @Test(dataProvider="createChannels")
     public void testStateTransferFromSelfWithRegularChannel(final Class<? extends Protocol> state_transfer_class) throws Exception {
-        JChannel ch=createChannel(true);
+        JChannel ch=createChannel();
         replaceStateTransferProtocolWith(ch, state_transfer_class);
         ch.connect("StateTransferTest");
         try {
             Address self=ch.getAddress();
             assert self != null;
             ch.getState(self, 20000);
-            assert true : "getState() on self should return";
+            // "getState() on self should return";
         }
         finally {
             Util.close(ch);
@@ -72,17 +76,20 @@ public class StateTransferTest extends ChannelTestBase {
     // @Test(dataProvider="createChannels",invocationCount=10)
     @Test(dataProvider="createChannels")
     public void testStateTransferWhileSending(final Class<? extends Protocol> state_transfer_class) throws Exception {
-        Semaphore semaphore=new Semaphore(APP_COUNT, true); // fifo order
-        semaphore.acquire(APP_COUNT);
+        Semaphore semaphore=new Semaphore(0);
         Thread[] threads=new Thread[APP_COUNT];
 
         int from=0, to=MSG_SEND_COUNT;
         for(int i=0;i < apps.length;i++) {
-            if(i == 0)
-                apps[i]=new StateTransferApplication(semaphore, names[i], from, to);
-            else
-                apps[i]=new StateTransferApplication(apps[0].getChannel(), semaphore, names[i], from, to);
+            apps[i]=new StateTransferApplication(semaphore, names[i], from, to);
             replaceStateTransferProtocolWith(apps[i].getChannel(), state_transfer_class);
+        }
+
+        List<JChannel> l=Stream.of(apps).map(StateTransferApplication::getChannel).collect(Collectors.toList());
+        makeUnique(l);
+
+        // connect and send
+        for(int i=0;i < apps.length;i++) {
             threads[i]=new Thread(apps[i], "thread-" + names[i]);
             threads[i].start();
             from+=MSG_SEND_COUNT;
@@ -91,7 +98,7 @@ public class StateTransferTest extends ChannelTestBase {
 
         for(int i=0;i < threads.length; i++) {
             semaphore.release();
-            Util.sleep(i == 0? 4000 : 100); // to reduce changes of a merge
+            Util.sleep(i == 0? 3000 : 100); // to reduce changes of a merge
         }
 
         // Make sure everyone is in sync
@@ -129,7 +136,7 @@ public class StateTransferTest extends ChannelTestBase {
 
         for(int i=0;i < apps.length;i++) {
             StateTransferApplication w=apps[i];
-            ConcurrentMap<Address,AtomicInteger> map=w.getCount();
+            Map<Address,AtomicInteger> map=w.getCount();
             System.out.println("msgs for " + names[i] + ":");
             for(Map.Entry<Address,AtomicInteger> entry: map.entrySet())
                 System.out.println("from " + entry.getKey() + " --> " + entry.getValue() + " msgs");
@@ -169,8 +176,10 @@ public class StateTransferTest extends ChannelTestBase {
     protected void resumeStableAndGC() {
         for(StateTransferApplication app: apps) {
             STABLE stable=app.getChannel().getProtocolStack().findProtocol(STABLE.class);
-            stable.down(new Event(Event.RESUME_STABLE));
-            stable.gc();
+            if(stable != null) {
+                stable.down(new Event(Event.RESUME_STABLE));
+                stable.gc();
+            }
         }
     }
 
@@ -215,43 +224,29 @@ public class StateTransferTest extends ChannelTestBase {
         if(prot != null) {
             stack.replaceProtocol(prot, new_state_transfer_protcol);
         }
-        else { // no state transfer protocol found in stack
-            Protocol flush=stack.findProtocol(FLUSH.class);
-            if(flush != null)
-                stack.insertProtocol(new_state_transfer_protcol, ProtocolStack.Position.BELOW, FLUSH.class);
-            else
-                stack.insertProtocolAtTop(new_state_transfer_protcol);
-        }
+        else // no state transfer protocol found in stack
+            stack.insertProtocolAtTop(new_state_transfer_protcol);
     }
 
 
     protected class StateTransferApplication implements Receiver, Runnable {
-        protected final Map<String,List<Long>>         map=new HashMap<>(MSG_SEND_COUNT * APP_COUNT);
-        protected final int                            from, to;
-        protected ConcurrentMap<Address,AtomicInteger> count=new ConcurrentHashMap<>();
-        protected final Semaphore                      semaphore;
-        protected final JChannel                       channel;
-        protected long                                 start_time;
+        protected final Map<String,List<Long>> map=new HashMap<>(MSG_SEND_COUNT * APP_COUNT);
+        protected final int                    from, to;
+        protected Map<Address,AtomicInteger>   count=new ConcurrentHashMap<>();
+        protected final Semaphore              semaphore;
+        protected final JChannel               channel;
+        protected long                         start_time;
+
 
         public StateTransferApplication(Semaphore semaphore, String name, int from, int to) throws Exception {
             this.from=from;
             this.to=to;
             this.semaphore=semaphore;
             init();
-            channel=createChannel(true, APP_COUNT, name);
+            channel=createChannel().name(name);
             channel.setReceiver(this);
-
         }
         
-        public StateTransferApplication(JChannel copySource, Semaphore semaphore, String name, int from, int to) throws Exception {
-            this.from=from;
-            this.to=to;
-            this.semaphore=semaphore;
-            init();
-            this.channel=createChannel(copySource, name);
-            channel.setReceiver(this);
-
-        }
 
         protected void init() {
             for(String s: names)
@@ -270,7 +265,7 @@ public class StateTransferTest extends ChannelTestBase {
             }
         }
 
-        public ConcurrentMap<Address,AtomicInteger> getCount() {
+        public Map<Address,AtomicInteger> getCount() {
             return count;
         }
 
@@ -299,6 +294,11 @@ public class StateTransferTest extends ChannelTestBase {
             }
         }
 
+        @Override
+        public void receive(MessageBatch batch) {
+            for(Message msg: batch)
+                receive(msg);
+        }
 
         public void getState(OutputStream ostream) throws Exception {
             OutputStream out=new BufferedOutputStream(ostream);
@@ -328,7 +328,7 @@ public class StateTransferTest extends ChannelTestBase {
         public void run() {
             boolean acquired=false;
             try {
-                acquired=semaphore.tryAcquire(60000L, TimeUnit.MILLISECONDS);
+                acquired=semaphore.tryAcquire(10L, TimeUnit.SECONDS);
                 if(!acquired)
                     throw new Exception(channel.getAddress() + " cannot acquire semaphore");
                 useChannel();

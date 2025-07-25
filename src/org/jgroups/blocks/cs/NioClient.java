@@ -56,23 +56,18 @@ public class NioClient extends NioBaseServer implements Client {
     public Address           remoteAddress()               {return remote_addr;}
     /** Sets the address of the server. Has no effect when already connected. */
     public NioClient         remoteAddress(IpAddress addr) {this.remote_addr=addr; return this;}
-    @Override public boolean isOpen()                      {return conn != null && conn.isOpen();}
     @Override public boolean isConnected()                 {return conn != null && conn.isConnected();}
 
     @Override
     public void start() throws Exception {
         if(running.compareAndSet(false, true)) {
-            super.start();
-            selector=Selector.open();
-            conn=createConnection(remote_addr);
-            conn.connect(remote_addr, false);
-            local_addr=conn.localAddress();
-            if(use_peer_connections)
-                conn.sendLocalAddress(local_addr);
-            conn.start();
-            acceptor=factory.newThread(new Acceptor(), "NioClient.Acceptor [srv=" + remote_addr + "]");
-            acceptor.setDaemon(true);
-            acceptor.start();
+            try {
+                doStart();
+            }
+            catch(Exception ex) {
+                stop();
+                throw ex;
+            }
         }
     }
 
@@ -109,6 +104,20 @@ public class NioClient extends NioBaseServer implements Client {
     public String toString() {
         return conn == null? String.format("%s -> %s [not connected]", localAddress(), remoteAddress())
           : String.format("%s", conn);
+    }
+
+    protected void doStart() throws Exception {
+        super.start();
+        selector=Selector.open();
+        conn=createConnection(remote_addr);
+        conn.connect(remote_addr, false);
+        local_addr=conn.localAddress();
+        if(use_peer_connections)
+            conn.sendLocalAddress(local_addr);
+        conn.start();
+        acceptor=factory.newThread(new Acceptor(), "NioClient.Acceptor [srv=" + remote_addr + "]");
+        acceptor.setDaemon(true);
+        acceptor.start();
     }
 
 }

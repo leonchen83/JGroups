@@ -9,12 +9,17 @@ import org.jgroups.conf.AttributeType;
 import org.jgroups.stack.Protocol;
 import org.jgroups.util.Credit;
 import org.jgroups.util.MessageBatch;
-import org.jgroups.util.MessageIterator;
 import org.jgroups.util.Util;
 
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+import static org.jgroups.Message.TransientFlag.DONT_BLOCK;
+import static org.jgroups.Message.TransientFlag.DONT_LOOPBACK;
+import static org.jgroups.conf.AttributeType.SCALAR;
 
 
 /**
@@ -35,23 +40,11 @@ public abstract class FlowControl extends Protocol {
       type=AttributeType.BYTES)
     protected long           max_credits=5_000_000;
 
-    /**
-     * Max time (in milliseconds) to block. If credit hasn't been received after max_block_time, we send
+    /** Max time (in milliseconds) to block. If credit hasn't been received after max_block_time, we send
      * a REPLENISHMENT request to the members from which we expect credits. A value <= 0 means to wait forever.
      */
     @Property(description="Max time (in ms) to block",type=AttributeType.TIME)
-    protected long           max_block_time=500;
-
-    /**
-     * Defines the max number of milliseconds for a message to block before being sent, based on the length of
-     * the message. The property is defined as a comma-separated list of values (separated by ':'), where the key
-     * is the size in bytes and the value is the number of milliseconds to block.
-     * Example: max_block_times="50:1,500:3,1500:5,10000:10,100000:100". This means that messages up to 50 bytes wait
-     * 1 ms max until they get sent, messages up to 500 bytes 3 ms, and so on.
-     * If a message's length (size of the payload in bytes) is for example 15'000 bytes,
-     * FlowControl blocks it for a max of 100 ms.
-     */
-    protected Map<Long,Long> max_block_times;
+    protected long           max_block_time=5000;
 
 
     /**
@@ -62,7 +55,7 @@ public abstract class FlowControl extends Protocol {
     @Property(description="The threshold (as a percentage of max_credits) at which a receiver sends more credits to " +
             "a sender. Example: if max_credits is 1'000'000, and min_threshold 0.25, then we send ca. 250'000 credits " +
             "to P once we've got only 250'000 credits left for P (we've received 750'000 bytes from P)")
-    protected double         min_threshold=0.40;
+    protected double         min_threshold=0.20;
 
     /**
      * Computed as <tt>max_credits</tt> times <tt>min_theshold</tt>. If explicitly set, this will
@@ -71,14 +64,21 @@ public abstract class FlowControl extends Protocol {
     @Property(description="Computed as max_credits x min_theshold unless explicitly set",type=AttributeType.BYTES)
     protected long           min_credits;
     
+    @ManagedAttribute(description="Number of credit requests received",type=AttributeType.SCALAR)
+    protected long           num_credit_requests_received;
 
+    @ManagedAttribute(description="Number of credit requests sent",type=AttributeType.SCALAR)
+    protected long           num_credit_requests_sent;
+
+    @ManagedAttribute(description="Number of credit responses received",type=AttributeType.SCALAR)
+    protected long           num_credit_responses_received;
+
+    @ManagedAttribute(description="Number of credit responses sent",type=AttributeType.SCALAR)
+    protected long           num_credit_responses_sent;
+
+    @ManagedAttribute(description="Number of messages dropped due to DONT_BLOCK flag",type=AttributeType.SCALAR)
+    protected long           num_msgs_dropped;
     
-    
-    /* ---------------------------------------------   JMX      -------------------------------------------------- */
-    protected int  num_credit_requests_received, num_credit_requests_sent;
-    protected int  num_credit_responses_sent, num_credit_responses_received;
-
-
     /* --------------------------------------------- Fields ------------------------------------------------------ */
    
 
@@ -89,13 +89,9 @@ public abstract class FlowControl extends Protocol {
      */
     protected final Map<Address,Credit> received=Util.createConcurrentMap();
 
-    protected Address                   local_addr;
-
     /** Whether FlowControl is still running, this is set to false when the protocol terminates (on stop()) */
     protected volatile boolean          running=true;
-
     protected int                       frag_size; // remember frag_size from the fragmentation protocol
-
 
 
 
@@ -103,87 +99,36 @@ public abstract class FlowControl extends Protocol {
     public void resetStats() {
         super.resetStats();
         num_credit_responses_sent=num_credit_responses_received=num_credit_requests_received=num_credit_requests_sent=0;
+        num_msgs_dropped=0;
     }
 
-    public long                      getMaxCredits()           {return max_credits;}
-    public <T extends FlowControl> T setMaxCredits(long m)     {max_credits=m; return (T)this;}
-    public double                    getMinThreshold()         {return min_threshold;}
-    public <T extends FlowControl> T setMinThreshold(double m) {min_threshold=m; return (T)this;}
-    public long                      getMinCredits()           {return min_credits;}
-    public <T extends FlowControl> T setMinCredits(long m)     {min_credits=m; return (T)this;}
-    public long                      getMaxBlockTime()         {return max_block_time;}
-    public <T extends FlowControl> T setMaxBlockTime(long t)   {max_block_time=t; return (T)this;}
+    public abstract int              getNumberOfBlockings();
+    public abstract double           getAverageTimeBlocked();
+    public long                      getMaxCredits()                      {return max_credits;}
+    public <T extends FlowControl> T setMaxCredits(long m)                {max_credits=m; return (T)this;}
+    public double                    getMinThreshold()                    {return min_threshold;}
+    public <T extends FlowControl> T setMinThreshold(double m)            {min_threshold=m; return (T)this;}
+    public long                      getMinCredits()                      {return min_credits;}
+    public <T extends FlowControl> T setMinCredits(long m)                {min_credits=m; return (T)this;}
+    public long                      getMaxBlockTime()                    {return max_block_time;}
+    public <T extends FlowControl> T setMaxBlockTime(long t)              {max_block_time=t; return (T)this;}
 
+    /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public long                      getNumberOfCreditRequestsReceived()  {return num_credit_requests_received;}
 
-    @Property(description="Max times to block for the listed messages sizes (Message.getLength()). Example: \"1000:10,5000:30,10000:500\"")
-    public FlowControl setMaxBlockTimes(String str) {
-        if(str == null) return this;
-        Long prev_key=null, prev_val=null;
-        List<String> vals=Util.parseCommaDelimitedStrings(str);
-        if(max_block_times == null)
-            max_block_times=new TreeMap<>();
-        for(String tmp: vals) {
-            int index=tmp.indexOf(':');
-            if(index == -1)
-                throw new IllegalArgumentException("element '" + tmp + "'  is missing a ':' separator");
-            long key=Long.parseLong(tmp.substring(0, index).trim());
-            long val=Long.parseLong(tmp.substring(index +1).trim());
+    /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public long                      getNumberOfCreditRequestsSent()      {return num_credit_requests_sent;}
 
-            // sanity checks:
-            if(key < 0 || val < 0)
-                throw new IllegalArgumentException("keys and values must be >= 0");
+    /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public long                      getNumberOfCreditResponsesReceived() {return num_credit_responses_received;}
 
-            if(prev_key != null && key <= prev_key)
-                throw new IllegalArgumentException("keys are not sorted: " + vals);
-            prev_key=key;
+    /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public long                      getNumberOfCreditResponsesSent()     {return num_credit_responses_sent;}
 
-            if(prev_val != null && val <= prev_val)
-                throw new IllegalArgumentException("values are not sorted: " + vals);
-            prev_val=val;
-            max_block_times.put(key, val);
-        }
-        log.debug("max_block_times: %s", max_block_times);
-        return this;
-    }
-
-    public String getMaxBlockTimes() {
-        if(max_block_times == null) return "n/a";
-        StringBuilder sb=new StringBuilder();
-        boolean first=true;
-        for(Map.Entry<Long,Long> entry: max_block_times.entrySet()) {
-            if(!first)
-                sb.append(", ");
-            else
-                first=false;
-            sb.append(entry.getKey()).append(":").append(entry.getValue());
-        }
-        return sb.toString();
-    }
-
-    public abstract int getNumberOfBlockings();
-
-    public abstract double getAverageTimeBlocked();
-
-    @ManagedAttribute(description="Number of credit requests received",type=AttributeType.SCALAR)
-    public int getNumberOfCreditRequestsReceived() {
-        return num_credit_requests_received;
-    }
-    
-    @ManagedAttribute(description="Number of credit requests sent",type=AttributeType.SCALAR)
-    public int getNumberOfCreditRequestsSent() {
-        return num_credit_requests_sent;
-    }
-
-    @ManagedAttribute(description="Number of credit responses received",type=AttributeType.SCALAR)
-    public int getNumberOfCreditResponsesReceived() {
-        return num_credit_responses_received;
-    }
-
-    @ManagedAttribute(description="Number of credit responses sent",type=AttributeType.SCALAR)
-    public int getNumberOfCreditResponsesSent() {
-        return num_credit_responses_sent;
-    }
-    
     public abstract String printSenderCredits();
 
     @ManagedOperation(description="Print receiver credits")
@@ -191,29 +136,17 @@ public abstract class FlowControl extends Protocol {
         return printMap(received);
     }
 
+    public long getReceiverCreditsFor(Address mbr) {
+        Credit credits=received.get(mbr);
+        return credits == null? 0 : credits.get();
+    }
 
     public String printCredits() {
         return String.format("receivers:\n%s", printMap(received));
     }
 
 
-    protected long getMaxBlockTime(long length) {
-        if(max_block_times == null)
-            return 0;
-        Long retval=null;
-        for(Map.Entry<Long,Long> entry: max_block_times.entrySet()) {
-            retval=entry.getValue();
-            if(length <= entry.getKey())
-                break;
-        }
-        return retval != null? retval : 0;
-    }
-
-
-    /**
-     * Whether the protocol handles message with dest == null || dest.isMulticastAddress()
-     * @return
-     */
+    /** Whether the protocol handles message with dest == null || dest.isMulticastAddress() */
     protected abstract boolean handleMulticastMessage();
 
     protected abstract void    handleCredit(Address sender, long increase);
@@ -231,8 +164,7 @@ public abstract class FlowControl extends Protocol {
         ;
     }
 
-    public void init() throws Exception {
-        boolean min_credits_set = min_credits != 0;
+    public void init() throws Exception {        boolean min_credits_set = min_credits != 0;
         if(!min_credits_set)
             min_credits=(long)(max_credits * min_threshold);
     }
@@ -242,10 +174,10 @@ public abstract class FlowControl extends Protocol {
         boolean is_udp_transport=getTransport().isMulticastCapable();
         if(is_udp_transport && frag_size <= 0)
             log.warn("No fragmentation protocol was found. When flow control is used, we recommend " +
-                       "a fragmentation protocol, due to http://jira.jboss.com/jira/browse/JGRP-590");
+                       "a fragmentation protocol, due to https://issues.redhat.com/browse/JGRP-590");
         if(frag_size > 0 && frag_size >= min_credits) {
             log.warn("The fragmentation size of the fragmentation protocol is %d, which is greater than min_credits (%d). " +
-                       "This can lead to blockings (https://issues.jboss.org/browse/JGRP-1659)", frag_size, min_credits);
+                       "This can lead to blockings (https://issues.redhat.com/browse/JGRP-1659)", frag_size, min_credits);
         }
         running=true;
     }
@@ -265,10 +197,6 @@ public abstract class FlowControl extends Protocol {
             case Event.VIEW_CHANGE:
                 handleViewChange(((View)evt.getArg()).getMembers());
                 break;
-
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                break;
         }
         return down_prot.down(evt); // this could potentially use the lower protocol's thread which may block
     }
@@ -279,9 +207,10 @@ public abstract class FlowControl extends Protocol {
             return down_prot.down(msg);
 
         Address dest=msg.getDest();
-        boolean multicast=dest == null;
+        boolean multicast=dest == null || dest.isMulticast();
         boolean handle_multicasts=handleMulticastMessage();
-        boolean process=(handle_multicasts && multicast) || (!handle_multicasts && !multicast);
+        boolean process=(multicast && handle_multicasts)
+          || (!multicast && !handle_multicasts && !(msg.isFlagSet(DONT_LOOPBACK) && Objects.equals(dest, local_addr)));
         if(!process)
             return down_prot.down(msg);
 
@@ -289,11 +218,11 @@ public abstract class FlowControl extends Protocol {
         if(length == 0)
             return down_prot.down(msg);
 
-        Object retval=handleDownMessage(msg);
+        Object retval=handleDownMessage(msg, length);
 
-        // if the message is DONT_LOOPBACK, we will not receive it, therefore the credit
-        // check needs to be done now
-        if(msg.isFlagSet(Message.TransientFlag.DONT_LOOPBACK)) {
+        // If the message is DONT_LOOPBACK, we will not receive it, therefore the credit check needs to be done now.
+        // This is only done for multicast messages (unicasts to self are discarded above)
+        if(multicast && msg.isFlagSet(DONT_LOOPBACK)) {
             long new_credits=adjustCredit(received, local_addr, length);
             if(new_credits > 0)
                 sendCredit(local_addr, new_credits);
@@ -364,8 +293,7 @@ public abstract class FlowControl extends Protocol {
 
     public void up(MessageBatch batch) {
         int length=0;
-        MessageIterator it=batch.iterator();
-        while(it.hasNext()) {
+        for(Iterator<Message> it=batch.iterator(); it.hasNext();) {
             Message msg=it.next();
             if(msg.isFlagSet(Message.Flag.NO_FC))
                 continue;
@@ -411,7 +339,7 @@ public abstract class FlowControl extends Protocol {
     }
 
     
-    protected abstract Object handleDownMessage(final Message msg);
+    protected abstract Object handleDownMessage(final Message msg, int length);
 
 
 
@@ -454,7 +382,7 @@ public abstract class FlowControl extends Protocol {
         if(log.isTraceEnabled())
             log.trace("sending %d credits to %s", credits, dest);
         Message msg=new LongMessage(dest, credits).putHeader(this.id,getReplenishHeader())
-          .setFlag(Message.Flag.OOB, Message.Flag.INTERNAL, Message.Flag.DONT_BUNDLE);
+          .setFlag(Message.Flag.OOB, Message.Flag.DONT_BUNDLE).setFlag(DONT_BLOCK);
         down_prot.down(msg);
         num_credit_responses_sent++;
     }
@@ -469,7 +397,7 @@ public abstract class FlowControl extends Protocol {
         if(log.isTraceEnabled())
             log.trace("sending request for %d credits to %s", credits_needed, dest);
         Message msg=new LongMessage(dest, credits_needed).putHeader(this.id, getCreditRequestHeader())
-          .setFlag(Message.Flag.OOB, Message.Flag.INTERNAL, Message.Flag.DONT_BUNDLE);
+          .setFlag(Message.Flag.OOB, Message.Flag.DONT_BUNDLE).setFlag(DONT_BLOCK);
         down_prot.down(msg);
         num_credit_requests_sent++;
     }
@@ -489,9 +417,8 @@ public abstract class FlowControl extends Protocol {
 
 
     protected static String printMap(Map<Address,? extends Credit> m) {
-        return m.entrySet().stream().collect(StringBuilder::new,
-                                             (sb,entry) -> sb.append(entry.getKey()).append(": ").append(entry.getValue()).append("\n"),
-                                             (l,r) -> {}).toString();
+        return m.entrySet().stream().map(e -> String.format("%s: %s", e.getKey(), e.getValue()))
+          .collect(Collectors.joining("\n"));
     }
 
 

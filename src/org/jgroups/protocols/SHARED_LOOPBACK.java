@@ -57,8 +57,8 @@ public class SHARED_LOOPBACK extends TP {
         return sb.toString();
     }
 
-
-    public void sendMulticast(byte[] data, int offset, int length) throws Exception {
+    @Override
+    public void sendToAll(byte[] data, int offset, int length) throws Exception {
         List<SHARED_LOOPBACK> targets;
         synchronized(routing_table) {
             Map<Address,SHARED_LOOPBACK> dests=routing_table.get(this.cluster_name);
@@ -75,16 +75,16 @@ public class SHARED_LOOPBACK extends TP {
                 target.receive(local_addr, data, offset, length);
             }
             catch(Throwable t) {
-                log.error(Util.getMessage("FailedSendingMessageTo") + target.localAddress(), t);
+                log.error(Util.getMessage("FailedSendingMessageTo") + target.getAddress(), t);
             }
         });
     }
 
     public void sendUnicast(PhysicalAddress dest, byte[] data, int offset, int length) throws Exception {
-        sendToSingleMember(dest, data, offset, length);
+        sendTo(dest, data, offset, length);
     }
 
-    protected void sendToSingleMember(Address dest, byte[] buf, int offset, int length) throws Exception {
+    protected void sendTo(Address dest, byte[] buf, int offset, int length) throws Exception {
         SHARED_LOOPBACK target;
         synchronized(routing_table) {
             Map<Address,SHARED_LOOPBACK> dests=routing_table.get(cluster_name);
@@ -138,15 +138,10 @@ public class SHARED_LOOPBACK extends TP {
         switch(evt.getType()) {
             case Event.CONNECT:
             case Event.CONNECT_WITH_STATE_TRANSFER:
-            case Event.CONNECT_USE_FLUSH:
-            case Event.CONNECT_WITH_STATE_TRANSFER_USE_FLUSH:
                 register(cluster_name, local_addr, this);
                 break;
             case Event.DISCONNECT:
                 unregister(cluster_name, local_addr);
-                break;
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
                 break;
             case Event.BECOME_SERVER: // called after client has joined and is fully working group member
                 is_server=true;
@@ -189,6 +184,20 @@ public class SHARED_LOOPBACK extends TP {
         unregister(cluster_name, local_addr);
     }
 
+    public static void clear(AsciiString cluster) {
+        if(cluster == null) {
+            synchronized(routing_table) {
+                routing_table.clear();
+            }
+            return;
+        }
+        Map<Address,SHARED_LOOPBACK> map=routing_table.get(cluster);
+        if(map != null) {
+            map.clear();
+            routing_table.remove(cluster);
+        }
+    }
+
     protected void handleViewChange(View v) {
         curr_view=v;
         is_coord=Objects.equals(local_addr, v.getCoord());
@@ -199,7 +208,7 @@ public class SHARED_LOOPBACK extends TP {
             Map<Address,SHARED_LOOPBACK> map=routing_table.computeIfAbsent(cluster, FUNC);
             if(map.isEmpty()) {
                 // the first member will become coord (may be changed by view changes/merges later)
-                // https://issues.jboss.org/browse/JGRP-2395
+                // https://issues.redhat.com/browse/JGRP-2395
                 shared_loopback.coord(true);
             }
             map.putIfAbsent(local_addr, shared_loopback);

@@ -1,13 +1,12 @@
 package org.jgroups.tests.rt.transports;
 
 import org.jgroups.Address;
-import org.jgroups.Global;
 import org.jgroups.blocks.cs.*;
 import org.jgroups.logging.Log;
 import org.jgroups.logging.LogFactory;
+import org.jgroups.tests.RoundTrip;
 import org.jgroups.tests.rt.RtReceiver;
 import org.jgroups.tests.rt.RtTransport;
-import org.jgroups.util.Bits;
 import org.jgroups.util.Util;
 
 import java.io.DataInput;
@@ -23,7 +22,8 @@ public class ServerTransport extends ReceiverAdapter implements RtTransport {
     protected RtReceiver   receiver;
     protected InetAddress  host;
     protected int          port=7800;
-    protected boolean      server, nio;
+    protected boolean      server, nio, tcp_nodelay;
+    protected int          out_buf_size=8192, in_buf_size=8192;
     protected final Log    log=LogFactory.getLog(ServerTransport.class);
 
 
@@ -31,7 +31,8 @@ public class ServerTransport extends ReceiverAdapter implements RtTransport {
     }
 
     public String[] options() {
-        return new String[]{"-host <host>", "-port <port>", "-server", "-nio"};
+        return new String[]{"-host <host>", "-port <port>", "-server", "-nio", "-tcp-nodelay <boolean>",
+          "-outbuf <size>", "-inbuf <size>"};
     }
 
     public void options(String... options) throws Exception {
@@ -52,6 +53,18 @@ public class ServerTransport extends ReceiverAdapter implements RtTransport {
             }
             if(options[i].equals("-nio")) {
                 nio=true;
+                continue;
+            }
+            if(options[i].equals("-tcp-nodelay")) {
+                tcp_nodelay=Boolean.parseBoolean(options[++i]);
+                continue;
+            }
+            if(options[i].equals("-outbuf")) {
+                out_buf_size=Integer.parseInt(options[++i]);
+                continue;
+            }
+            if(options[i].equals("-inbuf")) {
+                in_buf_size=Integer.parseInt(options[++i]);
             }
         }
         if(host == null)
@@ -74,17 +87,21 @@ public class ServerTransport extends ReceiverAdapter implements RtTransport {
     public void start(String ... options) throws Exception {
         options(options);
         if(server) {
-            srv=nio? new NioServer(host, port) : new TcpServer(host, port);
-            srv.connExpireTimeout(0);
-            srv.tcpNodelay(false);
-            srv.receiver(this);
+            srv=nio? new NioServer(host, port) : new TcpServer(host, port)
+              .connExpireTimeout(0)
+              .tcpNodelay(tcp_nodelay)
+              .receiver(this);
+            if(srv instanceof TcpBaseServer)
+                ((TcpBaseServer)srv).setBufferedOutputStreamSize(out_buf_size).setBufferedInputStreamSize(in_buf_size);
             srv.start();
             System.out.printf("server started on %s (ctrl-c to terminate)\n", srv.localAddress());
         }
         else {
-            srv=nio? new NioClient(null, 0, host, port) : new TcpClient(null, 0, host, port);
-            srv.tcpNodelay(false);
-            srv.receiver(this);
+            srv=nio? new NioClient(null, 0, host, port) : new TcpClient(null, 0, host, port)
+              .tcpNodelay(false)
+              .receiver(this);
+            if(srv instanceof TcpBaseServer)
+                ((TcpBaseServer)srv).setBufferedOutputStreamSize(out_buf_size).setBufferedInputStreamSize(in_buf_size);
             srv.start();
         }
     }
@@ -94,24 +111,19 @@ public class ServerTransport extends ReceiverAdapter implements RtTransport {
     }
 
     public void send(Object dest, byte[] buf, int offset, int length) throws Exception {
-        byte[] buffer=new byte[length+Global.INT_SIZE];
-        Bits.writeInt(length, buffer, 0);
-        System.arraycopy(buf, 0, buffer, Global.INT_SIZE, length);
-        srv.send((Address)dest, buffer, 0, buffer.length);
+        srv.send((Address)dest, buf, offset, buf.length);
     }
 
     public void receive(Address sender, byte[] buf, int offset, int length) {
         if(receiver != null) {
-            int len=Bits.readInt(buf, offset);
-            receiver.receive(sender, buf, offset+ Global.INT_SIZE, len);
+            receiver.receive(sender, buf, offset, length);
         }
     }
 
-    public void receive(Address sender, DataInput in) throws Exception {
+    public void receive(Address sender, DataInput in, int length) throws Exception {
         if(receiver == null)
             return;
-        int len=in.readInt();
-        byte[] buf=new byte[len];
+        byte[] buf=new byte[RoundTrip.PAYLOAD];
         in.readFully(buf);
         receiver.receive(sender, buf, 0, buf.length);
     }

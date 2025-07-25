@@ -1,0 +1,76 @@
+
+
+Latency versus throughput
+=========================
+Author: Bela Ban
+Date:   Feb 2023
+
+
+JGroups can be configured to reduce latency (e.g. for synchronous RPCs), or to provide high throughput (e.g. for
+asynchronous sending of messages). The default configuration is tuned for *high throughput*.
+
+Unfortunately, there is no middle ground configuration which provides both low latency *and* high throughput.
+
+The goal of this work is to come up with recommendations and sample configurations which provide *low latency*.
+This includes
+* Configuration changes
+* Code changes / additions (e.g. https://issues.redhat.com/browse/JGRP-2672)
+* Best practices for applications to help in the reduction of latency. E.g. OOB versus regular messages, batch
+  processing etc
+
+
+
+Components to look at
+---------------------
+
+* Bundler type (TransferQueue, NoBundler, PerDestinationBundler)
+  * Does the message submitted to the bundler cause the current thread to possibly send it? Or are messages added
+    to a queue from where a different thread sends it?
+
+* Thread pool enabled/disabled
+
+* JDK: virtual threads available?
+
+* Many threads sending messages / few threads sending messages?
+  * Oversubscription: more threads than cores? -> Virtual threads
+
+* OOB or regular messages (FIFO delivery per sender needed)?
+  * DONT_BUNDLE flag set?
+
+* Unicast or multicast messages?
+
+* Transport: TCP, TCP_NIO2 or UDP?
+
+* TCP: output/input stream buffering? (TCP.buffered_{output,input}_stream_size)
+
+* BATCH{2}: batching on the sender side (many small requests), with or without batching in the bundler
+
+
+
+Recommendations
+---------------
+
+* General
+  * Use a JDK >= 15. Changes to the networking code in 15 improved performance for TCP (and UDP datagram sockets)
+    a lot: http://belaban.blogspot.com/2020/07/double-your-performance-virtual-threads.html
+  * Use virtual threads (set use_virtual_threads=true in the transport). This reduces context switching when more
+    threads than cores are used.
+  * Remove TIME when up/down measurements are not needed anymore; every message sent/received requires a
+    System.nanoTime(), slowing things down a bit
+
+* TCP:
+  * Low latency:
+    * buffered_output_stream_size=0 (or a low value)
+    * bundler_type="no-bundler"
+      * Investigate: use "per-destination" bunder_type, but also use OOB|DONT_BUNDLE
+    * Disable thread pool when having only few senders
+  * High throughput: set buffered_output_stream to a high value (e.g. 65k)
+
+
+* UNICAST3
+  * ack_threshold: <investigate>
+
+Discussion
+----------
+
+* OOB versus regular messages on the receiver side

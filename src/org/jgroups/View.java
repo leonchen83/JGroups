@@ -213,7 +213,7 @@ public class View implements Comparable<View>, SizeStreamable, Iterable<Address>
 
     @Override
     public int serializedSize() {
-        return (int)(view_id.serializedSize() + Util.size(members));
+        return view_id.serializedSize() + Util.size(members);
     }
 
     /**
@@ -230,10 +230,11 @@ public class View implements Comparable<View>, SizeStreamable, Iterable<Address>
     }
 
     public static List<Address> newMembers(View old, View new_view) {
-        if(old == null || new_view == null)
+        if(new_view == null)
             return null;
         List<Address> retval=new ArrayList<>(new_view.getMembers());
-        retval.removeAll(old.getMembers());
+        if(old != null)
+            retval.removeAll(old.getMembers());
         return retval;
     }
 
@@ -329,7 +330,7 @@ public class View implements Comparable<View>, SizeStreamable, Iterable<Address>
     }
 
     public Iterator<Address> iterator() {
-        return new ArrayIterator(this.members);
+        return new ArrayIterator<>(this.members);
     }
 
 

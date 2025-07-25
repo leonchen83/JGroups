@@ -1,20 +1,27 @@
-
-
 package org.jgroups.tests;
 
-
-import org.jgroups.*;
+import org.jgroups.Global;
+import org.jgroups.JChannel;
+import org.jgroups.Message;
+import org.jgroups.Receiver;
+import org.jgroups.protocols.MPING;
 import org.jgroups.protocols.SHUFFLE;
+import org.jgroups.protocols.TP;
+import org.jgroups.protocols.UDP;
 import org.jgroups.protocols.pbcast.NAKACK2;
 import org.jgroups.stack.ProtocolStack;
+import org.jgroups.util.ResourceManager;
 import org.jgroups.util.Util;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
-import java.util.LinkedList;
+import java.net.InetAddress;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 
 
 /**
@@ -38,20 +45,15 @@ public class SequencerOrderTest {
 
     @BeforeMethod
     void setUp() throws Exception {
-        a=new JChannel(props).name("A");
-        a.connect(GROUP);
-        r1=new MyReceiver("A");
-        a.setReceiver(r1);
+        String mcast_addr=ResourceManager.getNextMulticastAddress();
+        a=create(props, "A", mcast_addr).connect(GROUP);
+        a.setReceiver(r1=new MyReceiver("A"));
 
-        b=new JChannel(props).name("B");
-        b.connect(GROUP);
-        r2=new MyReceiver("B");
-        b.setReceiver(r2);
+        b=create(props, "B", mcast_addr).connect(GROUP);
+        b.setReceiver(r2=new MyReceiver("B"));
 
-        c=new JChannel(props).name("C");
-        c.connect(GROUP);
-        r3=new MyReceiver("C");
-        c.setReceiver(r3);
+        c=create(props, "C", mcast_addr).connect(GROUP);
+        c.setReceiver(r3=new MyReceiver("C"));
 
         Util.waitUntilAllChannelsHaveSameView(10000, 1000, a, b, c);
 
@@ -74,15 +76,9 @@ public class SequencerOrderTest {
         for(Sender sender: senders)
             sender.start();
 
-        for(Sender sender: senders)
-            sender.join(60000);
-        System.out.println("Ok, senders have completed");
-
-        for(int i=0; i < 10; i++) {
-            if(r1.size() == EXPECTED_MSGS && r2.size() == EXPECTED_MSGS && r3.size() == EXPECTED_MSGS)
-                break;
-            Util.sleep(1000);
-        }
+        stopShuffling(2000);
+        Util.waitUntilTrue(10_000, 100,
+                           () -> Stream.of(r1, r2, r3).allMatch(r -> r.size() == EXPECTED_MSGS));
 
         final List<String> l1=r1.getMsgs();
         final List<String> l2=r2.getMsgs();
@@ -93,15 +89,33 @@ public class SequencerOrderTest {
         verifySameOrder(EXPECTED_MSGS, l1, l2, l3);
     }
 
+    protected void stopShuffling(long time_to_wait_before_stopping) {
+        for(JChannel ch: List.of(a,b,c)) {
+            final SHUFFLE shuffle=ch.getProtocolStack().findProtocol(SHUFFLE.class);
+            CompletableFuture.runAsync(() -> {
+                Util.sleep(time_to_wait_before_stopping);
+                System.out.printf("-- stopping shuffling in %s\n", ch.getAddress());
+                shuffle.flush(true); // stops and disables shuffling
+            });
+        }
+    }
+
+    protected static JChannel create(String props, String name, String mcast_addr) throws Exception {
+        JChannel ch=new JChannel(props).name(name);
+        TP tp=ch.getProtocolStack().getTransport();
+        if(tp instanceof UDP)
+            ((UDP)tp).setMulticastAddress(InetAddress.getByName(mcast_addr));
+        MPING mping=ch.getProtocolStack().findProtocol(MPING.class);
+        if(mping != null)
+            mping.setMulticastAddress(mcast_addr);
+        return ch;
+    }
+
     protected static void insertShuffle(JChannel... channels) throws Exception {
         for(JChannel ch: channels) {
-            SHUFFLE shuffle=new SHUFFLE();
-            shuffle.setDown(false);
-            shuffle.setUp(true);
-            shuffle.setMaxSize(10);
-            shuffle.setMaxTime(1000);
+            SHUFFLE shuffle=new SHUFFLE().setDown(false).setUp(true).setMaxSize(10).setMaxTime(1000);
             ch.getProtocolStack().insertProtocol(shuffle, ProtocolStack.Position.BELOW, NAKACK2.class);
-            shuffle.init(); // starts the timer
+            shuffle.init();
             shuffle.start();
         }
     }
@@ -183,8 +197,9 @@ public class SequencerOrderTest {
     }
 
     private static class MyReceiver implements Receiver {
+        @SuppressWarnings("unused")
         final String name;
-        final List<String> msgs=new LinkedList<>();
+        final List<String> msgs=new ArrayList<>();
 
         private MyReceiver(String name) {
             this.name=name;

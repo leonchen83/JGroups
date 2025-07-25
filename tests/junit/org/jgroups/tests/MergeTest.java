@@ -1,9 +1,7 @@
 package org.jgroups.tests;
 
 import org.jgroups.*;
-import org.jgroups.protocols.DISCARD;
-import org.jgroups.protocols.MERGE3;
-import org.jgroups.protocols.TP;
+import org.jgroups.protocols.*;
 import org.jgroups.protocols.pbcast.GMS;
 import org.jgroups.protocols.pbcast.NAKACK2;
 import org.jgroups.stack.ProtocolStack;
@@ -11,9 +9,7 @@ import org.jgroups.util.Util;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.Test;
 
-import java.util.Collection;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -27,13 +23,7 @@ public class MergeTest extends ChannelTestBase {
 
     @AfterMethod protected void destroy() {
         level("warn", channels);
-        for(JChannel ch: channels)
-            try {
-                Util.shutdown(ch);
-            }
-            catch(Exception e) {
-                e.printStackTrace();
-            }
+        Util.close(channels);
     }
    
     public void testMerging2Members() throws Exception {
@@ -59,14 +49,14 @@ public class MergeTest extends ChannelTestBase {
 
         Address merge_leader=determineLeader(channels, members);
         System.out.println("\n==== injecting merge event into merge leader : " + merge_leader + " ====");
-        for(JChannel ch: channels)
-            ch.getProtocolStack().removeProtocol(DISCARD.class);
         injectMergeEvent(channels, merge_leader, members);
         for(int i=0; i < 40; i++) {
             System.out.print(".");
             if(allChannelsHaveViewOf(channels, members.length))
                 break;
             Util.sleep(1000);
+            if(i > 0 && i % 10 == 0)
+                injectMergeEvent(channels, merge_leader, members);
         }
         System.out.println("\n");
         print(channels);
@@ -87,11 +77,11 @@ public class MergeTest extends ChannelTestBase {
         for(int i=0; i < retval.length; i++) {
             JChannel tmp;
             if(ch == null) {
-                ch=createChannel(true, members.length);
+                ch=createChannel();
                 tmp=ch;
             }
             else {
-                tmp=createChannel(ch);
+                tmp=createChannel();
             }
             tmp.setName(members[i]);
             ProtocolStack stack=tmp.getProtocolStack();
@@ -102,15 +92,17 @@ public class MergeTest extends ChannelTestBase {
 
             stack.removeProtocol(MERGE3.class);
 
-            tmp.connect(cluster_name);
+            FD_SOCK2 fd_sock=stack.findProtocol(FD_SOCK2.class);
+            if(fd_sock != null)
+                fd_sock.setPortRange(5);
+
+            // tmp.connect(cluster_name);
             retval[i]=tmp;
         }
-
+        makeUnique(retval);
+        for(JChannel c: retval)
+            c.connect(cluster_name);
         return retval;
-    }
-
-    private static void close(JChannel[] channels) {
-        Util.close(channels);
     }
 
 
@@ -121,22 +113,10 @@ public class MergeTest extends ChannelTestBase {
         view_id++;
 
         for(JChannel ch: channels) {
-            DISCARD discard=new DISCARD();
-            discard.discardAll(true);
-            ch.getProtocolStack().insertProtocol(discard, ProtocolStack.Position.ABOVE,TP.class);
-        }
-
-        for(JChannel ch: channels) {
             View view=View.create(ch.getAddress(), view_id, ch.getAddress());
             GMS gms=ch.getProtocolStack().findProtocol(GMS.class);
             gms.installView(view);
         }
-    }
-
-
-    private static void injectMergeEvent(JChannel[] channels, String leader, String ... coordinators) {
-        Address leader_addr=leader != null? findAddress(leader, channels) : determineLeader(channels);
-        injectMergeEvent(channels, leader_addr, coordinators);
     }
 
     private static void injectMergeEvent(JChannel[] channels, Address leader_addr, String ... coordinators) {
@@ -197,20 +177,6 @@ public class MergeTest extends ChannelTestBase {
          }
          return null;
      }
-
-     private static void applyViews(List<View> views, JChannel[] channels) {
-         for(View view: views) {
-             Collection<Address> members=view.getMembers();
-             for(JChannel ch: channels) {
-                 Address addr=ch.getAddress();
-                 if(members.contains(addr)) {
-                     GMS gms=ch.getProtocolStack().findProtocol(GMS.class);
-                     gms.installView(view);
-                 }
-             }
-         }
-     }
-    
 
     private static void print(JChannel[] channels) {
         for(JChannel ch: channels) {

@@ -1,0 +1,26 @@
+<config xmlns="urn:org:jgroups" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="urn:org:jgroups http://www.jgroups.org/schema/jgroups.xsd">
+    <include file="${transport-config:udp-default.xml}" />
+    <PING />
+    <MERGE3 />
+    <FD_SOCK/>
+    <FD_ALL/>
+    <VERIFY_SUSPECT timeout="1.5s"  />
+    <pbcast.NAKACK2 xmit_interval="0.5s"/>
+    <UNICAST3 xmit_interval="0.5s"/>
+    <pbcast.STABLE />
+    <pbcast.GMS print_local_addr="true" join_timeout="1000"/>
+    <UFC />
+    <MFC />
+    <FRAG2 frag_size="60K" />
+    <FORK>
+        <fork-stacks xmlns="fork" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                     xsi:schemaLocation="fork fork-stacks-4.2.xsd">
+            <fork-stack id="lock">
+                <config>
+                    <STATS/>
+                </config>
+            </fork-stack>
+        </fork-stacks>
+    </FORK>
+</config>

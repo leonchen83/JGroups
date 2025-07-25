@@ -113,7 +113,7 @@ public class AckCollectorTest {
         }).start();
         try {
             ac.waitForAllAcks(30000);
-            assert true : "we should not get a timeout exception here";
+            // "we should not get a timeout exception here";
         }
         catch(TimeoutException e) {
             assert false : "we should not get a timeout exception here";
@@ -223,6 +223,21 @@ public class AckCollectorTest {
         System.out.println("ac = " + ac);
         assert ac.size() == 0;
         assert ac.waitForAllAcks();
+    }
+
+    public void testSuspect2() throws TimeoutException {
+        final AckCollector ac=new AckCollector(list);
+        Stream.of(one,two,three).forEach(ac::ack);
+
+        new Thread(() -> {
+            Util.sleep(1000);
+            ac.suspect(List.of(four,five));
+        }).start();
+        long start=System.currentTimeMillis();
+        boolean rc=ac.waitForAllAcks(10000);
+        long time=System.currentTimeMillis()-start;
+        System.out.printf("waited for %d ms\n", time);
+        assert rc;
     }
 
     public void testRetainAll() throws TimeoutException {

@@ -12,13 +12,21 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
+import java.util.stream.Stream;
+
+import static org.jgroups.Message.Flag.*;
+import static org.jgroups.Message.TransientFlag.DONT_BLOCK;
+import static org.jgroups.Message.TransientFlag.DONT_LOOPBACK;
+import static org.jgroups.conf.AttributeType.SCALAR;
 
 
 /**
@@ -26,15 +34,11 @@ import java.util.function.Supplier;
  * the stack when this is the case. This allows NAKACK{2,3} to garbage collect messages that have been seen by all members.
  * <p>
  * Works as follows: periodically (desired_avg_gossip) or when having received a number of bytes (max_bytes), every
- * member sends its digest (highest seqno delivered, received) to the cluster (send_stable_msgs_to_coord_only=false)
- * or the current coordinator (send_stable_msgs_to_coord_only=true).<p/>
- * The recipient updates a stability vector, which maintains the highest seqno delivered/receive for each member
- * and initially contains no data, when such a message is received. <p/>
+ * member sends its digest (highest seqno delivered, received) to the current coordinator<br/>
+ * The coordinator updates a stability vector, which maintains the highest seqno delivered/receive for each member
+ * and initially contains no data, when such a message is received. <br/>
  * When messages from all members have been received, a stability message is mcast, which causes all
  * members to send a STABLE event down the stack (triggering garbage collection in the NAKACK{2,3} layer).
- * <p>
- * When send_stable_msgs_to_coord_only is true, far fewer messages are exchanged, as members don't multicast
- * STABLE messages, but instead send them only to the coordinator.
  * @author Bela Ban
  */
 @MBean(description="Computes the broadcast messages that are stable")
@@ -50,43 +54,28 @@ public class STABLE extends Protocol {
     protected long   desired_avg_gossip=20000;
 
     /**
-     * delay before we send STABILITY msg (give others a change to send first).
-     * This should be set to a very small number (> 0 !) if {@code max_bytes} is used
+     * Total amount of bytes from incoming messages (default = 0 = disabled). When exceeded, a STABLE message will
+     * be broadcast and{@code num_bytes_received} reset to 0 . If this is > 0, then ideally {@code stability_delay}
+     * should be set to a low number as well
      */
-    @Property(description="Delay before stability message is sent",type=AttributeType.TIME)
-    protected long   stability_delay=6000;
-
-    /**
-     * Total amount of bytes from incoming messages (default = 0 = disabled).
-     * When exceeded, a STABLE message will be broadcast and
-     * {@code num_bytes_received} reset to 0 . If this is > 0, then
-     * ideally {@code stability_delay} should be set to a low number as
-     * well
-     */
-    @Property(description="Maximum number of bytes received in all messages before sending a STABLE message is triggered",
+    @Property(description="Maximum number of bytes received in all messages before sending a STABLE message",
       type=AttributeType.BYTES)
     protected long   max_bytes=2000000;
 
 
-    @Property(description="Wether or not to send the STABLE messages to all members of the cluster, or to the " +
-      "current coordinator only. The latter reduces the number of STABLE messages, but also generates more work " +
-      "on the coordinator")
-    protected boolean send_stable_msgs_to_coord_only=true;
-
-    
     /* --------------------------------------------- JMX  ---------------------------------------------- */
-
-    protected int    num_stable_msgs_sent;
-    protected int    num_stable_msgs_received;
-    protected int    num_stability_msgs_sent;
-    protected int    num_stability_msgs_received;
+    @ManagedAttribute(description="Number of stable messages sent",type= SCALAR)
+    protected final LongAdder num_stable_msgs_sent=new LongAdder();
+    @ManagedAttribute(description="Number of stable messages received",type= SCALAR)
+    protected final LongAdder num_stable_msgs_received=new LongAdder();
+    @ManagedAttribute(description="Number of stability messages sent",type= SCALAR)
+    protected final LongAdder num_stability_msgs_sent=new LongAdder();
+    @ManagedAttribute(description="Number of stability messages received",type= SCALAR)
+    protected final LongAdder num_stability_msgs_received=new LongAdder();
 
     
     /* --------------------------------------------- Fields ------------------------------------------------------ */
-
-    
-    protected Address             local_addr;
-    protected volatile View       view;
+    protected volatile View          view;
 
     @GuardedBy("lock")
     protected volatile MutableDigest digest; // keeps track of the highest seqnos from all members
@@ -99,10 +88,6 @@ public class STABLE extends Protocol {
     protected FixedSizeBitSet     votes;
 
     protected final Lock          lock=new ReentrantLock();
-
-    @GuardedBy("stability_lock")
-    protected Future<?>           stability_task_future;
-    protected final Lock          stability_lock=new ReentrantLock(); // to synchronize on stability_task
 
     @GuardedBy("stable_task_lock")
     protected Future<?>           stable_task_future; // bcasts periodic STABLE message (added to timer below)
@@ -121,13 +106,14 @@ public class STABLE extends Protocol {
      * When true, don't take part in garbage collection: neither send STABLE messages nor handle STABILITY messages
      */
     @ManagedAttribute
-    protected volatile boolean    suspended=false;
+    protected volatile boolean    suspended;
 
-    protected boolean             initialized=false;
+    protected boolean             initialized;
 
     protected Future<?>           resume_task_future;
     protected final Object        resume_task_mutex=new Object();
 
+    @ManagedAttribute(description="The coordinator")
     protected volatile Address    coordinator;
 
     
@@ -139,19 +125,20 @@ public class STABLE extends Protocol {
     public STABLE setDesiredAverageGossip(long g) {desired_avg_gossip=g; return this;}
     public long   getMaxBytes()                   {return max_bytes;}
     public STABLE setMaxBytes(long m)             {this.max_bytes=m; return this;}
-    public long   getStabilityDelay()             {return stability_delay;}
-    public STABLE setStabilityDelay(long d)       {stability_delay=d; return this;}
 
     // @ManagedAttribute(name="bytes_received")
     public long getBytes() {return num_bytes_received;}
-    @ManagedAttribute(type=AttributeType.SCALAR)
-    public int getStableSent() {return num_stable_msgs_sent;}
-    @ManagedAttribute(type=AttributeType.SCALAR)
-    public int getStableReceived() {return num_stable_msgs_received;}
-    @ManagedAttribute(type=AttributeType.SCALAR)
-    public int getStabilitySent() {return num_stability_msgs_sent;}
-    @ManagedAttribute(type=AttributeType.SCALAR)
-    public int getStabilityReceived() {return num_stability_msgs_received;}
+    @ManagedAttribute(description="The number of votes for the current digest",type=SCALAR)
+    public int getNumVotes() {return votes != null? votes.cardinality() : 0;}
+
+    @ManagedAttribute(type=SCALAR)
+    public long getStableReceived() {return num_stable_msgs_received.sum();}
+    @ManagedAttribute(type=SCALAR)
+    public long getStableSent() {return num_stable_msgs_sent.sum();}
+    @ManagedAttribute(type=SCALAR)
+    public long getStabilityReceived() {return num_stability_msgs_received.sum();}
+    @ManagedAttribute(type=SCALAR)
+    public long getStabilitySent() {return num_stability_msgs_received.sum();}
 
     @ManagedAttribute
     public boolean getStableTaskRunning() {
@@ -164,9 +151,27 @@ public class STABLE extends Protocol {
         }
     }
 
+
+    @ManagedOperation(description="Sends a STABLE message; when every member has received a STABLE message " +
+      "from everybody else, a STABILITY message will be sent")
+    public void gc() {
+        sendStableMessage(false);
+    }
+
+    @ManagedOperation(description="Prints the current digest")
+    public String printDigest() {
+        return printDigest(digest);
+    }
+
+    @ManagedOperation(description="Prints the current votes")
+    public String printVotes() {
+        return votes != null? votes.toString() : "n/a";
+    }
+
     public void resetStats() {
         super.resetStats();
-        num_stability_msgs_received=num_stability_msgs_sent=num_stable_msgs_sent=num_stable_msgs_received=0;
+        Stream.of(num_stability_msgs_received,num_stability_msgs_sent,num_stable_msgs_sent,num_stable_msgs_received)
+          .forEach(LongAdder::reset);
     }
 
 
@@ -177,7 +182,7 @@ public class STABLE extends Protocol {
     protected void suspend(long timeout) {
         if(!suspended) {
             suspended=true;
-            log.debug("suspending message garbage collection");
+            log.debug("%s: suspending message garbage collection", local_addr);
         }
         startResumeTask(timeout); // will not start task if already running
     }
@@ -192,7 +197,7 @@ public class STABLE extends Protocol {
             lock.unlock();
         }
 
-        log.debug("resuming message garbage collection");
+        log.debug("%s: resuming message garbage collection", local_addr);
         stopResumeTask();
     }
     
@@ -206,10 +211,6 @@ public class STABLE extends Protocol {
             throw new Exception("timer cannot be retrieved");
         if(desired_avg_gossip > 0)
             startStableTask();
-
-        // we're the only one who sends out STABILITY messages; no need to wait for others to send it (as they won't)
-        if(send_stable_msgs_to_coord_only)
-            stability_delay=0;
     }
 
     public void stop() {
@@ -233,87 +234,34 @@ public class STABLE extends Protocol {
             handleRegularMessage(msg);
             return up_prot.up(msg);
         }
-
-        handleUpEvent(hdr, msg.getSrc(), msg.getObject());
-        return null;  // don't pass STABLE or STABILITY messages up the stack
+        return handle(hdr, msg.getSrc(), msg.getObject()); // don't pass STABLE or STABILITY messages up the stack
     }
-
-    protected void handleUpEvent(StableHeader hdr, Address sender, Digest digest) {
-        switch(hdr.type) {
-            case StableHeader.STABLE_GOSSIP:
-                handleStableMessage(digest, sender, hdr.view_id);
-                break;
-            case StableHeader.STABILITY:
-                handleStabilityMessage(digest, sender, hdr.view_id);
-                break;
-            default:
-                log.error("%s: StableHeader type %s not known", local_addr, hdr.type);
-        }
-    }
-
 
     public void up(MessageBatch batch) {
         StableHeader hdr;
-        MessageIterator it=batch.iterator();
-        while(it.hasNext()) { // remove and handle messages with flow control headers (STABLE_GOSSIP, STABILITY)
+        for(Iterator<Message> it=batch.iterator(); it.hasNext();) { // remove / handle msgs with headers STABLE_GOSSIP, STABILITY
             Message msg=it.next();
             if((hdr=msg.getHeader(id)) != null) {
                 it.remove();
-                handleUpEvent(hdr, batch.sender(), msg.getObject());
+                handle(hdr, batch.sender(), msg.getObject());
             }
         }
 
-        // only if message counting is on, and only for multicast messages (http://jira.jboss.com/jira/browse/JGRP-233)
-        if(max_bytes > 0 && batch.dest() == null && !batch.isEmpty()) {
-            boolean send_stable_msg=false;
-            received.lock();
-            try {
-                num_bytes_received+=batch.length();
-                if(num_bytes_received >= max_bytes) {
-                    log.trace("max_bytes has been reached (%s, bytes received=%s): triggers stable msg",
-                              max_bytes, num_bytes_received);
-                    num_bytes_received=0;
-                    send_stable_msg=true;
-                }
-            }
-            finally {
-                received.unlock();
-            }
-
-            if(send_stable_msg)
-                sendStableMessage(true);
-        }
+        // only if message counting is on, and only for multicast messages (https://issues.redhat.com/browse/JGRP-233)
+        if(max_bytes > 0 && batch.dest() == null && !batch.isEmpty() && maxBytesExceeded(batch.length()))
+            sendStableMessage(true);
 
         if(!batch.isEmpty())
             up_prot.up(batch);
     }
 
-
-    protected void handleRegularMessage(Message msg) {
-        // only if bytes counting is enabled, and only for multicast messages (http://jira.jboss.com/jira/browse/JGRP-233)
-        if(max_bytes <= 0)
-            return;
-        if(msg.getDest() == null) {
-            boolean send_stable_msg=false;
-            received.lock();
-            try {
-                num_bytes_received+=msg.getLength();
-                if(num_bytes_received >= max_bytes) {
-                    log.trace("max_bytes has been reached (%s, bytes received=%s): triggers stable msg",
-                              max_bytes, num_bytes_received);
-                    num_bytes_received=0;
-                    send_stable_msg=true;
-                }
-            }
-            finally {
-                received.unlock();
-            }
-
-            if(send_stable_msg)
-                sendStableMessage(true);
-        }
+    public Object down(Message msg) {
+        boolean send_stable_msg=max_bytes > 0 && msg.getDest() == null && msg.isFlagSet(DONT_LOOPBACK) && maxBytesExceeded(msg.getLength());
+        Object retval=down_prot.down(msg);
+        if(send_stable_msg)
+            sendStableMessage(true);
+        return retval;
     }
-
 
     public Object down(Event evt) {
         switch(evt.getType()) {
@@ -333,23 +281,47 @@ public class STABLE extends Protocol {
             case Event.RESUME_STABLE:
                 resume();
                 break;
-
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                break;
         }
         return down_prot.down(evt);
     }
 
 
-    @ManagedOperation(description="Sends a STABLE message; when every member has received a STABLE message " +
-      "from everybody else, a STABILITY message will be sent")
-    public void gc() {
-        sendStableMessage(false);
+    protected Object handle(StableHeader hdr, Address sender, Digest digest) {
+        switch(hdr.type) {
+            case StableHeader.STABLE_GOSSIP:
+                handleStableMessage(digest, sender, hdr.view_id);
+                break;
+            case StableHeader.STABILITY:
+                handleStabilityMessage(digest, sender, hdr.view_id);
+                break;
+            default:
+                log.error("%s: StableHeader type %s not known", local_addr, hdr.type);
+        }
+        return null;
     }
 
+    protected void handleRegularMessage(Message msg) {
+        // only if bytes counting is enabled, and only for multicast messages (https://issues.redhat.com/browse/JGRP-233)
+        if(max_bytes > 0 && msg.getDest() == null &&  maxBytesExceeded(msg.getLength()))
+            sendStableMessage(true);
+    }
 
-    /* --------------------------------------- Private Methods ---------------------------------------- */
+    protected boolean maxBytesExceeded(int len) {
+        received.lock();
+        try {
+            num_bytes_received+=len;
+            if(num_bytes_received >= max_bytes) {
+                log.trace("%s: max_bytes (%d) has been exceeded; bytes received=%d: triggers stable msg",
+                          local_addr, max_bytes, num_bytes_received);
+                num_bytes_received=0;
+                return true;
+            }
+            return false;
+        }
+        finally {
+            received.unlock();
+        }
+    }
 
 
     protected void handleViewChange(View v) {
@@ -368,7 +340,6 @@ public class STABLE extends Protocol {
 
 
 
-
     /** Update my own digest from a digest received by somebody else. Returns whether the update was successful.
      *  Needs to be called with a lock on digest */
     @GuardedBy("lock")
@@ -376,7 +347,7 @@ public class STABLE extends Protocol {
         StringBuilder sb=null;
         if(log.isTraceEnabled())
             sb=new StringBuilder().append(local_addr).append(": handling digest from ").append(sender).append(":\nmine:   ")
-              .append(printDigest(digest)).append("\nother:  ").append(printDigest(d));
+              .append(printDigest(digest)).append("\nsender: ").append(printDigest(d));
 
         for(Digest.Entry entry: d) {
             Address mbr=entry.getMember();
@@ -480,7 +451,6 @@ public class STABLE extends Protocol {
                 log.debug("%s: resume task started, max_suspend_time=%d", local_addr, max_suspend_time);
             }
         }
-
     }
 
 
@@ -490,35 +460,6 @@ public class STABLE extends Protocol {
                 resume_task_future.cancel(false);
                 resume_task_future=null;
             }
-        }
-    }
-
-
-    protected void startStabilityTask(Digest d, ViewId view_id, long delay) {
-        stability_lock.lock();
-        try {
-            if(stability_task_future == null || stability_task_future.isDone()) {
-                StabilitySendTask stability_task=new StabilitySendTask(d, view_id); // runs only once
-                stability_task_future=timer.schedule(stability_task, delay, TimeUnit.MILLISECONDS,
-                                                     getTransport() instanceof TCP);
-            }
-        }
-        finally {
-            stability_lock.unlock();
-        }
-    }
-
-
-    protected void stopStabilityTask() {
-        stability_lock.lock();
-        try {
-            if(stability_task_future != null) {
-                stability_task_future.cancel(false);
-                stability_task_future=null;
-            }
-        }
-        finally {
-            stability_lock.unlock();
         }
     }
 
@@ -556,7 +497,7 @@ public class STABLE extends Protocol {
             int rank=getRank(sender, view);
             if(rank < 0 || votes.get(rank))  // already received gossip from sender; discard it
                 return;
-            num_stable_msgs_received++;
+            num_stable_msgs_received.increment();
             updateLocalDigest(d, sender);
             if(addVote(rank)) {       // votes from all members have been received
                 stable_digest=digest; // no need to copy, as digest (although mutable) is reassigned below
@@ -597,19 +538,10 @@ public class STABLE extends Protocol {
             if(log.isErrorEnabled()) log.error(Util.getMessage("StabilityDigestIsNull"));
             return;
         }
-
         if(!initialized || suspended) {
             log.trace("%s: STABLE message is ignored: initialized=%b, suspended=%b", local_addr, initialized, suspended);
             return;
         }
-
-        // received my own STABILITY message - no need to handle it as I already reset my digest before I sent the msg
-        if(Objects.equals(local_addr, sender)) {
-            num_stability_msgs_received++;
-            return;
-        }
-
-        stopStabilityTask();
 
         lock.lock();
         try {
@@ -618,12 +550,10 @@ public class STABLE extends Protocol {
             if(!view_id.equals(this.view.getViewId())) {
                 log.trace("%s: discarded STABILITY message with different view-id %s (my view-id=%s)",
                           local_addr, view_id, view);
-                // resetDigest();
                 return;
             }
             log.trace("%s: received stability msg from %s: %s", local_addr, sender, printDigest(stable_digest));
-
-            num_stability_msgs_received++;
+            num_stability_msgs_received.increment();
             resetDigest();
         }
         finally {
@@ -641,37 +571,46 @@ public class STABLE extends Protocol {
     protected void sendStableMessage(boolean send_in_background) {
         if(suspended || view == null)
             return;
+        View          current_view=view;
+        Address       dest=coordinator;
+        boolean       is_coord=Objects.equals(local_addr, coordinator);
+        MutableDigest d=new MutableDigest(current_view.getMembersRaw()).set(getDigest());
+        boolean       all_set=d.allSet() || d.set(getDigest()).allSet();
 
-        final View          current_view=view;
-        final MutableDigest d=new MutableDigest(current_view.getMembersRaw()).set(getDigest());
-        Address dest=send_stable_msgs_to_coord_only? coordinator : null;
-
-        if(d.allSet() || d.set(getDigest()).allSet()) // try once more if the first digest didn't match
-            log.trace("%s: sending stable msg to %s: %s",
-                      local_addr, (send_stable_msgs_to_coord_only? coordinator : "cluster"), printDigest(d));
-        else {
-            log.trace("%s: could not find matching digest for view %s, missing members: %s", local_addr, current_view, d.getNonSetMembers());
+        if(!all_set) {
+            log.trace("%s: could not find matching digest for view %s, missing members: %s",
+                      local_addr, current_view, d.getNonSetMembers());
             return;
         }
-
-        final Message msg=new ObjectMessage(dest, d)
-          .setFlag(Message.Flag.OOB, Message.Flag.INTERNAL, Message.Flag.NO_RELIABILITY)
+        // don't send a STABLE message to self when coord, but instead update the digest directly
+        if(is_coord) {
+            log.trace("%s: updating the local digest with a stable message (coordinator): %s", local_addr, d);
+            num_stable_msgs_sent.increment();
+            handleStableMessage(d, local_addr, current_view.getViewId());
+            return;
+        }
+        log.trace("%s: sending stable msg to %s: %s", local_addr, dest, printDigest(d));
+        final ObjectMessage msg=new ObjectMessage(dest, d);
+        msg.setFlag(OOB, NO_RELIABILITY, NO_FC)
           .putHeader(this.id, new StableHeader(StableHeader.STABLE_GOSSIP, current_view.getViewId()));
         try {
             if(!send_in_background) {
-                num_stable_msgs_sent++;
+                num_stable_msgs_sent.increment();
                 down_prot.down(msg);
                 return;
             }
             Runnable r=new Runnable() {
                 public void run() {
                     down_prot.down(msg);
-                    num_stable_msgs_sent++;
+                    num_stable_msgs_sent.increment();
                 }
-                public String toString() {return STABLE.class.getSimpleName() + ": STABLE-GOSSIP";}
+
+                public String toString() {
+                    return STABLE.class.getSimpleName() + ": STABLE-GOSSIP";
+                }
             };
 
-            // Run in a separate thread so we don't potentially block (http://jira.jboss.com/jira/browse/JGRP-532)
+            // Run in a separate thread so we don't potentially block (https://issues.redhat.com/browse/JGRP-532)
             timer.execute(r, getTransport() instanceof TCP);
         }
         catch(Throwable t) {
@@ -680,63 +619,30 @@ public class STABLE extends Protocol {
     }
 
 
-   /* public static ByteArray marshal(Digest digest) {
-        try {
-            return Util.streamableToBuffer(digest);
-        }
-        catch(Exception e) {
-            return null;
-        }
-    }
-
-    protected Digest readDigest(byte[] buffer, int offset, int length) {
-        try {
-            return buffer != null? Util.streamableFromBuffer(Digest::new, buffer, offset, length) : null;
-        }
-        catch(Exception ex) {
-            log.error("%s: failed reading Digest from message: %s", local_addr, ex);
-            return null;
-        }
-    }*/
-
 
     /**
-     Schedules a stability message to be mcast after a random number of milliseconds (range [1-stability_delay] secs).
-     The reason for waiting a random amount of time is that, in the worst case, all members receive a
-     STABLE_GOSSIP message from the last outstanding member at the same time and would therefore mcast the
-     STABILITY message at the same time too. To avoid this, each member waits random N msecs. If, before N
-     elapses, some other member sent the STABILITY message, we just cancel our own message. If, during
-     waiting for N msecs to send STABILITY message S1, another STABILITY message S2 is to be sent, we just discard S2.
-     @param tmp A copy of the stability digest, so we don't need to copy it again
+     Sends a stability message to all members except self.
+     @param d A copy of the stability digest, so we don't need to copy it again
      */
-    protected void sendStabilityMessage(Digest tmp, final ViewId view_id) {
-        if(send_stable_msgs_to_coord_only || stability_delay <= 1)
-            _sendStabilityMessage(tmp, view_id);
-        else {
-            // give other members a chance to mcast STABILITY message. if we receive STABILITY by the end of our random
-            // sleep, we will not send the STABILITY msg. this prevents that all mbrs mcast a STABILITY msg at the same time
-            startStabilityTask(tmp, view_id, Util.random(stability_delay));
-        }
-    }
-
-    protected void _sendStabilityMessage(Digest stability_digest, final ViewId view_id) {
+    protected void sendStabilityMessage(Digest d, final ViewId view_id) {
         if(suspended) {
-            log.debug("STABILITY message will not be sent as suspended=%b", suspended);
+            log.debug("%s: STABILITY message will not be sent as suspended=%b", local_addr, suspended);
             return;
         }
 
-        // https://issues.jboss.org/browse/JGRP-1638: we reverted to sending the STABILITY message *unreliably*,
+        // https://issues.redhat.com/browse/JGRP-1638: we reverted to sending the STABILITY message *unreliably*,
         // but clear votes *before* sending it
         try {
-            Message msg=new ObjectMessage(null, stability_digest)
-              .setFlag(Message.Flag.OOB, Message.Flag.INTERNAL, Message.Flag.NO_RELIABILITY)
+            Message msg=new ObjectMessage(null, d)
+              .setFlag(OOB, NO_RELIABILITY, NO_RELAY, NO_FC).setFlag(DONT_LOOPBACK,DONT_BLOCK)
               .putHeader(id, new StableHeader(StableHeader.STABILITY, view_id));
-            log.trace("%s: sending stability msg %s", local_addr, printDigest(stability_digest));
-            num_stability_msgs_sent++;
+            log.trace("%s: sending stability msg %s", local_addr, printDigest(d));
+            num_stability_msgs_sent.increment();
+            num_stability_msgs_received.increment(); // since we don't receive this message
             down_prot.down(msg);
         }
         catch(Exception e) {
-            log.warn("failed sending STABILITY message", e);
+            log.warn("%s: failed sending STABILITY message: %s", local_addr, e);
         }
     }
 
@@ -839,31 +745,11 @@ public class STABLE extends Protocol {
 
 
 
-
-    /** Multicasts a STABILITY message */
-    protected class StabilitySendTask implements Runnable {
-        protected final Digest stability_digest;
-        protected final ViewId view_id; // ViewId at the time the STABILITY message was created
-
-
-        protected StabilitySendTask(Digest d, ViewId view_id) {
-            this.stability_digest=d;
-            this.view_id=view_id;
-        }
-
-        public void run() {
-            _sendStabilityMessage(stability_digest, view_id);
-        }
-
-        public String toString() {return STABLE.class.getSimpleName() + ": StabilityTask";}
-    }
-
-
     protected class ResumeTask implements Runnable {
         public void run() {
             if(suspended)
-                log.warn("ResumeTask resumed message garbage collection - this should be done by a RESUME_STABLE event; " +
-                           "check why this event was not received (or increase max_suspend_time for large state transfers)");
+                log.warn("%s: ResumeTask resumed message garbage collection - this should be done by a RESUME_STABLE event; " +
+                           "check why this event was not received (or increase max_suspend_time for large state transfers)", local_addr);
             resume();
         }
         public String toString() {return STABLE.class.getSimpleName() + ": ResumeTask";}

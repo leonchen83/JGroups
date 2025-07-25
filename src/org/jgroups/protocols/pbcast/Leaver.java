@@ -35,51 +35,41 @@ public class Leaver {
      * Sends a LEAVE-REQ to the coordinator. Blocks the caller until a LEAVE-RSP has been received, or no coord is found.
      */
     public void leave() {
-        Address coord, leaving_mbr;
+        Address coord, me=gms.getAddress();
 
         if(!leaving.compareAndSet(false, true)) {
             coord=gms.getCoord();
             if(coord == null) {
-                log.trace("%s: last member in the group (coord); leaving now", gms.local_addr);
-                leave_promise.setResult(gms.local_addr);
+                log.trace("%s: last member in the group (coord); leaving now", me);
+                leave_promise.setResult(me);
             }
             else {
-                log.trace("%s: re-sending LEAVE request to %s", gms.local_addr, coord);
-                sendLeaveRequest(coord, gms.local_addr);
+                log.trace("%s: re-sending LEAVE request to %s", me, coord);
+                sendLeaveRequest(coord, me);
             }
             return;
         }
 
         try {
-            int leave_attempts=0;
             leave_promise.reset(false);
-            leaving_mbr=Objects.requireNonNull(gms.local_addr);
             coord=gms.getCoord();
             if(coord == null) {
-                log.trace("%s: last member in the group (coord); leaving now", gms.local_addr);
+                log.trace("%s: last member in the group (coord); leaving now", me);
                 return;
             }
-            log.trace("%s: sending LEAVE request to %s", gms.local_addr, coord);
+            log.trace("%s: sending LEAVE request to %s", me, coord);
             long start=System.currentTimeMillis();
-            sendLeaveRequest(coord, leaving_mbr);
-            while(leaving.get()) {
+            sendLeaveRequest(coord, me);
+            if(leaving.get()) {
                 Address sender=leave_promise.getResult(gms.leave_timeout);
                 long time=System.currentTimeMillis() - start;
                 if(leave_promise.hasResult()) {
                     if(sender != null) {
-                        boolean self=Objects.equals(sender, gms.local_addr);
-                        log.trace("%s: got LEAVE response from %s in %d ms",
-                                  gms.local_addr, self? " self" : sender, time);
+                        boolean myself=Objects.equals(sender, me);
+                        log.trace("%s: got LEAVE response from %s in %d ms", me, myself? " self" : sender, time);
                     }
                     else
-                        log.trace("%s: timed out waiting for LEAVE response from %s (after %d ms)",
-                                  gms.local_addr, coord, time);
-                    break;
-                }
-                if(gms.max_leave_attempts > 0 && ++leave_attempts >= gms.max_leave_attempts) {
-                    log.warn("%s: terminating after %d unsuccessful LEAVE attempts (waited %d ms): ",
-                             gms.local_addr, leave_attempts, time);
-                    break;
+                        log.trace("%s: timed out waiting for LEAVE response from %s (after %d ms)", me, coord, time);
                 }
             }
         }
@@ -102,12 +92,12 @@ public class Leaver {
     public void coordChanged(Address new_coord) {
         if(!leaving.get() || new_coord == null)
             return;
-        Address leaving_mbr=gms.local_addr;
+        Address leaving_mbr=gms.getAddress();
         if(leaving_mbr == null) {
             log.error("local address is null, cannot re-send LEAVE request");
         }
         else {
-            log.trace("%s: re-sending LEAVE request to %s", gms.local_addr, new_coord);
+            log.trace("%s: re-sending LEAVE request to %s", gms.getAddress(), new_coord);
             sendLeaveRequest(new_coord, leaving_mbr);
         }
     }
@@ -124,8 +114,21 @@ public class Leaver {
 
 
     protected void sendLeaveRequest(Address coord, Address leaving_mbr) {
-        Message msg=new EmptyMessage(coord).setFlag(Message.Flag.OOB)
+        Message msg=new EmptyMessage(coord).setFlag(Message.Flag.OOB).setFlag(Message.TransientFlag.DONT_BLOCK)
           .putHeader(gms.getId(), new GMS.GmsHeader(GMS.GmsHeader.LEAVE_REQ, leaving_mbr));
-        gms.getDownProtocol().down(msg);
+        if(gms.thread_pool == null)
+            gms.getDownProtocol().down(msg);
+        else {
+            // If the mcast protocol can block, we need to send a view asynchronously. The views will still
+            // be delivered in order, see https://issues.redhat.com/browse/JGRP-2875 for details
+            Runnable r=() -> {
+                gms.getDownProtocol().down(msg);
+            };
+            boolean rc=gms.thread_pool.execute(r);
+            if(!rc) { // https://issues.redhat.com/browse/JGRP-2880
+                Thread th=gms.getThreadFactory().newThread(r);
+                th.start();
+            }
+        }
     }
 }

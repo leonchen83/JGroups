@@ -19,11 +19,14 @@ import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 import java.lang.reflect.Method;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.atomic.LongAdder;
 
+import static org.jgroups.Message.TransientFlag.DONT_LOOPBACK;
+
 /**
- * Tests blocking in UFC / MFC (https://issues.jboss.org/browse/JGRP-1665)
+ * Tests blocking in UFC / MFC (https://issues.redhat.com/browse/JGRP-1665)
  * @author Bela Ban
  * @since  3.4
  */
@@ -162,7 +165,7 @@ public class FlowControlUnitTest {
 
         for(int i=1; i <= 15; i++)
             da.callRemoteMethods(null, new MethodCall(RECEIVE, local, buf),
-                                 RequestOptions.ASYNC().transientFlags(Message.TransientFlag.DONT_LOOPBACK));
+                                 RequestOptions.ASYNC().transientFlags(DONT_LOOPBACK));
 
         MFC_NB mfc_nb=a.getProtocolStack().findProtocol(MFC_NB.class);
         System.out.printf("A's sender credits: %s\n", mfc_nb.printCredits());
@@ -239,7 +242,7 @@ public class FlowControlUnitTest {
 
         for(int i=1; i <= 15; i++)
             da.callRemoteMethods(null, new MethodCall(RECEIVE, local, buf),
-                                 RequestOptions.ASYNC().transientFlags(Message.TransientFlag.DONT_LOOPBACK));
+                                 RequestOptions.ASYNC().transientFlags(DONT_LOOPBACK));
 
         MFC_NB mfc_nb=a.getProtocolStack().findProtocol(MFC_NB.class);
         System.out.printf("A's sender credits: %s\n", mfc_nb.printCredits());
@@ -251,6 +254,42 @@ public class FlowControlUnitTest {
         }
         assert received_msgs.intValue() == 15
           : String.format("B was expected to get 15 messages but only received %s", received_msgs.intValue());
+    }
+
+    /**
+     * Tests A sending async unicasts to itself; the credits should be adjusted accordingly
+     */
+    public void testUnicastToSelf() throws Exception {
+        Address self=a.getAddress();
+        UFC ufc=a.getProtocolStack().findProtocol(UFC.class);
+        long before_sender_creds=ufc.getSenderCreditsFor(self), before_receiver_creds=ufc.getReceiverCreditsFor(self);
+        callReceive(da, self, MAX_CREDITS / 2, RequestOptions.ASYNC());
+        Util.sleep(1000);
+        long after_sender_creds=ufc.getSenderCreditsFor(self), after_receiver_creds=ufc.getReceiverCreditsFor(self);
+        System.out.printf("sender credits for %s before: %d, after: %d\nreceiver credits for %s before: %d, after: %s\n",
+                          self, before_sender_creds, after_sender_creds, self, before_receiver_creds, after_receiver_creds);
+        assert after_sender_creds <= before_sender_creds / 2;
+        assert after_receiver_creds <= before_receiver_creds / 2;
+    }
+
+    /**
+     * Tests A sending async unicasts to self with DONT_LOOPBACK; the credits should remain unchanged.
+     */
+    public void testUnicastToSelfWithDontLoopback() throws Exception {
+        Address self=a.getAddress();
+        UFC ufc=a.getProtocolStack().findProtocol(UFC.class);
+        long before_sender_creds=ufc.getSenderCreditsFor(self), before_receiver_creds=ufc.getReceiverCreditsFor(self);
+        callReceive(da, self, MAX_CREDITS / 2, RequestOptions.ASYNC().setTransientFlags(DONT_LOOPBACK));
+        Util.sleep(1000);
+        long after_sender_creds=ufc.getSenderCreditsFor(self), after_receiver_creds=ufc.getReceiverCreditsFor(self);
+        System.out.printf("sender credits for %s before: %d, after: %d\nreceiver credits for %s before: %d, after: %s\n",
+                          self, before_sender_creds, after_sender_creds, self, before_receiver_creds, after_receiver_creds);
+        assert after_sender_creds == before_sender_creds;
+        assert after_receiver_creds == before_receiver_creds;
+    }
+
+    protected static void callReceive(RpcDispatcher d, Address self, int bytes, RequestOptions opts) throws Exception {
+        d.callRemoteMethod(self, new MethodCall(RECEIVE, self, new byte[bytes]), opts);
     }
 
 
@@ -282,7 +321,8 @@ public class FlowControlUnitTest {
             View view=ch.getView();
             ufc_nb.handleViewChange(view.getMembers()); // needs to setup received and sent hashmaps
             stack.replaceProtocol(stack.findProtocol(UFC.class), ufc_nb);
-            ufc_nb.down(new Event(Event.SET_LOCAL_ADDRESS, ch.getAddress()));
+            for(Protocol p=ufc_nb; p != null; p=p.getDownProtocol())
+                p.setAddress(ch.getAddress());
             ufc_nb.start();
         }
     }
@@ -298,7 +338,8 @@ public class FlowControlUnitTest {
             stack.replaceProtocol(stack.findProtocol(MFC.class), mfc_nb);
             View view=ch.getView();
             mfc_nb.handleViewChange(view.getMembers()); // needs to setup received and sent hashmaps
-            mfc_nb.down(new Event(Event.SET_LOCAL_ADDRESS, ch.getAddress()));
+            for(Protocol p=mfc_nb; p != null;p=p.getDownProtocol())
+                p.setAddress(ch.getAddress());
             mfc_nb.start();
         }
     }
@@ -314,11 +355,12 @@ public class FlowControlUnitTest {
         }
 
         public void up(MessageBatch batch) {
-            for(Message msg: batch) {
+            for(Iterator<Message> it=batch.iterator(); it.hasNext();) {
+                Message msg=it.next();
                 FcHeader hdr=getHeader(msg, UFC_ID, UFC_NB_ID, MFC_ID, MFC_NB_ID);
                 if(hdr != null && hdr.type == FcHeader.REPLENISH) {
                     System.out.println("-- dropping credits from " + batch.sender());
-                    batch.remove(msg);
+                    it.remove();
                 }
             }
             if(!batch.isEmpty())

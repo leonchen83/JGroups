@@ -35,7 +35,16 @@ public class FragmentedMessage extends BytesMessage { // we need the superclass'
     public boolean           hasArray()           {return false;}
     public boolean           hasPayload()         {return true;}
     public Supplier<Message> create()             {return FragmentedMessage::new;}
-    protected int            sizeOfPayload()      {return Global.INT_SIZE + length;}
+    protected int            payloadSize()        {return Global.INT_SIZE + length;}
+
+    @Override
+    protected Message copyPayload(Message copy) {
+        FragmentedMessage msg=(FragmentedMessage)super.copyPayload(copy);
+        msg.offset=this.offset;
+        msg.length=this.length;
+        msg.original_msg=this.original_msg;
+        return msg;
+    }
 
     public void writePayload(DataOutput out) throws IOException {
         ByteArrayDataOutputStream bos=out instanceof ByteArrayDataOutputStream? (ByteArrayDataOutputStream)out : null;

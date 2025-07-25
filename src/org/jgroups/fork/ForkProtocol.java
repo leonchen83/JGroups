@@ -21,12 +21,9 @@ public class ForkProtocol extends Protocol {
 
     public Object down(Event evt) {
         switch(evt.getType()) {
-            case Event.SET_LOCAL_ADDRESS:
             case Event.VIEW_CHANGE:
             case Event.CONNECT:
-            case Event.CONNECT_USE_FLUSH:
             case Event.CONNECT_WITH_STATE_TRANSFER:
-            case Event.CONNECT_WITH_STATE_TRANSFER_USE_FLUSH:
             case Event.DISCONNECT:
                 return null; // don't propagate further down, this is only important for the main stack
         }

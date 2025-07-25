@@ -20,7 +20,7 @@ import java.util.Map;
 /**
  * Uses the ReplicatedHashMap building block, which subclasses java.util.HashMap and overrides
  * the methods that modify the hashmap (e.g. put()). Those methods are multicast to the group, whereas
- * read-only methods such as get() use the local copy. A ReplicatedtHashMap is created given the name
+ * read-only methods such as get() use the local copy. A ReplicatedHashMap is created given the name
  * of a group; all hashmaps with the same name find each other and form a group.
  * @author Bela Ban
  */
@@ -171,7 +171,7 @@ public class ReplicatedHashMapDemo extends Frame implements WindowListener, Acti
                         showMsg("Both key and value have to be present to create a new entry");
                         return;
                     }
-                    Float val=new Float(stock_val);
+                    Float val=Float.parseFloat(stock_val);
                     map.put(stock_name, val);
                     showMsg("Key " + stock_name + " set to " + val);
                     break;

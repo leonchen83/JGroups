@@ -53,8 +53,6 @@ public abstract class Encrypt<E extends KeyStore.Entry> extends Protocol {
     @Property(description="Max number of keys in key_map")
     protected int                           key_map_max_size=20;
 
-    protected volatile Address              local_addr;
-
     protected volatile View                 view;
 
     // Cipher pools used for encryption and decryption. Size is cipher_pool_size
@@ -71,8 +69,6 @@ public abstract class Encrypt<E extends KeyStore.Entry> extends Protocol {
 
     // SecureRandom instance for generating IV's
     protected SecureRandom                  secure_random = new SecureRandom();
-
-    protected MessageFactory                msg_factory;
 
 
     /**
@@ -95,11 +91,9 @@ public abstract class Encrypt<E extends KeyStore.Entry> extends Protocol {
     public String                   asymAlgorithm()                 {return asym_algorithm;}
     public <T extends Encrypt<E>> T asymAlgorithm(String alg)       {this.asym_algorithm=alg; return (T)this;}
     public byte[]                   symVersion()                    {return sym_version;}
-    public <T extends Encrypt<E>> T localAddress(Address addr)      {this.local_addr=addr; return (T)this;}
     public SecureRandom             secureRandom()                  {return this.secure_random;}
     /** Allows callers to replace secure_random with impl of their choice, e.g. for performance reasons. */
     public <T extends Encrypt<E>> T secureRandom(SecureRandom sr)   {this.secure_random = sr; return (T)this;}
-    public <T extends Encrypt<E>> T msgFactory(MessageFactory f)    {this.msg_factory=f; return (T)this;}
     @ManagedAttribute public String version()                       {return Util.byteArrayToHexString(sym_version);}
 
 
@@ -118,9 +112,6 @@ public abstract class Encrypt<E extends KeyStore.Entry> extends Protocol {
         }
         key_map=new BoundedHashMap<>(key_map_max_size);
         initSymCiphers(sym_algorithm, secret_key);
-        TP transport=getTransport();
-        if(transport != null)
-            msg_factory=transport.getMessageFactory();
     }
 
 
@@ -130,10 +121,6 @@ public abstract class Encrypt<E extends KeyStore.Entry> extends Protocol {
                 Object retval=down_prot.down(evt); // Start keyserver socket in SSL_KEY_EXCHANGE, for instance
                 handleView(evt.getArg());
                 return retval;
-
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                break;
         }
         return down_prot.down(evt);
     }
@@ -149,7 +136,7 @@ public abstract class Encrypt<E extends KeyStore.Entry> extends Protocol {
             down_prot.down(encrypt(msg));
         }
         catch(Exception e) {
-            log.warn("%s: unable to send message down", local_addr, e);
+            log.warn("%s: unable to send message down: %s", local_addr, e);
         }
         return null;
     }
@@ -191,7 +178,7 @@ public abstract class Encrypt<E extends KeyStore.Entry> extends Protocol {
         Cipher cipher=null;
         try {
             cipher=cipherQueue.take();
-            MessageIterator it=batch.iterator();
+            FastArray<Message>.FastIterator it=(FastArray<Message>.FastIterator)batch.iterator();
             while(it.hasNext()) {
                 Message msg=it.next();
                 if(msg.getHeader(id) == null) {
@@ -274,7 +261,7 @@ public abstract class Encrypt<E extends KeyStore.Entry> extends Protocol {
     }
 
     protected Object handleEncryptedMessage(Message msg) throws Exception {
-        // decrypt the message; we need to copy msg as we modify its buffer (http://jira.jboss.com/jira/browse/JGRP-538)
+        // decrypt the message; we need to copy msg as we modify its buffer (https://issues.redhat.com/browse/JGRP-538)
         Message tmpMsg=decrypt(null, msg.copy(true, true)); // need to copy for possible xmits
         return tmpMsg != null? up_prot.up(tmpMsg) : null;
     }
@@ -329,12 +316,15 @@ public abstract class Encrypt<E extends KeyStore.Entry> extends Protocol {
             decrypted_msg=cipher.doFinal(msg.getArray(), msg.getOffset(), msg.getLength());
         }
         if(hdr.needsDeserialization())
-            return Util.messageFromBuffer(decrypted_msg, 0, decrypted_msg.length, msg_factory);
+            return Util.messageFromBuffer(decrypted_msg, 0, decrypted_msg.length);
         else
             return msg.setArray(decrypted_msg, 0, decrypted_msg.length);
     }
 
     protected Message encrypt(Message msg) throws Exception {
+        // To avoid NPE (https://issues.redhat.com/browse/JGRP-2680)
+        if(msg.getSrc() == null)
+            msg.setSrc(local_addr);
         // copy needed because same message (object) may be retransmitted -> prevent double encryption
         if(!msg.hasPayload())
             return msg.putHeader(this.id, new EncryptHeader((byte)0, symVersion(), makeIv()));

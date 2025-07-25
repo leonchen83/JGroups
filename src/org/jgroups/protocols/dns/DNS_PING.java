@@ -7,6 +7,7 @@ import org.jgroups.protocols.Discovery;
 import org.jgroups.protocols.PingData;
 import org.jgroups.protocols.PingHeader;
 import org.jgroups.stack.IpAddress;
+import org.jgroups.util.ByteArray;
 import org.jgroups.util.NameCache;
 import org.jgroups.util.Responses;
 
@@ -14,6 +15,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+
+import static org.jgroups.Message.Flag.*;
+import static org.jgroups.Message.TransientFlag.DONT_LOOPBACK;
 
 public class DNS_PING extends Discovery {
 
@@ -26,14 +30,15 @@ public class DNS_PING extends Discovery {
     @Property(description = "DNS Address. This property will be assembled with the 'dns://' prefix.  If this is specified, A records will be resolved through DnsContext.")
     protected String  dns_address = "";
 
-    @Property(description = "DNS Record type")
+    @Property(description = "DNS Record type",
+            systemProperty="jgroups.dns.dns_record_type")
     protected String  dns_record_type = DEFAULT_DNS_RECORD_TYPE;
 
     @Property(description = "A comma-separated list of DNS queries for fetching members",
       systemProperty="jgroups.dns.dns_query")
     protected String  dns_query;
 
-    @Property(description="For SRV records returned by the DNS query, the non-0 ports returned by DNS are" +
+    @Property(description="For SRV records returned by the DNS query, the non-0 ports returned by DNS are " +
       "used. If this attribute is true, then the transport ports will also be used. Ignored for A records.")
     protected boolean probe_transport_ports;
 
@@ -57,6 +62,33 @@ public class DNS_PING extends Discovery {
             }
         }
     }
+
+    public DNSResolver dnsResolver() { return dns_resolver; }
+    public DNS_PING dnsResolver(DNSResolver r) { dns_resolver = r; return this; }
+
+    public DNS_PING setDNSResolver(DNSResolver r) { dns_resolver = r; return this; }
+    public DNSResolver getDNSResolver(DNSResolver r) { return dns_resolver; }
+
+    public String dnsQuery() { return dns_query; }
+    public DNS_PING dnsQuery(String q) { dns_query = q; return this; }
+
+    public DNS_PING setDNSQuery(String q) { dns_query = q; return this; }
+    public String getDNSQuery() { return dns_query; }
+
+    public String dnsRecordType() { return dns_record_type; }
+    public DNS_PING dnsRecordType(String t) { dns_record_type = t; return this; }
+
+    public String dnsAddress() { return dns_address; }
+    public DNS_PING dnsAddress(String a) { dns_address = a; return this; }
+
+    public String getDNSAddress() { return this.dns_address; }
+    public DNS_PING setDNSAddress(String a) { dns_address = a; return this; }
+
+    public String dnsContextFactory() { return dns_context_factory; }
+    public DNS_PING dnsContextFactory(String f) { dns_context_factory = f; return this; }
+
+    public String getDNSContextFactory() { return dns_context_factory; }
+    public DNS_PING setDNSContextFactory(String f) { dns_context_factory = f; return this; }
 
     protected void validateProperties() {
         if (dns_query == null || dns_query.trim().isEmpty()) {
@@ -116,7 +148,7 @@ public class DNS_PING extends Discovery {
         DNSResolver.DNSRecordType record_type=DNSResolver.DNSRecordType.valueOf(dns_record_type);
 
         physical_addr = (PhysicalAddress) down(new Event(Event.GET_PHYSICAL_ADDRESS, local_addr));
-        // https://issues.jboss.org/browse/JGRP-1670
+        // https://issues.redhat.com/browse/JGRP-1670
         data = new PingData(local_addr, false, NameCache.get(local_addr), physical_addr);
         if (members != null && members.size() <= max_members_in_discovery_request)
             data.mbrs(members);
@@ -134,8 +166,6 @@ public class DNS_PING extends Discovery {
         boolean ports_found=false;
         if (dns_discovery_members != null) {
             for (Address address : dns_discovery_members) {
-                if (address.equals(physical_addr)) // no need to send the request to myself
-                    continue;
                 if(address instanceof IpAddress) {
                     IpAddress ip = ((IpAddress) address);
                     if(record_type == DNSResolver.DNSRecordType.SRV && ip.getPort() > 0) {
@@ -148,6 +178,7 @@ public class DNS_PING extends Discovery {
                         cluster_members.add(new IpAddress(ip.getIpAddress(), transportPort + i));
                 }
             }
+            cluster_members.remove(physical_addr); // skip request to self (https://issues.redhat.com/browse/JGRP-2669)
         }
 
         if(dns_discovery_members != null && !dns_discovery_members.isEmpty() && log.isDebugEnabled()) {
@@ -158,14 +189,15 @@ public class DNS_PING extends Discovery {
                           local_addr, dns_discovery_members, transportPort, transportPort + portRange);
         }
 
+        ByteArray data_buf=data != null? marshal(data) : null;
         PingHeader hdr = new PingHeader(PingHeader.GET_MBRS_REQ).clusterName(cluster_name).initialDiscovery(initial_discovery);
-        for (Address addr : cluster_members) {
+        for (Address addr: cluster_members) {
 
             // the message needs to be DONT_BUNDLE, see explanation above
-            final Message msg = new BytesMessage(addr).setFlag(Message.Flag.INTERNAL, Message.Flag.DONT_BUNDLE, Message.Flag.OOB)
+            final Message msg = new BytesMessage(addr).setFlag(DONT_BUNDLE, OOB).setFlag(DONT_LOOPBACK)
               .putHeader(this.id, hdr);
-            if (data != null)
-                msg.setArray(marshal(data));
+            if (data_buf != null)
+                msg.setArray(data_buf);
 
             if (async_discovery_use_separate_thread_per_request)
                 timer.execute(() -> sendDiscoveryRequest(msg), sends_can_block);

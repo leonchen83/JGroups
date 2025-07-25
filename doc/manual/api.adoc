@@ -164,7 +164,6 @@ public interface Message extends SizeStreamable, Constructable<Message> {
         NO_RELAY,       // bypass relaying (RELAY2)
         RSVP,           // ack of a multicast
         RSVP_NB,        // non blocking RSVP
-        INTERNAL,       // for internal use by JGroups only, don't use!
         SKIP_BARRIER;   // passing messages through a closed BARRIER
     }
 
@@ -270,47 +269,21 @@ to better performance.
 
 JGroups 5.0 comes with a number of message types (see the next sections). If none of them are a fit for the application's
 requirements, new message types can be defined and registered. To do this, the new message type needs to implement
-`Message` (typically by subclassing `BaseMessage`) and registering it with the `MessageFactory` in the transport:
+`Message` (typically by subclassing `BaseMessage`) and registering it with the `MessageFactory`:
 
 [source,java]
 ----
 CustomMessage msg=new CustomMessage(...);
-JChannel ch;
-TP transport=ch.getProtocolStack().getTransport();
-MessageFactory mf=transport.getMessageFactory();
-mf.register((short)12345, CustomMessage::new)
+MessageFactory.register((short)12345, CustomMessage::new)
 ----
 
 A (unique) ID has to be assigned with the message type, and then it has to be registered with the message factory
 in the transport. This has to be done before sending an instance of the new message type.
 If the ID has already been registered before, or is taken, an exception will be thrown.
-Note that the default implementation of `MessageFactory` requires all IDs to be greater than 32, so that there's room
-for adding built-in message types.
+`MessageFactory` requires all IDs to be greater than 32, so that there's room for adding built-in message types.
 
 NOTE: It is recommended to register all custom message types _before_ connecting the channel, so that potential errors
 are detected early.
-
-[[CustomMessageFactory]]
-==== Custom `MessageFactory`
-`MessageFactory` is a simple interface:
-
-[source,java]
-----
-public interface MessageFactory {
-    <T extends Message> T create(short id);
-    void register(short type, Supplier<? extends Message> generator);
-}
-----
-We saw the that the `register()` method is used to associate new message types with IDs <<MessageFactory,above>>.
-
-There is a `DefaultMessageFactory` which is set in the transport (`TP`). If more control over the creation of custom
-messages is desired, a custom implementation of `MessageFactory` can be written and registered in the transport, using
-`TP.setMessageFactory(MessageFactory mf)`.
-
-An example for why we might want to provide our own `MessageFactory` is that we have control over the creation of
-messages; e.g. to create an `NioMessage` with a *direct* `ByteBuffer`, we may want to use a _pool_ of off-heap memory
-rather than calling `ByteBuffer.allocateDirect()` for each message, which is slow.
-
 
 [[BytesMessage]]
 ==== BytesMessage
@@ -366,8 +339,7 @@ The methods of `NioMessage` are:
 |==========================
 
 NOTE: The envisioned use case for `useDirectMemory()` is when we send an `NioMessage` with a direct `ByteBuffer`, but
-      don't need the `ByteBuffer` to be created in off-heap memory at the receiver, when on-heap will do. +
-      The alternative is to provide a custom <<MessageFactory,`MessageFactory`>>.
+      don't need the `ByteBuffer` to be created in off-heap memory at the receiver, when on-heap will do.
 
 
 
@@ -384,7 +356,7 @@ Here's an example that sends a heartbeat in `FD_ALL`:
 [source,java]
 ----
 Message heartbeat=new EmptyMessage()
-                   .setFlag(Message.Flag.INTERNAL)
+                   .setFlag(Message.Flag.OOB)
                    .putHeader(id, new HeartbeatHeader());
 ----
 
@@ -579,95 +551,6 @@ The second `FragmentedMessage` will only marshall the part of the underlying mes
 mainly for completeness.
 
 
-[[Refcounting]]
-==== Reference-counted messages
-When a sender wants to reuse the message payload, a shared pool of payloads may be used. For example, we may want to
-create a pool of direct ByteBuffers (allocated off-heap) and wrap ByteBuffers (taken from that pool) in NioMessages.
-
-After sending an NioMessage with ByteBuffer `buf`, we may want to modify `buf` and send another NioMessage with `buf`
-as payload. However, this might fail, as the message may not yet have been sent, or it may have been dropped and
-will later get retransmitted.
-
-For example, if we set `buf` to `123`, send it, then set it to `456` and send it again, the following
-might happen:
-
-* `123` is sent as NioMessage `m1`, but `m1` is dropped
-* `456` is sent as NioMessage `m2`
-* `m1` gets retransmitted. By now, its payload is `456`, as `buf` has been changed in the meantime
-* This leads to a receiver receiving `456` twice, rather than `123` followed by `456`.
-
-Reference counting makes sure that a payload is only available to be reused when
-
-* a unicast message has been sent to a receiver and the ack from the receiver has been received by the sender,
-so that the message can be purged from the retransmission table, or
-* a multicast message (= message to all members) has been seen by all members and has been purged from
-the retransmission table.
-
-This is achieved by reference counting: a message increments a reference count (refcnt) when being sent,
-and decrements it when `JChannel.send()` returns. Retransmission protocols (such as `NAKACK2` or `UNICAST3`)
-increment refcnt, and decrement it when the message is known to have been received by the receiver(s).
-
-When refcnt becomes 0, a callback is invoked (with the message as argument), which can (e.g.) return the
-message to a pool.
-
-As example of a refcounted message is `RefcountedNioMessage`:
-
-[source,java]
-----
-public class RefcountedNioMessage extends NioMessage implements Refcountable<Message> {
-    protected final RefcountImpl<Message> impl=new RefcountImpl<>();
-
-    public RefcountedNioMessage() {
-    }
-
-    public RefcountedNioMessage(Address dest) {
-        super(dest);
-    }
-
-    public RefcountedNioMessage(Address dest, ByteBuffer buf) {
-        super(dest, buf);
-    }
-
-    public synchronized byte getRefcount() {
-        return impl.getRefcount();
-    }
-
-    @Override public synchronized RefcountedNioMessage incr() {
-        impl.incr();
-        return this;
-    }
-
-    @Override public synchronized RefcountedNioMessage decr() {
-        impl.decr(this);
-        return this;
-    }
-
-    public RefcountedNioMessage onRelease(Consumer<Message> rc) {
-        impl.onRelease(rc);
-        return this;
-    }
-}
-----
-
-It subclasses `NioMessage` and implements methods `incr()` and `decr()` of the `Refcountable` interface. The latter calls
-a function previously passed in via `onRelease()`. This function may for example return the payload of the NioMessage
-to a pool. See `RefcountedNioMessageTest` as an example.
-
-NOTE: Reference counting is an experimental feature, introduced in 5.1.0, and is WIP. The authors are interested in
-scenarios where this would be beneficial, and its performance impact. Please contact us if you are serious
-about using this feature; we're interested in feedback, suggestions and are happy to collaborate on this!
-
-===== Reference counting on the receiver side
-Reference counting is currently only implemented on the sender side.
-
-However, it could also be useful on the receiver side: a `MessageFactory` could create instances of ref-counted messages
-(the payload would be taken from a buffer pool) and increment the refcount.
-
-When such a message is received and processed by the application, the `receive(Message)` callback (or, alternatively,
-the application itself) could decrement the refcount, thus returning the buffer to the pool.
-
-
-
 [[PayloadMismatch]]
 === Mismatch between message type and getters/setters
 
@@ -747,11 +630,6 @@ public interface Receiver {
 |viewAccepted|Called when a change in membership has occurred. No long running actions, sending of messages
               or anything that could block should be done in this callback. If some long running action
                needs to be performed, it should be done in a separate thread.
-|block|Called (usually by the <<FLUSH,FLUSH>> protocol), as an indication that the member should stop sending
-       messages. Any messages sent after returning from this callback might get blocked by the FLUSH protocol.
-       When the FLUSH protocol is done, and messages can be sent again, the FLUSH protocol will simply unblock
-       all pending messages. If a callback for unblocking is desired, implement `unblock()`.
-|unblock|Called _after_ the FLUSH protocol has unblocked previously blocked senders, and messages can be sent again.
 |getState|Allows an application to write the state to an OutputStream. After the state has been written, the
           OutputStream doesn't need to be closed as stream closing is automatically done when a calling thread
           returns from this callback.
@@ -762,12 +640,7 @@ public interface Receiver {
 |==========================
 
 
-CAUTION: Note that anything that could block should _not_ be done in a callback. This includes sending of messages:
-if we have FLUSH on the stack, and send a message in a viewAccepted() callback, then the following happens:
-the FLUSH protocol blocks all
-(multicast) messages before installing a view, then installs the view, then unblocks. However,
-because installation of the view triggers the viewAccepted() callback, sending of messages inside of
-viewAccepted() will block. This in turn blocks the viewAccepted() thread, so the flush will never return! +
+CAUTION: Note that anything that could block should _not_ be done in a callback. This includes sending of messages;
 If we need to send a message in a callback, the sending should be done on a separate thread, or a
 task should be submitted to the timer.
 
@@ -853,6 +726,26 @@ JGroups tries to bundle as many messages as possible into a batch on the sender 
 
 Also on the receiver side, if multiple threads added messages to a table, it tries to remove as many of them as possible
 and pass them up to other protocols (or the application) as a batch.
+
+==== Cost of processing of message batches
+A message batch is delivered to the application via the `receive(MessageBatch)` callback. While each message of
+an *OOB batch* could be delivered in a separate thread, regular messages need to be delivered one by one, or else
+ordering will be destroyed.
+
+If the average processing time for a message is `20us`, in a batch of `10` it will take `20us` to process the first
+message, `40us` to process the second and so on. The last message is delayed by `180us` before it can be processed.
+
+For latency-sensitive applications, batching is detrimental to performance. There are a few things to fix this:
+
+* Make smaller batches on the sender side: reduce `max_bundle_size`. However, a `MessageProcessingPolicy`
+(<<MessageProcessingPolicy>>) of `max` will still create larger batches on the receiver side. A smaller
+`max_bundle_size` leads only to faster filling and sending of batches on the sender side. This still helps latency.
+* Use a `MessageProcessingPolicy` of `unbatch`: this delivers only OOB batches up to a given size; larger batches
+deliver their messages in separate threads.
+* Application: an application knows best whether messages in a batch can be processed in parallel, or whether they
+need to be delivered sequentially. Example: responses in a batch could be delivered each by a separate thread,
+whereas requests would need to be processed sequentially.
+
 
 
 [[Header]]
@@ -997,18 +890,20 @@ argument, but were not found, or wrong parameters to protocols.
 For example, the Draw demo can be launched as follows:
 
 ----
-java org.javagroups.demos.Draw -props file:/home/bela/udp.xml
+java org.jgroups.demos.Draw -props file:/home/bela/udp.xml
 ----
 
 or
 
 ----
-java org.javagroups.demos.Draw -props http://www.jgroups.org/udp.xml
+java org.jgroups.demos.Draw -props http://www.jgroups.org/udp.xml
 ----
 
 In the latter case, an application downloads its protocol stack specification from a server, which
 allows for central administration of application properties.
-            
+
+==== Configuration
+
 A sample XML configuration looks like this (edited from `udp.xml`):
             
 
@@ -1020,12 +915,11 @@ A sample XML configuration looks like this (edited from `udp.xml`):
     <UDP
          mcast_port="${jgroups.udp.mcast_port:45588}"
          ip_ttl="4"
-         max_bundle_size="64K"
-         enable_diagnostics="true"
+         bundler.max_size="64K"
+         diag.enabled="true"
          thread_pool.min_threads="2"
          thread_pool.max_threads="8"
          thread_pool.keep_alive_time="5000" />
-
     <PING />
     <MERGE3 max_interval="30000" min_interval="10000"/>
     <FD_SOCK/>
@@ -1065,7 +959,58 @@ one of them being the IP multicast port (`mcast_port`) which is set to 45588, or
 the system property `jgroups.udp.mcast_port`, if set.
 
 NOTE: Note that all members in a group have to have the same protocol stack.
-            
+
+[[UsingIncludes]]
+===== Using includes
+
+Oftentimes different configurations have parts in common which change, but the rest is the same. An example
+for the latter is transports such as `TCP` or `UDP`. These could be defined once, and be included by various
+configurations. For example, if we have optimized transport configurations `tcp-default.xml` (`TCP`) and
+`nio-default.xml` (`TCP_NIO2`), we could include them as follows:
+
+[source,xml]
+----
+<config>
+   <include file="${transport-config:tcp-default.xml}" />
+   <MPING />
+   <MERGE3 max_interval="30000"
+           min_interval="${min:10000}"/>
+   ...
+</config>
+----
+
+This configuration by default includes the transport defined in `tcp-default.xml`. All the configurations which
+include this transport configuration will benefit from changes made to `tcp-default.xml`, which is better than
+copy-and-paste where there's a risk to forget to update all configurations.
+
+Note that we can pick the transport to be included *at run time*, by defining system (or environment) variable
+`transport-config` in the example above:
+
+* `-Dtransport-config=tcp-default.xml` uses a `TCP` transport
+* `-Dtransport-config=nio-default.xml` uses `TCP_NIO2` as transport
+
+NOTE: An include can configure *multiple protocols*: for example, we could define both a transport *and* a
+discovery protocol
+
+We can also use multiple includes in the same configuration, e.g.:
+[source,xml]
+----
+<config>
+   <include file="${transport-config:tcp-default.xml}" />
+   <include file="${discovery-config:mping-default.xml}" />
+   <MERGE3 max_interval="30000"
+           min_interval="${min:10000}"/>
+   ...
+</config>
+----
+
+This includes a transport, but also the discovery protocol to be used, in 2 separate includes. This allows us to
+tailor the stack to be run to the environment.
+
+To summarize: includes allow us to remove a lot of boilerplate code and customize the stack to the
+environment, even at run time.
+
+NOTE: includes were added in 5.5.0; prior versions will not recognize them and fail at startup
 
 [[ProgrammaticCreation]]
 ===== Programmatic creation

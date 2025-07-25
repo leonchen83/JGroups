@@ -19,11 +19,11 @@ public class SuppressCache<T> {
 
 
     /**
-     * Adds a new key to the hashmap, or updates the Value associated with the existing key if present. If expiry_time
-     * is greater than the age of the Value, the key will be removed.
+     * Adds a new key to the hashmap, or updates the value associated with the existing key if present. If expiry_time
+     * is greater than the age of the value, the key will be removed.
      * @param key The key
      * @param expiry_time Expiry time (in ms)
-     * @return Null if the key was present and not expired, or the Value associated with the existing key
+     * @return Null if the key was present and not expired, or the value associated with the existing key
      * (its count incremented)
      */
     public Value putIfAbsent(T key, long expiry_time) {
@@ -85,12 +85,12 @@ public class SuppressCache<T> {
             this.count=1;
         }
 
-        protected final long timestamp; // time of last update
-        protected int        count;     // number of accesses since last update
+        private final long timestamp; // time of last update
+        private int        count;     // number of accesses since last update
 
         public long               age()    {return System.currentTimeMillis() - timestamp;}
         public synchronized Value update() {count++; return this;}
-        public int count()                 {return count;}
+        public int                count()  {return count;}
 
         public String toString() {return count + " update(s) in " + age() + " ms";}
     }

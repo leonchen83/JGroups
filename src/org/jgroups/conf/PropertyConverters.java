@@ -1,7 +1,9 @@
 package org.jgroups.conf;
 
+import org.jgroups.annotations.Property;
 import org.jgroups.stack.Configurator;
 import org.jgroups.stack.IpAddress;
+import org.jgroups.stack.Policy;
 import org.jgroups.stack.Protocol;
 import org.jgroups.util.StackType;
 import org.jgroups.util.Util;
@@ -12,6 +14,9 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.stream.Collectors;
+
+import static org.jgroups.conf.AttributeType.TIME;
 
 /**
  * Groups a set of standard PropertyConverter(s) supplied by JGroups.
@@ -104,7 +109,7 @@ public final class PropertyConverters {
         public Object convert(Object obj, Class<?> propertyFieldType, String propertyName, String propertyValue, boolean check_scope, StackType ip_version) throws Exception {
 
             // get the existing bind address - possibly null
-            InetAddress old_bind_addr=Configurator.getValueFromProtocol((Protocol)obj, "bind_addr");
+            InetAddress old_bind_addr=Configurator.getValueFromObject((Protocol)obj, "bind_addr");
 
             // apply a bind interface constraint
             InetAddress new_bind_addr=Util.validateBindAddressFromInterface(old_bind_addr, propertyValue, ip_version);
@@ -127,33 +132,67 @@ public final class PropertyConverters {
         }
     }
 
+    /** Creates a list of Policy objects from a comma-separated list of classnames */
+    public static class PolicyConverter implements PropertyConverter {
+
+        @Override
+        public Object convert(Object obj, Class<?> propertyFieldType, String propertyName, String val, boolean check_scope, StackType ip_version) throws Exception {
+            if(val == null)
+                return null;
+            List<String> classes=Util.parseCommaDelimitedStrings(val);
+            List<Policy> l=new ArrayList<>();
+            for(String classname: classes) {
+                Class<? extends Policy> clazz=(Class<? extends Policy>)Util.loadClass(classname, getClass());
+                Policy p=clazz.getConstructor().newInstance();
+                l.add(p);
+            }
+            return l;
+        }
+
+        @Override
+        public String toString(Object value) {
+            List<Policy> l=(List<Policy>)value;
+            return l == null? "n/a" : l.stream().map(p -> p.getClass().getSimpleName()).collect(Collectors.joining(", "));
+        }
+    }
+
 
     public static class Default implements PropertyConverter {
 
 
-        public Object convert(Object obj, Class<?> propertyFieldType, String propertyName, String propertyValue,
+        @Override
+        public Object convert(Object obj, Class<?> propertyFieldType, String propertyName, String propertyValue, boolean check_scope, StackType ip_version) throws Exception {
+            return convert(null, obj, propertyFieldType, propertyName, propertyValue, check_scope, ip_version);
+        }
+
+        @Override
+        public Object convert(Property ann, Object obj, Class<?> propertyFieldType, String propertyName, String propValue,
                               boolean check_scope, StackType ip_version) throws Exception {
-            if(propertyValue == null)
+            if(propValue == null)
                 throw new NullPointerException("Property value cannot be null");
 
             if(Boolean.TYPE.equals(propertyFieldType))
-                return Boolean.parseBoolean(propertyValue);
+                return Boolean.parseBoolean(propValue);
             if(Integer.TYPE.equals(propertyFieldType))
-                return Util.readBytesInteger(propertyValue);
+                return ann != null && ann.type() == TIME? Util.readDurationInt(propValue, ann.unit()) : Util.readBytesInteger(propValue);
             if(Long.TYPE.equals(propertyFieldType))
-                return Util.readBytesLong(propertyValue);
+                return ann != null && ann.type() == TIME ? Util.readDurationLong(propValue, ann.unit()) : Util.readBytesLong(propValue);
             if(Byte.TYPE.equals(propertyFieldType))
-                return Byte.parseByte(propertyValue);
+                return Byte.parseByte(propValue);
             if(Double.TYPE.equals(propertyFieldType))
-                return Util.readBytesDouble(propertyValue);
+                return Util.readBytesDouble(propValue);
             if(Short.TYPE.equals(propertyFieldType))
-                return Short.parseShort(propertyValue);
+                return Short.parseShort(propValue);
             if(Float.TYPE.equals(propertyFieldType))
-                return Float.parseFloat(propertyValue);
+                return Float.parseFloat(propValue);
+            if(String[].class.equals(propertyFieldType))
+                return Util.parseStringArray(propValue, ",");
+            if(propertyFieldType.isEnum())
+                return Util.createEnum(propValue, propertyFieldType);
             if(InetAddress.class.equals(propertyFieldType)) {
                 InetAddress retval=null;
-                if(propertyValue.contains(",")) {
-                    List<String> addrs=Util.parseCommaDelimitedStrings(propertyValue);
+                if(propValue.contains(",")) {
+                    List<String> addrs=Util.parseCommaDelimitedStrings(propValue);
                     for(String addr : addrs) {
                         try {
                             retval=Util.getAddress(addr, ip_version);
@@ -164,10 +203,10 @@ public final class PropertyConverters {
                         }
                     }
                     if(retval == null)
-                        throw new IllegalArgumentException(String.format("failed parsing attribute %s with value %s", propertyName, propertyValue));
+                        throw new IllegalArgumentException(String.format("failed parsing attribute %s with value %s", propertyName, propValue));
                 }
                 else
-                    retval=Util.getAddress(propertyValue, ip_version);
+                    retval=Util.getAddress(propValue, ip_version);
 
                 if(check_scope && retval instanceof Inet6Address && retval.isLinkLocalAddress()) {
                     // check scope
@@ -182,9 +221,8 @@ public final class PropertyConverters {
                 }
                 return retval;
             }
-            return propertyValue;
+            return propValue;
         }
-
 
 
 

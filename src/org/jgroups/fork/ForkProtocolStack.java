@@ -5,7 +5,6 @@ import org.jgroups.protocols.FORK;
 import org.jgroups.stack.Protocol;
 import org.jgroups.stack.ProtocolStack;
 import org.jgroups.util.MessageBatch;
-import org.jgroups.util.MessageIterator;
 import org.jgroups.util.Util;
 
 import java.util.*;
@@ -18,7 +17,6 @@ import java.util.concurrent.ConcurrentMap;
  * @since  3.4
  */
 public class ForkProtocolStack extends ProtocolStack {
-    protected       Address                        local_addr;
     protected final String                         fork_stack_id;
     protected final ConcurrentMap<String,JChannel> fork_channels=new ConcurrentHashMap<>();
     protected UnknownForkHandler                   unknownForkHandler;
@@ -64,7 +62,8 @@ public class ForkProtocolStack extends ProtocolStack {
         if(Objects.equals(local_addr, addr))
             return;
         this.local_addr=addr;
-        down_prot.down(new Event(Event.SET_LOCAL_ADDRESS, addr));
+        for(Protocol p=down_prot; p != null; p=p.getDownProtocol())
+            p.setAddress(addr);
     }
 
     @Override
@@ -111,6 +110,7 @@ public class ForkProtocolStack extends ProtocolStack {
         switch(evt.getType()) {
             case Event.VIEW_CHANGE:
             case Event.SITE_UNREACHABLE:
+            case Event.MBR_UNREACHABLE:
                 for(JChannel ch: fork_channels.values())
                     ch.up(evt);
                 break;
@@ -135,13 +135,15 @@ public class ForkProtocolStack extends ProtocolStack {
     public void up(MessageBatch batch) {
         // Sort fork messages by fork-channel-id
         Map<String,List<Message>> map=new HashMap<>();
-        MessageIterator it=batch.iterator();
+        Iterator<Message> it=batch.iterator();
         while(it.hasNext()) {
             Message msg=it.next();
             FORK.ForkHeader hdr=msg.getHeader(FORK.ID);
             if(hdr != null) {
                 it.remove();
-                List<Message> list=map.computeIfAbsent(hdr.getForkChannelId(), k -> new ArrayList<>());
+                List<Message> list=map.get(hdr.getForkChannelId());
+                if(list == null)
+                    list=map.computeIfAbsent(hdr.getForkChannelId(), k -> new ArrayList<>());
                 list.add(msg);
             }
         }

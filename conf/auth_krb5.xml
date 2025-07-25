@@ -1,11 +1,9 @@
-<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-        xmlns="urn:org:jgroups"
-        xsi:schemaLocation="urn:org:jgroups http://www.jgroups.org/schema/jgroups.xsd"
-        >
-    <UDP/>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="urn:org:jgroups"
+        xsi:schemaLocation="urn:org:jgroups http://www.jgroups.org/schema/jgroups.xsd">
+    <include file="${transport-config:udp-default.xml}" />
     <PING />
     <MERGE3 />
-    <FD_SOCK/>
+    <FD_SOCK2/>
     <FD_ALL3 />
     <VERIFY_SUSPECT />
     <BARRIER />
@@ -13,9 +11,9 @@
     <UNICAST3 />
     <pbcast.STABLE />
     <AUTH auth_class="org.jgroups.auth.Krb5Token"
-          client_principal_name="martin"
-          client_password="Password99"
-          service_principal_name="cluster1" />
+          auth_token.client_principal_name="martin"
+          auth_token.client_password="Password99"
+          auth_token.service_principal_name="cluster1" />
     <pbcast.GMS />
     <UFC />
     <MFC />

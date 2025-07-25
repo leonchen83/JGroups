@@ -22,7 +22,7 @@ import java.util.function.Supplier;
  * physical address(es)
  * @author Bela Ban
  */
-public class PingData implements SizeStreamable, Constructable<PingData> {
+public class PingData implements SizeStreamable, Constructable<PingData>, Comparable<PingData> {
     protected Address                       sender;  // the sender of this PingData
     protected byte                          flags;   // used to mark as server and/or coordinator
     protected String                        logical_name;
@@ -78,18 +78,18 @@ public class PingData implements SizeStreamable, Constructable<PingData> {
         return Util.isFlagSet(flags, is_server) || Util.isFlagSet(flags, is_coord); // a coord is always a server
     }
 
-    public Address getAddress() {
-        return sender;
-    }
-
-    public String getLogicalName() {
-        return logical_name;
-    }
+    public Address getSender()      {return sender;}
+    public Address getAddress()     {return sender;}
+    public String  getLogicalName() {return logical_name;}
 
     public PhysicalAddress               getPhysicalAddr()                        {return physical_addr;}
     public PingData                      mbrs(Collection<? extends Address> mbrs) {this.mbrs=mbrs; return this;}
     public Collection<? extends Address> mbrs()                                   {return mbrs;}
 
+    @Override
+    public int compareTo(PingData o) {
+        return sender.compareTo(o.sender);
+    }
 
     public boolean equals(Object obj) {
         if(!(obj instanceof PingData))
@@ -99,12 +99,7 @@ public class PingData implements SizeStreamable, Constructable<PingData> {
     }
 
     public int hashCode() {
-        int retval=0;
-        if(sender != null)
-            retval+=sender.hashCode();
-        if(retval == 0)
-            retval=super.hashCode();
-        return retval;
+        return sender != null? sender.hashCode() : 0;
     }
 
     public String toString() {

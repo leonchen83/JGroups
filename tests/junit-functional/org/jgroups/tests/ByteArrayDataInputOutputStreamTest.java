@@ -96,6 +96,41 @@ public class ByteArrayDataInputOutputStreamTest {
         assert in.read() == -1;
     }
 
+    public void testAdvance() {
+        byte[] buf=new byte[100];
+        buf[10]='B'; buf[11]='e'; buf[12]='l'; buf[13]='a';
+        ByteArrayDataInputStream in=new ByteArrayDataInputStream(buf, 10, 4);
+        assert in.position() == 10;
+        assert in.limit() == 14;
+        assert in.capacity() == buf.length;
+
+        try {
+            in.advance(5);
+            assert false : " should have gotten an exception";
+        }
+        catch(Exception ex) {
+            System.out.println("caught exception as expected: " + ex);
+            assert ex instanceof IndexOutOfBoundsException;
+        }
+    }
+
+    public void testAdvance2() {
+        byte[] buf="Bela".getBytes();
+        ByteArrayDataInputStream in=new ByteArrayDataInputStream(buf);
+        assert in.position() == 0;
+        assert in.limit() == buf.length;
+        assert in.capacity() == buf.length;
+
+        try {
+            in.advance(5);
+            assert false : " should have gotten an exception";
+        }
+        catch(Exception ex) {
+            System.out.println("caught exception as expected: " + ex);
+            assert ex instanceof IndexOutOfBoundsException;
+        }
+    }
+
 
     public void testPosition() {
         byte[] buf=new byte[100];
@@ -322,10 +357,10 @@ public class ByteArrayDataInputOutputStreamTest {
         ByteArrayDataOutputStream out=new ByteArrayDataOutputStream(1024);
         long[] numbers={Long.MIN_VALUE, -500, 0, 1, 100, Long.MAX_VALUE};
         for(long i: numbers)
-            Bits.writeLong(i, out);
+            Bits.writeLongCompressed(i, out);
         ByteArrayDataInputStream in=new ByteArrayDataInputStream(out.buffer());
         for(long i: numbers) {
-            long num=Bits.readLong(in);
+            long num=Bits.readLongCompressed(in);
             assert num == i;
         }
     }

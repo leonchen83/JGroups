@@ -16,14 +16,11 @@ import java.net.SocketException;
 public class TcpServer extends TcpBaseServer {
     protected ServerSocket srv_sock;
     protected Thread       acceptor;
-    protected int          buffered_inputstream_size;
-    protected int          buffered_outputstream_size;
+    protected boolean      log_accept_error=true;
 
 
-    public int       getBufferedInputStreamSize()       {return buffered_inputstream_size;}
-    public TcpServer setBufferedInputStreamSize(int s)  {this.buffered_inputstream_size=s; return this;}
-    public int       getBufferedOutputStreamSize()      {return buffered_outputstream_size;}
-    public TcpServer setBufferedOutputStreamSize(int s) {this.buffered_outputstream_size=s; return this;}
+    public boolean   getLogAcceptError()                {return log_accept_error;}
+    public TcpServer setLogAcceptError(boolean l)       {log_accept_error=l; return this;}
 
 
     /**
@@ -40,6 +37,14 @@ public class TcpServer extends TcpBaseServer {
 
 
 
+    public TcpServer(ThreadFactory thread_factory, SocketFactory socket_factory,
+                     InetAddress bind_addr, int srv_port, int end_port,
+                     InetAddress external_addr, int external_port, int recv_buf_size) throws Exception {
+        this(thread_factory, socket_factory, bind_addr, srv_port, end_port, external_addr, external_port,
+             recv_buf_size, "jgroups.tcp.server");
+    }
+
+
     /**
      * Creates an instance of {@link TcpServer} that creates a server socket and listens for connections
      * Needs to be started next.
@@ -52,13 +57,15 @@ public class TcpServer extends TcpBaseServer {
      * @param external_addr The external address in case of NAT. Ignored if null.
      * @param external_port The external port on the NA. If 0, srv_port is used.
      * @param recv_buf_size The size of the initial TCP receive window (in bytes)
+     * @param service_name The name of the service
      * @throws Exception Thrown if the creation failed
      */
     public TcpServer(ThreadFactory thread_factory, SocketFactory socket_factory,
                      InetAddress bind_addr, int srv_port, int end_port,
-                     InetAddress external_addr, int external_port, int recv_buf_size) throws Exception {
+                     InetAddress external_addr, int external_port, int recv_buf_size,
+                     String service_name) throws Exception {
         super(thread_factory, socket_factory, recv_buf_size);
-        this.srv_sock=Util.createServerSocket(this.socket_factory, "jgroups.tcp.server", bind_addr,
+        this.srv_sock=Util.createServerSocket(this.socket_factory, service_name, bind_addr,
                                               srv_port, end_port, recv_buf_size);
         acceptor=factory.newThread(new Acceptor(),"TcpServer.Acceptor[" + srv_sock.getLocalPort() + "]");
         local_addr=localAddress(bind_addr, srv_sock.getLocalPort(), external_addr, external_port);
@@ -98,31 +105,31 @@ public class TcpServer extends TcpBaseServer {
                 catch(Exception ex) {
                     if(ex instanceof SocketException && srv_sock.isClosed() || Thread.currentThread().isInterrupted())
                         break;
-                    log.warn(Util.getMessage("AcceptError"), client_sock, ex);
+                    if(log_accept_error)
+                        log.warn(Util.getMessage("AcceptError"), local_addr, client_sock, ex);
                     Util.close(client_sock);
                 }
             }
         }
 
-
         protected void handleAccept(final Socket client_sock) throws Exception {
             TcpConnection conn=null;
             try {
-                conn=new TcpConnection(client_sock, TcpServer.this);
+                conn=non_blocking_sends? new TcpConnectionNonBlocking(client_sock, TcpServer.this, max_send_queue)
+                  : new TcpConnection(client_sock, TcpServer.this);
+                conn.useLockToSend(use_lock_to_send);
                 Address peer_addr=conn.peerAddress();
-                synchronized(this) {
-                    boolean conn_exists=hasConnection(peer_addr),
-                      replace=conn_exists && use_peer_connections && local_addr.compareTo(peer_addr) < 0; // bigger conn wins
+                boolean conn_exists=hasConnection(peer_addr),
+                  replace=conn_exists && use_peer_connections && local_addr.compareTo(peer_addr) < 0; // bigger conn wins
 
-                    if(!conn_exists || replace) {
-                        replaceConnection(peer_addr, conn); // closes old conn
-                        conn.start();
-                        log.trace("%s: accepted connection from %s", local_addr, peer_addr);
-                    }
-                    else {
-                        log.trace("%s: rejected connection from %s %s", local_addr, peer_addr, explanation(conn_exists, replace));
-                        Util.close(conn); // keep our existing conn, reject accept() and close client_sock
-                    }
+                if(!conn_exists || replace) {
+                    replaceConnection(peer_addr, conn); // closes old conn
+                    conn.start();
+                    log.trace("%s: accepted connection from %s", local_addr, peer_addr);
+                }
+                else {
+                    log.trace("%s: rejected connection from %s %s", local_addr, peer_addr, explanation(conn_exists, replace));
+                    Util.close(conn); // keep our existing conn and close client_sock
                 }
             }
             catch(Exception ex) {
@@ -131,7 +138,6 @@ public class TcpServer extends TcpBaseServer {
             }
         }
     }
-
 
 
 }

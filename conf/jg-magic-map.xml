@@ -1,4 +1,3 @@
-<?xml version="1.0" encoding="UTF-8"?>
 
 <magic-number-class-mapping>
 
@@ -21,10 +20,11 @@
     <class id="17" name="org.jgroups.auth.X509Token"/>
     <class id="18" name="org.jgroups.blocks.MethodCall"/>
     <class id="19" name="org.jgroups.util.FlagsUUID"/>
-    <class id="20" name="org.jgroups.util.ObjectWrapper"/>
+    <class id="20" name="org.jgroups.util.ObjectWrapperSerializable"/>
+    <class id="21" name="org.jgroups.util.ObjectWrapperPrimitive"/>
+    <class id="22" name="org.jgroups.util.MillisAddress"/>
 
     <!-- Headers -->
-    <class id="50"  name="org.jgroups.protocols.FD$FdHeader"/>
     <class id="51"  name="org.jgroups.protocols.FD_SOCK$FdHeader"/>
     <class id="52"  name="org.jgroups.protocols.FragHeader"/>
     <class id="53"  name="org.jgroups.protocols.PingHeader"/>
@@ -37,26 +37,34 @@
     <class id="60"  name="org.jgroups.protocols.TpHeader"/>
     <class id="61"  name="org.jgroups.protocols.SEQUENCER$SequencerHeader"/>
     <class id="62"  name="org.jgroups.protocols.FailureDetection$HeartbeatHeader"/>
-    <class id="64"  name="org.jgroups.protocols.pbcast.FLUSH$FlushHeader"/>
     <class id="65"  name="org.jgroups.protocols.pbcast.StreamingStateTransfer$StateHeader"/>
     <class id="66"  name="org.jgroups.protocols.AuthHeader"/>
     <class id="67"  name="org.jgroups.blocks.RequestCorrelator$Header"/>
     <class id="68"  name="org.jgroups.blocks.RequestCorrelator$MultiDestinationHeader"/>
     <class id="69"  name="org.jgroups.protocols.DAISYCHAIN$DaisyHeader"/>
     <class id="71"  name="org.jgroups.protocols.STOMP$StompHeader"/>
-    <class id="72"  name="org.jgroups.protocols.Locking$LockingHeader"/>
     <class id="74"  name="org.jgroups.protocols.COUNTER$CounterHeader"/>
     <class id="75"  name="org.jgroups.protocols.MERGE3$MergeHeader"/>
     <class id="76"  name="org.jgroups.protocols.RSVP$RsvpHeader"/>
     <class id="77"  name="org.jgroups.tests.perf.MPerf$MPerfHeader"/>
     <class id="78"  name="org.jgroups.protocols.pbcast.NakAckHeader2"/>
-    <class id="80"  name="org.jgroups.protocols.relay.RELAY2$Relay2Header"/>
+    <class id="80"  name="org.jgroups.protocols.relay.RelayHeader"/>
     <class id="82"  name="org.jgroups.protocols.UnicastHeader3"/>
     <class id="83"  name="org.jgroups.protocols.FORK$ForkHeader"/>
-    <class id="84"  name="org.jgroups.protocols.PERF$PerfHeader"/>
+    <class id="84"  name="org.jgroups.protocols.PerfHeader"/>
     <class id="86"  name="org.jgroups.protocols.SEQUENCER2$SequencerHeader"/>
     <class id="88"  name="org.jgroups.protocols.EncryptHeader"/>
     <class id="91"  name="org.jgroups.protocols.Frag3Header"/>
     <class id="92"  name="org.jgroups.protocols.DH_KEY_EXCHANGE$DhHeader"/>
+    <class id="93"  name="org.jgroups.protocols.FD_SOCK2$FdHeader"/>
+    <class id="94"  name="org.jgroups.protocols.VERIFY_SUSPECT2$VerifyHeader"/>
+    <class id="95"  name="org.jgroups.protocols.BATCH$BatchHeader"/>
+    <class id="96"  name="org.jgroups.protocols.BATCH2$Batch2Header"/>
+    <class id="97"  name="org.jgroups.protocols.RTTHeader"/>
+    <class id="98"  name="org.jgroups.protocols.ProtPerfHeader"/>
+    <class id="99"  name="org.jgroups.protocols.NakAckHeader"/>
+    <class id="100" name="org.jgroups.protocols.UnicastHeader"/>
+    <class id="101" name="org.jgroups.protocols.InfoHeader"/>
+
 </magic-number-class-mapping>
 

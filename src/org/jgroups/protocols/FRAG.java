@@ -5,8 +5,8 @@ import org.jgroups.*;
 import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.conf.AttributeType;
 import org.jgroups.util.ByteArray;
+import org.jgroups.util.FastArray;
 import org.jgroups.util.MessageBatch;
-import org.jgroups.util.MessageIterator;
 import org.jgroups.util.Util;
 
 import java.util.*;
@@ -42,7 +42,6 @@ public class FRAG extends Fragmentation {
     protected final FragmentationList  fragment_list=new FragmentationList();
     protected final AtomicInteger      curr_id=new AtomicInteger(1);
     protected final List<Address>      members=new ArrayList<>(11);
-    protected MessageFactory           msg_factory;
     protected final Predicate<Message> HAS_FRAG_HEADER=msg -> msg.getHeader(id) != null;
  
 
@@ -58,7 +57,6 @@ public class FRAG extends Fragmentation {
 
     public void init() throws Exception {
         super.init();
-        msg_factory=getTransport().getMessageFactory();
         Map<String,Object> info=new HashMap<>(1);
         info.put("frag_size", frag_size);
         down_prot.down(new Event(Event.CONFIG, info));
@@ -125,13 +123,13 @@ public class FRAG extends Fragmentation {
     }
 
     public void up(MessageBatch batch) {
-        MessageIterator it=batch.iteratorWithFilter(HAS_FRAG_HEADER);
+        FastArray<Message>.FastIterator it=(FastArray<Message>.FastIterator)batch.iterator(HAS_FRAG_HEADER);
         while(it.hasNext()) {
             Message msg=it.next();
             FragHeader hdr=msg.getHeader(this.id);
             Message assembled_msg=unfragment(msg, hdr);
             if(assembled_msg != null)
-                // the reassembled msg has to be add in the right place (https://issues.jboss.org/browse/JGRP-1648),
+                // the reassembled msg has to be add in the right place (https://issues.redhat.com/browse/JGRP-1648),
                 // and cannot be added at the tail of the batch!
                 it.replace(assembled_msg);
             else
@@ -192,6 +190,8 @@ public class FRAG extends Fragmentation {
 
             for(int i=0; i < num_frags; i++) {
                 Message frag_msg=new BytesMessage(dest, fragments[i]).setSrc(src)
+                  .setFlag(msg.getFlags(true), true)
+                  .setFlag(msg.getFlags(false), false)
                   .putHeader(this.id, new FragHeader(frag_id, i, num_frags));
                 down_prot.down(frag_msg);
             }
@@ -227,7 +227,7 @@ public class FRAG extends Fragmentation {
             return null;
 
         try {
-            Message assembled_msg=Util.messageFromBuffer(buf, 0, buf.length, msg_factory);
+            Message assembled_msg=Util.messageFromBuffer(buf, 0, buf.length);
             assembled_msg.setSrc(sender); // needed ? YES, because fragments have a null src !!
             if(log.isTraceEnabled()) log.trace("assembled_msg is " + assembled_msg);
             num_received_msgs++;

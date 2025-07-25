@@ -4,9 +4,9 @@ import org.jgroups.util.UUID;
 
 /**
  * Global is a JGroups internal class defining global variables.
- * 
+ *
  * @since 2.0
- * @author Bela Ban 
+ * @author Bela Ban
  */
 public final class Global {
     public static final int BYTE_SIZE   = Byte.SIZE    / 8; // 1
@@ -18,6 +18,9 @@ public final class Global {
 
     public static final int MAX_DATAGRAM_PACKET_SIZE=1 << 16;
     public static final Address NULL_ADDRESS=new UUID(0,0);
+
+    public static final String DEFAULT_DIAG_ADDR="224.0.75.75";
+    public static final String DEFAULT_DIAG_ADDR_IPv6="ff0e::0:75:75";
 
     public static final String IPv4="java.net.preferIPv4Stack";
     public static final String IPv6="java.net.preferIPv6Addresses";
@@ -50,6 +53,9 @@ public final class Global {
     public static final String USE_JDK_LOGGER="jgroups.use.jdk_logger"; // forces use of the JDK logger
     public static final String LOG_CLASS="jgroups.log_class"; // class of preferred logger
 
+    public static final String VERSION_CHECK="jgroups.version.check"; // used to disable/enable version checking
+    public static final String VERSION_CHECK_MICRO="jgroups.version.check.micro"; // used to disable/enable version micro checking
+
     /** System prop for defining the default number of headers in a Message */
     public static final String DEFAULT_HEADERS="jgroups.msg.default_headers";
 
@@ -57,7 +63,7 @@ public final class Global {
 
     /** First ID assigned for building blocks (defined in jg-protocols.xml) */
     public static final short  BLOCKS_START_ID=200;
-    
+
     public static final long   THREADPOOL_SHUTDOWN_WAIT_TIME=3000;
     public static final long   THREAD_SHUTDOWN_WAIT_TIME=300;
 
@@ -65,19 +71,23 @@ public final class Global {
     public static final String MATCH_HOST="match-host";
     public static final String MATCH_INTF="match-interface";
 
+    // used to return all groups (https://issues.redhat.com/browse/JGRP-2693)
+    public static final String ALL_GROUPS="<<all-groups>>";
+
     public static final String PREFIX="org.jgroups.protocols.";
     public static final String DEFAULT_PROTOCOL_STACK="udp.xml";
-    
+
     // for TestNG
     public static final String FUNCTIONAL="functional";
     public static final String TIME_SENSITIVE="time-sensitive";
     public static final String STACK_DEPENDENT="stack-dependent";
     public static final String STACK_INDEPENDENT="stack-independent";
     public static final String GOSSIP_ROUTER="gossip-router";
-    public static final String FLUSH="flush";
     public static final String BYTEMAN="byteman";
     public static final String EAP_EXCLUDED="eap-excluded"; // tests not supported by EAP
     public static final String ENCRYPT="encrypt";
+    public static final String RELAY="relay";
+    public static final String JDBC="jdbc";
 
     public static final String INITIAL_MCAST_ADDR="INITIAL_MCAST_ADDR";
     public static final String INITIAL_MCAST_PORT="INITIAL_MCAST_PORT";

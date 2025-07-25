@@ -47,17 +47,21 @@ public class LongMessage extends BaseMessage {
         return LongMessage::new;
     }
 
+    protected Message copyPayload(Message copy) {
+        ((LongMessage)copy).setValue(value);
+        return copy;
+    }
 
     public void writePayload(DataOutput out) throws IOException {
-        Bits.writeLong(value, out);
+        Bits.writeLongCompressed(value, out);
     }
 
     public void readPayload(DataInput in) throws IOException, ClassNotFoundException {
-        value=Bits.readLong(in);
+        value=Bits.readLongCompressed(in);
     }
 
-    public int size() {
-        return super.size() + Bits.size(value);
+    @Override protected int payloadSize() {
+        return Bits.size(value);
     }
 
     public String toString() {

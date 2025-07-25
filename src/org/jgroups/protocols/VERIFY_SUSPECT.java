@@ -6,6 +6,7 @@ import org.jgroups.annotations.*;
 import org.jgroups.conf.AttributeType;
 import org.jgroups.stack.IpAddress;
 import org.jgroups.stack.Protocol;
+import org.jgroups.util.MessageBatch;
 import org.jgroups.util.Util;
 
 import java.io.DataInput;
@@ -55,7 +56,6 @@ public class VERIFY_SUSPECT extends Protocol implements Runnable {
     
     /** network interface to be used to send the ICMP packets */
     protected NetworkInterface        intf;
-    protected Address                 local_addr;
 
     // a list of suspects, ordered by time when a SUSPECT event needs to be sent up
     protected final DelayQueue<Entry> suspects=new DelayQueue<>();
@@ -94,9 +94,6 @@ public class VERIFY_SUSPECT extends Protocol implements Runnable {
 
     public Object down(Event evt) {
         switch(evt.getType()) {
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                break;
             case Event.VIEW_CHANGE:
                 View v=evt.getArg();
                 adjustSuspectedMembers(v.getMembers());
@@ -133,6 +130,23 @@ public class VERIFY_SUSPECT extends Protocol implements Runnable {
         VerifyHeader hdr=msg.getHeader(this.id);
         if(hdr == null)
             return up_prot.up(msg);
+        return handle(hdr);
+    }
+
+    public void up(MessageBatch batch) {
+        for(Iterator<Message> it=batch.iterator(); it.hasNext();) {
+            Message msg=it.next();
+            VerifyHeader hdr=msg.getHeader(id);
+            if(hdr != null) {
+                it.remove();
+                handle(hdr);
+            }
+        }
+        if(!batch.isEmpty())
+            up_prot.up(batch);
+    }
+
+    protected Object handle(VerifyHeader hdr) {
         switch(hdr.type) {
             case VerifyHeader.ARE_YOU_DEAD:
                 if(hdr.from == null) {
@@ -141,7 +155,7 @@ public class VERIFY_SUSPECT extends Protocol implements Runnable {
                 }
                 Address target=use_mcast_rsps? null : hdr.from;
                 for(int i=0; i < num_msgs; i++) {
-                    Message rsp=new EmptyMessage(target).setFlag(Message.Flag.INTERNAL)
+                    Message rsp=new EmptyMessage(target).setFlag(Message.TransientFlag.DONT_BLOCK)
                       .putHeader(this.id, new VerifyHeader(VerifyHeader.I_AM_NOT_DEAD, local_addr));
                     down_prot.down(rsp);
                 }
@@ -217,7 +231,7 @@ public class VERIFY_SUSPECT extends Protocol implements Runnable {
         }
         for(Address mbr: mbrs) {
             for(int i=0; i < num_msgs; i++) {
-                Message msg=new EmptyMessage(mbr).setFlag(Message.Flag.INTERNAL)
+                Message msg=new EmptyMessage(mbr)
                   .putHeader(this.id, new VerifyHeader(VerifyHeader.ARE_YOU_DEAD, local_addr));
                 down_prot.down(msg);
             }
@@ -258,10 +272,11 @@ public class VERIFY_SUSPECT extends Protocol implements Runnable {
             return false;
         boolean added=false;
         synchronized(suspects) {
+            long target_time=getCurrentTimeMillis() + timeout;
             for(Address suspected_mbr : list) {
                 boolean found_dupe=suspects.stream().anyMatch(e -> e.suspect.equals(suspected_mbr));
                 if(!found_dupe) {
-                    suspects.add(new Entry(suspected_mbr, getCurrentTimeMillis() + timeout));
+                    suspects.add(new Entry(suspected_mbr, target_time));
                     added=true;
                 }
             }

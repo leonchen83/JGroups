@@ -17,23 +17,25 @@ import org.testng.annotations.Test;
 import java.lang.reflect.Method;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Stream;
+
+import static org.jgroups.Message.Flag.DONT_BUNDLE;
+import static org.jgroups.Message.Flag.OOB;
+import static org.jgroups.blocks.ResponseMode.GET_ALL;
 
 /**
  * A collection of tests to test the RpcDispatcher.
- * 
- * NOTE on processing return values: 
- * 
+ * NOTE on processing return values:
  * The method RspDispatcher.callRemoteMethods(...) returns an RspList, containing one Rsp
  * object for each group member receiving the RPC call. Rsp.getValue() returns the 
  * value returned by the RPC call from the corresponding member. Rsp.getValue() may
  * contain several classes of values, depending on what happened during the call:
- * 
- * (i) a value of the expected return data type, if the RPC call completed successfully 
+ * (i) a value of the expected return data type, if the RPC call completed successfully
  * (ii) null, if the RPC call timed out before the value could be returned
  * (iii) an object of type java.lang.Throwable, if an exception (e.g. lava.lang.OutOfMemoryException) 
  * was raised during the processing of the call 
- * 
+ *
  * It is wise to check for such cases when processing RpcDispatcher calls.
  * 
  * This also applies to the return value of callRemoteMethod(...).
@@ -55,15 +57,15 @@ public class RpcDispatcherTest {
     @BeforeMethod
     protected void setUp() throws Exception {
         a=createChannel("A");
-        da=new RpcDispatcher(a, new ServerObject(1));
+        da=new RpcDispatcher(a, new ServerObject("A", 1));
         a.connect(GROUP);
 
         b=createChannel("B");
-        db=new RpcDispatcher(b, new ServerObject(2));
+        db=new RpcDispatcher(b, new ServerObject("B", 2));
         b.connect(GROUP);
 
         c=createChannel("C");
-        dc=new RpcDispatcher(c, new ServerObject(3));
+        dc=new RpcDispatcher(c, new ServerObject("C", 3));
         c.connect(GROUP);
 
         Util.waitUntilAllChannelsHaveSameView(10000, 1000, a, b, c);
@@ -84,8 +86,8 @@ public class RpcDispatcherTest {
             e=createChannel("E");
             d1.setChannel(d);
             d2.setChannel(e);
-            d1.setServerObject(new ServerObject(1));
-            d2.setServerObject(new ServerObject(2));
+            d1.setServerObject(new ServerObject("D", 1));
+            d2.setServerObject(new ServerObject("E", 2));
             d1.start();
             d2.start();
             d.connect("RpcDispatcherTest-DifferentGroup");
@@ -100,7 +102,7 @@ public class RpcDispatcherTest {
             System.out.println("view channel 1= " + view);
 
             assert view.size() == 2;
-            RspList<Integer> rsps=d1.callRemoteMethods(null, "foo", null, null, new RequestOptions(ResponseMode.GET_ALL, 5000));
+            RspList<Integer> rsps=d1.callRemoteMethods(null, "foo", null, null, new RequestOptions(GET_ALL, 5000));
             System.out.println("rsps:\n" + rsps);
             assert rsps.size() == 2;
             for(Rsp<Integer> rsp: rsps.values()) {
@@ -111,6 +113,7 @@ public class RpcDispatcherTest {
 
 
             Object server_object=new Object() {
+                @SuppressWarnings("unused")
                 public long foobar() {
                     return System.currentTimeMillis();
                 }
@@ -118,7 +121,7 @@ public class RpcDispatcherTest {
             d1.setServerObject(server_object);
             d2.setServerObject(server_object);
 
-            rsps=d2.callRemoteMethods(null, "foobar", null, null, new RequestOptions(ResponseMode.GET_ALL, 5000));
+            rsps=d2.callRemoteMethods(null, "foobar", null, null, new RequestOptions(GET_ALL, 5000));
             System.out.println("rsps:\n" + rsps);
             assert rsps.size() == 2;
             for(Rsp<Integer> rsp: rsps.values()) {
@@ -136,7 +139,7 @@ public class RpcDispatcherTest {
 
 
     public void testException() throws Exception {
-        RspList<Object> rsps=da.callRemoteMethods(null, "throwException", null, null, new RequestOptions(ResponseMode.GET_ALL, 5000));
+        RspList<Object> rsps=da.callRemoteMethods(null, "throwException", null, null, new RequestOptions(GET_ALL, 5000));
         rsps.values().forEach(System.out::println);
         for(Rsp<Object> rsp: rsps.values())
             assert rsp.getException() != null && rsp.getValue() == null;
@@ -144,7 +147,7 @@ public class RpcDispatcherTest {
 
 
     public void testExceptionAsReturnValue() throws Exception {
-        RspList<Object> rsps=da.callRemoteMethods(null, "returnException", null, null, new RequestOptions(ResponseMode.GET_ALL, 5000));
+        RspList<Object> rsps=da.callRemoteMethods(null, "returnException", null, null, new RequestOptions(GET_ALL, 5000));
         rsps.values().forEach(System.out::println);
         for(Rsp<Object> rsp: rsps.values())
             assert rsp.getException() == null && rsp.getValue() != null && rsp.getValue() instanceof Throwable;
@@ -190,7 +193,7 @@ public class RpcDispatcherTest {
     }
 
     public void testUnicastInvocationWithFuture() throws Exception {
-        RequestOptions opts=RequestOptions.SYNC().timeout(2000).flags(Message.Flag.OOB);
+        RequestOptions opts=RequestOptions.SYNC().timeout(2000).flags(OOB);
         MethodCall call=new MethodCall("bar", null, null);
         CompletableFuture<Void> future=da.callRemoteMethodWithFuture(b.getAddress(), call, opts);
         Void result=future.get(10000, TimeUnit.MILLISECONDS);
@@ -226,7 +229,7 @@ public class RpcDispatcherTest {
 
     public void testUnicastException()  {
         try {
-            da.callRemoteMethod(b.getAddress(), "throwException", null, null, new RequestOptions(ResponseMode.GET_ALL, 5000));
+            da.callRemoteMethod(b.getAddress(), "throwException", null, null, new RequestOptions(GET_ALL, 5000));
         }
         catch(Throwable throwable) {
             System.out.println("received exception (as expected)");
@@ -235,7 +238,7 @@ public class RpcDispatcherTest {
 
     public void testUnicastExceptionNested()  {
         try {
-            da.callRemoteMethod(b.getAddress(), "throwExceptionNested", null, null, new RequestOptions(ResponseMode.GET_ALL, 5000));
+            da.callRemoteMethod(b.getAddress(), "throwExceptionNested", null, null, new RequestOptions(GET_ALL, 5000));
         }
         catch(Throwable throwable) {
             System.out.printf("received exception (as expected): %s\n", throwable);
@@ -260,7 +263,7 @@ public class RpcDispatcherTest {
     public void testUnicastExceptionWithFuture()  {
         try {
             MethodCall call=new MethodCall(ServerObject.class.getMethod("throwException"));
-            Future<Object> future=da.callRemoteMethodWithFuture(b.getAddress(), call, new RequestOptions(ResponseMode.GET_ALL, 5000));
+            Future<Object> future=da.callRemoteMethodWithFuture(b.getAddress(), call, new RequestOptions(GET_ALL, 5000));
             Object val=future.get();
             assert val == null;
             assert false : " should not get here";
@@ -272,14 +275,14 @@ public class RpcDispatcherTest {
 
 
     public void testUnicastExceptionAsReturnValue() throws Exception {
-        Object rsp=da.callRemoteMethod(b.getAddress(), "returnException", null, null, new RequestOptions(ResponseMode.GET_ALL, 5000));
+        Object rsp=da.callRemoteMethod(b.getAddress(), "returnException", null, null, new RequestOptions(GET_ALL, 5000));
         System.out.println("rsp = " + rsp);
         assert rsp instanceof Throwable;
     }
 
     public void testUnicastExceptionAsReturnValueWithFuture() throws Exception {
         MethodCall call=new MethodCall(ServerObject.class.getMethod("returnException"));
-        Future<Object> future=da.callRemoteMethodWithFuture(b.getAddress(), call, new RequestOptions(ResponseMode.GET_ALL, 5000));
+        Future<Object> future=da.callRemoteMethodWithFuture(b.getAddress(), call, new RequestOptions(GET_ALL, 5000));
         Object val=future.get();
         assert val instanceof Exception;
     }
@@ -327,7 +330,7 @@ public class RpcDispatcherTest {
      *
      */
     public void testResponseFilter() throws Exception {
-        RequestOptions options=new RequestOptions(ResponseMode.GET_ALL, 10000, false,
+        RequestOptions options=new RequestOptions(GET_ALL, 10000, false,
                                                   new RspFilter() {
                                                       int num=0;
                                                       public boolean isAcceptable(Object response, Address sender) {
@@ -342,7 +345,7 @@ public class RpcDispatcherTest {
                                                       }
                                                   });
 
-        RspList rsps=da.callRemoteMethods(null, "foo", null, null, options);
+        RspList<Integer> rsps=da.callRemoteMethods(null, "foo", null, null, options);
         System.out.println("responses are:\n" + rsps);
         assert rsps.size() == 3 : "there should be three response values";
         assert rsps.numReceived() == 2 : "number of responses received should be 2";
@@ -370,7 +373,7 @@ public class RpcDispatcherTest {
      * filter.
      */
     public void testNonTerminatingResponseFilter() throws Exception {
-        RequestOptions options=new RequestOptions(ResponseMode.GET_ALL, 10000, false,
+        RequestOptions options=new RequestOptions(GET_ALL, 10000, false,
                                                   new RspFilter() {
                                                       public boolean isAcceptable(Object response, Address sender) {
                                                           return false;
@@ -378,10 +381,10 @@ public class RpcDispatcherTest {
                                                       public boolean needMoreResponses() {return true;}
                                                   });
 
-        RspList rsps=da.callRemoteMethods(null, "foo", null, null, options);
+        RspList<Integer> rsps=da.callRemoteMethods(null, "foo", null, null, options);
         System.out.println("responses are:\n" + rsps);
-        Util.assertEquals("there should be three response values", 3, rsps.size());
-        Util.assertEquals("number of responses received should be 3", 0, rsps.numReceived());
+        assert 3 == rsps.size();
+        assert 0 == rsps.numReceived();
     }
 
     /**
@@ -398,17 +401,17 @@ public class RpcDispatcherTest {
                                                       public boolean needMoreResponses() {return count < 3;}
                                                   });
 
-        RspList rsps=da.callRemoteMethods(null, "foo", null, null, options);
+        RspList<Integer> rsps=da.callRemoteMethods(null, "foo", null, null, options);
         System.out.println("responses are:\n" + rsps);
-        Util.assertEquals("there should be three response values", 3, rsps.size());
-        Util.assertEquals("number of responses received should be 3", 1, rsps.numReceived());
+        assert 3 == rsps.size();
+        assert 1 == rsps.numReceived();
     }
 
 
     public void testFuture() throws Exception {
         MethodCall sleep=new MethodCall("sleep", new Object[]{5000L}, new Class[]{long.class});
         CompletableFuture<RspList<Long>> future=da.callRemoteMethodsWithFuture(null, sleep,
-                                                                               new RequestOptions(ResponseMode.GET_ALL, 5000L, false, null));
+                                                                               RequestOptions.SYNC().timeout(5000));
         assert !future.isDone();
         assert !future.isCancelled();
 
@@ -423,7 +426,7 @@ public class RpcDispatcherTest {
 
     public void testNotifyingFuture() throws Exception {
         MethodCall sleep=new MethodCall("sleep", new Object[]{1000L}, new Class[]{long.class});
-        CompletableFuture<RspList<Long>> future=da.callRemoteMethodsWithFuture(null, sleep, new RequestOptions(ResponseMode.GET_ALL, 5000L));
+        CompletableFuture<RspList<Long>> future=da.callRemoteMethodsWithFuture(null, sleep, new RequestOptions(GET_ALL, 5000L));
         assert !future.isDone();
         assert !future.isCancelled();
         for(int i=0; i < 10; i++) {
@@ -447,13 +450,13 @@ public class RpcDispatcherTest {
 
     public void testNotifyingFutureWithDelayedListener() throws Exception {
         MethodCall sleep=new MethodCall("sleep", new Object[]{100L}, new Class[]{long.class});
-        CompletableFuture<RspList<Long>> future=da.callRemoteMethodsWithFuture(null, sleep, new RequestOptions(ResponseMode.GET_ALL,5000L));
+        CompletableFuture<RspList<Long>> future=da.callRemoteMethodsWithFuture(null, sleep, new RequestOptions(GET_ALL, 5000L));
         assert !future.isDone();
         assert !future.isCancelled();
 
         Util.sleep(2000);
         assert future.isDone();
-        RspList result=future.get(1L, TimeUnit.MILLISECONDS);
+        RspList<Long> result=future.get(1L, TimeUnit.MILLISECONDS);
         System.out.println("result:\n" + result);
         assert result != null;
         assert result.size() == 3;
@@ -461,43 +464,62 @@ public class RpcDispatcherTest {
 
 
     /**
-     * Invoke a call which sleeps for 5s 5 times. Since the sleep should be done in parallel (OOB msgs), all 5 futures
-     * should be done in roughly 5s. JIRA: https://issues.jboss.org/browse/JGRP-2039
+     * Invoke a call which sleeps for 2s 5 times. Since the sleep should be done in parallel (OOB msgs), all 5 futures
+     * should be done in roughly 2s. JIRA: https://issues.redhat.com/browse/JGRP-2039
      */
     public void testMultipleFutures() throws Exception {
-        final int NUM_CALLS=5, MAX_SLEEP=10000; // should be done in ~5s, make it 10 to be on the safe side
-        MethodCall sleep=new MethodCall("sleep", new Object[]{5000L}, new Class[]{long.class});
-        List<Future<RspList<Long>>> futures=new ArrayList<>();
-        long target=System.currentTimeMillis() + MAX_SLEEP;
+        _testMultipleUnicastFuturesToDest(null); // send to all
+    }
 
-        // if we didn't use DONT_BUNDLE, all OOB msgs from the same sender in a batch would be delivered sequentially!
-        RequestOptions options=new RequestOptions(ResponseMode.GET_ALL, 30000L)
-          .flags(Message.Flag.OOB, Message.Flag.DONT_BUNDLE);
+    public void testMultipleUnicastFuturesToSelf() throws Exception {
+        _testMultipleUnicastFuturesToDest(a.getAddress());
+    }
+
+    public void testMultipleUnicastFuturesToOther() throws Exception {
+        _testMultipleUnicastFuturesToDest(b.getAddress());
+    }
+
+    /**
+     * Invoke a call which sleeps for 2s 5 times. Since the sleep should be done in parallel (OOB msgs), all 5 futures
+     * should be done in roughly 2s. JIRA: https://issues.redhat.com/browse/JGRP-2039
+     */
+    protected void _testMultipleUnicastFuturesToDest(Address dest) throws Exception {
+        final int       NUM_CALLS=5, MAX_SLEEP=4000; // should be done in ~2s, make it 4s to be safe
+        List<Future<?>> futures=new ArrayList<>();
+        RequestOptions  opts=new RequestOptions(GET_ALL, 30000L).flags(OOB, DONT_BUNDLE);
+
+        long start=System.currentTimeMillis();
         for(int i=0; i < NUM_CALLS; i++) {
-            Future<RspList<Long>> future=da.callRemoteMethodsWithFuture(null, sleep, options);
+            Future<?> future;
+            MethodCall sleep=new MethodCall("sleep", new Object[]{i+1,2000L}, new Class[]{int.class, long.class});
+            if(dest == null)
+                future=da.callRemoteMethodsWithFuture(null, sleep, opts);
+            else
+                future=da.callRemoteMethodWithFuture(dest, sleep, opts);
             futures.add(future);
         }
-
-        List<Future<RspList<Long>>> rsps=new ArrayList<>();
-        while(!futures.isEmpty() && System.currentTimeMillis() < target) {
-            for(Iterator<Future<RspList<Long>>> it=futures.iterator(); it.hasNext();) {
-                Future<RspList<Long>> future=it.next();
-                if(future.isDone()) {
-                    it.remove();
-                    rsps.add(future);
-                }
+        Util.waitUntilTrue(MAX_SLEEP, 50, () -> futures.stream().allMatch(Future::isDone));
+        long time=System.currentTimeMillis() - start;
+        System.out.printf("\n%d responses (in %d ms):\n", futures.size(), time);
+        futures.forEach(f -> {
+            Object ret=null;
+            try {
+                ret=f.get();
             }
-            Util.sleep(500);
-        }
-        System.out.println("\n" + rsps.size() + " responses:\n");
-        rsps.forEach(System.out::println);
-        assert rsps.size() == NUM_CALLS;
+            catch(Exception e) {
+                ret=e.toString();
+            }
+            System.out.printf("%s\n", ret);
+        });
+        assert futures.size() == NUM_CALLS;
+        assert time < MAX_SLEEP;
     }
+
 
     public void testMultipleNotifyingFutures() throws Exception {
         MethodCall sleep=new MethodCall("sleep", new Object[]{100L}, new Class[]{long.class});
         List<CompletableFuture<RspList<Long>>> listeners=new ArrayList<>();
-        RequestOptions options=new RequestOptions(ResponseMode.GET_ALL, 30000L);
+        RequestOptions options=new RequestOptions(GET_ALL, 30000L);
         for(int i=0; i < 10; i++) {
             CompletableFuture<RspList<Long>> f=da.callRemoteMethodsWithFuture(null, sleep, options);
             listeners.add(f);
@@ -515,7 +537,7 @@ public class RpcDispatcherTest {
             if(all_done)
                 break;
             Util.sleep(500);
-            System.out.println("");
+            System.out.println();
         }
         for(CompletableFuture<RspList<Long>> listener: listeners)
             assert listener.isDone();
@@ -526,14 +548,14 @@ public class RpcDispatcherTest {
 
     public void testFutureCancel() throws Exception {
         MethodCall sleep=new MethodCall("sleep", new Object[]{1000L}, new Class[]{long.class});
-        Future<RspList<Long>> future=da.callRemoteMethodsWithFuture(null, sleep, new RequestOptions(ResponseMode.GET_ALL, 5000L));
+        Future<RspList<Long>> future=da.callRemoteMethodsWithFuture(null, sleep, new RequestOptions(GET_ALL, 5000L));
         assert !future.isDone();
         assert !future.isCancelled();
         future.cancel(true);
         assert future.isDone();
         assert future.isCancelled();
 
-        future=da.callRemoteMethodsWithFuture(null, sleep, new RequestOptions(ResponseMode.GET_ALL, 0));
+        future=da.callRemoteMethodsWithFuture(null, sleep, new RequestOptions(GET_ALL, 0));
         assert !future.isDone();
         assert !future.isCancelled();
         future.cancel(true);
@@ -564,7 +586,7 @@ public class RpcDispatcherTest {
     
 
     /**
-     * Tests a method call to {A,B,C} where C left *before* the call. http://jira.jboss.com/jira/browse/JGRP-620
+     * Tests a method call to {A,B,C} where C left *before* the call. https://issues.redhat.com/browse/JGRP-620
      */
     public void testMethodInvocationToNonExistingMembers() throws Exception {
         final int timeout = 5 * 1000 ;
@@ -582,33 +604,33 @@ public class RpcDispatcherTest {
         
         // make an RPC call using C's now outdated view of membership
         System.out.println("calling method foo() in " + members + " (view=" + b.getView() + ")");
-        RspList<Integer> rsps=da.callRemoteMethods(members, "foo", null, null, new RequestOptions(ResponseMode.GET_ALL, timeout));
+        RspList<Integer> rsps=da.callRemoteMethods(members, "foo", null, null, new RequestOptions(GET_ALL, timeout));
         
         // all responses 
         System.out.println("responses:\n" + rsps);
         assert rsps.size() == 2;
         for(Map.Entry<Address,Rsp<Integer>> entry: rsps.entrySet()) {
-            Rsp rsp=entry.getValue();
-            Util.assertTrue("response from " + entry.getKey() + " was received", rsp.wasReceived());
-            Util.assertFalse(rsp.wasSuspected());
+            Rsp<Integer> rsp=entry.getValue();
+            assert rsp.wasReceived();
+            assert !rsp.wasSuspected();
         }
 
         List<Address> mbrs=new ArrayList<>(members);
         mbrs.remove(b.getAddress());
         System.out.println("calling method foo() in " + mbrs + " (view=" + b.getView() + ")");
-        rsps=da.callRemoteMethods(mbrs, "foo", null, null, new RequestOptions(ResponseMode.GET_ALL, timeout));
+        rsps=da.callRemoteMethods(mbrs, "foo", null, null, new RequestOptions(GET_ALL, timeout));
 
         // all responses
         System.out.println("responses:\n" + rsps);
         assert rsps.size() == 1;
         for(Map.Entry<Address,Rsp<Integer>> entry: rsps.entrySet()) {
-            Rsp rsp=entry.getValue();
-            Util.assertTrue("response from " + entry.getKey() + " was received", rsp.wasReceived());
-            Util.assertFalse(rsp.wasSuspected());
+            Rsp<Integer> rsp=entry.getValue();
+            assert rsp.wasReceived();
+            assert !rsp.wasSuspected();
         }
 
         rsps=da.callRemoteMethods(mbrs, "foo", null, null,
-                                  new RequestOptions(ResponseMode.GET_ALL, timeout).transientFlags(Message.TransientFlag.DONT_LOOPBACK));
+                                  new RequestOptions(GET_ALL, timeout).transientFlags(Message.TransientFlag.DONT_LOOPBACK));
 
 
         System.out.println("responses:\n" + rsps);
@@ -616,7 +638,7 @@ public class RpcDispatcherTest {
 
         mbrs.clear();
         rsps=da.callRemoteMethods(mbrs, "foo", null, null,
-                                  new RequestOptions(ResponseMode.GET_ALL, timeout).transientFlags(Message.TransientFlag.DONT_LOOPBACK));
+                                  new RequestOptions(GET_ALL, timeout).transientFlags(Message.TransientFlag.DONT_LOOPBACK));
 
         // all responses
         System.out.println("responses:\n" + rsps);
@@ -633,7 +655,6 @@ public class RpcDispatcherTest {
      * required to process requests.
      * 
      * The expected behaviour is that all RPC requests complete successfully.
-     *
      */
     public void testLargeReturnValueUnicastCall() throws Exception {
         setProps(a,b,c);
@@ -646,35 +667,42 @@ public class RpcDispatcherTest {
         Method meth=ServerObject.class.getDeclaredMethod("foo");
         List<Address> targets=Arrays.asList(b.getAddress(), c.getAddress());
         RpcStats stats=da.rpcStats().extendedStats(true);
+        da.correlator().rpcStats(true);
 
         // sync mcast with future
         da.callRemoteMethodsWithFuture(null, new MethodCall(meth), RequestOptions.SYNC());
         System.out.println("stats = " + stats);
+        waitUntil(() -> stats.multicasts(true) == 1);
         assert stats.multicasts(true) == 1;
 
         // async mcast with future
         da.callRemoteMethodsWithFuture(null, new MethodCall(meth), RequestOptions.ASYNC());
         System.out.println("stats = " + stats);
+        waitUntil(() -> stats.multicasts(false) == 1);
         assert stats.multicasts(false) == 1;
 
         // sync anycast with future
         da.callRemoteMethodsWithFuture(targets, new MethodCall(meth), RequestOptions.SYNC().anycasting(true));
         System.out.println("stats = " + stats);
+        waitUntil(() -> stats.anycasts(true) == 1);
         assert stats.anycasts(true) == 1;
 
         // async anycast with future
         da.callRemoteMethodsWithFuture(targets, new MethodCall(meth), RequestOptions.ASYNC().anycasting(true));
         System.out.println("stats = " + stats);
+        waitUntil(() -> stats.anycasts(false) == 1);
         assert stats.anycasts(false) == 1;
 
         // sync unicast with future
         da.callRemoteMethodWithFuture(b.getAddress(), new MethodCall(meth), RequestOptions.SYNC());
         System.out.println("stats = " + stats);
+        waitUntil(() -> stats.unicasts(true) == 1);
         assert stats.unicasts(true) == 1;
 
         // async unicast with future
         da.callRemoteMethodWithFuture(b.getAddress(), new MethodCall(meth), RequestOptions.ASYNC());
         System.out.println("stats = " + stats);
+        waitUntil(() -> stats.unicasts(false) == 1);
         assert stats.unicasts(false) == 1;
 
 
@@ -709,7 +737,12 @@ public class RpcDispatcherTest {
         assert stats.unicasts(false) == 2;
     }
 
-
+    protected static void waitUntil(BooleanSupplier condition) throws TimeoutException {
+        long start=System.nanoTime();
+        Util.waitUntilNoX(2000, 100, condition);
+        long time=System.nanoTime() - start;
+        System.out.printf("-- waited for %s\n", Util.printTime(time, TimeUnit.NANOSECONDS));
+    }
 
     protected static void setProps(JChannel... channels) {
         for(JChannel ch: channels) {
@@ -724,7 +757,7 @@ public class RpcDispatcherTest {
 
             prot=ch.getProtocolStack().getTransport();
             if(prot != null)
-                ((TP)prot).setMaxBundleSize(14000);
+                ((TP)prot).getBundler().setMaxSize(14000);
         }
     }
 
@@ -747,7 +780,7 @@ public class RpcDispatcherTest {
         System.out.println("\ntesting with " + size + " bytes");
         long startTime = System.currentTimeMillis();
         RspList<Object> rsps=da.callRemoteMethods(null, "largeReturnValue", new Object[]{size}, new Class[]{int.class},
-                                                  new RequestOptions(ResponseMode.GET_ALL, timeout));
+                                                  new RequestOptions(GET_ALL, timeout));
         long stopTime = System.currentTimeMillis();
         System.out.println("test took: " + (stopTime-startTime) + " ms");
         System.out.println("rsps:");
@@ -785,7 +818,7 @@ public class RpcDispatcherTest {
 
         System.out.println("\ntesting with " + size + " bytes");
         RspList<Object> rsps=da.callRemoteMethods(null, "largeReturnValue", new Object[]{size}, new Class[]{int.class},
-                                                  new RequestOptions(ResponseMode.GET_ALL, timeout));
+                                                  new RequestOptions(GET_ALL, timeout));
         System.out.println("rsps:");
         assert rsps != null;
         assert rsps.size() == 3 : "there should be three responses to the RPC call but only " + rsps.size() +
@@ -801,7 +834,7 @@ public class RpcDispatcherTest {
             if (obj instanceof java.lang.Throwable) {
                 Throwable t = (Throwable) obj ;
 
-                System.out.println(t.toString() + " exception was raised processing argument from " +
+                System.out.println(t + " exception was raised processing argument from " +
                                      entry.getKey() + " -this is expected") ;
                 continue ;
             }
@@ -834,20 +867,20 @@ public class RpcDispatcherTest {
         final long timeout = LARGE_VALUE_TIMEOUT * 1000 ;
 
         System.out.println("\ntesting unicast call with " + size + " bytes");
-        Util.assertNotNull(dst);
+        assert dst != null;
 
         long startTime = System.currentTimeMillis();
         byte[] val=da.callRemoteMethod(dst, "largeReturnValue", new Object[]{size}, new Class[]{int.class},
-                                       new RequestOptions(ResponseMode.GET_ALL, timeout));
+                                       new RequestOptions(GET_ALL, timeout));
         long stopTime = System.currentTimeMillis();
         System.out.println("test took: " + (stopTime-startTime) + " ms");
 
         // check value is not null, otherwise fail the test
-        Util.assertNotNull("return value should be non-null", val);
+        assert val != null;
         System.out.println("rsp: " + val.length + " bytes");
         
         // returned value should have requested size
-        Util.assertEquals("return value does not match requested size", size, val.length);
+        assert size == val.length;
     }
 
     /**
@@ -859,7 +892,8 @@ public class RpcDispatcherTest {
      * function largeReturnValue(int size) returns a byte array of size 'size'
      */
     protected static class ServerObject {
-        protected int i;
+        protected final String name;
+        protected final int    i;
 
         protected static final Method[] methods;
 
@@ -881,17 +915,32 @@ public class RpcDispatcherTest {
         }
 
 
-        public ServerObject(int i) {
+        public ServerObject(String name, int i) {
+            this.name=name;
             this.i=i;
         }
 
         public int foo() {return i;}
         public static void bar() {;}
         
-        public static long sleep(long timeout) {
+        public long sleep(long timeout) {
+            long id=Thread.currentThread().getId();
+            System.out.printf("-- [%d] [%s] %s: sleeping for %d ms\n", id, new Date(), name, timeout);
             long start=System.currentTimeMillis();
             Util.sleep(timeout);
-            return System.currentTimeMillis() - start;
+            long retval=System.currentTimeMillis() - start;
+            System.out.printf("-- [%d] [%s] %s: slept for %d ms\n", id, new Date(), name, retval);
+            return retval;
+        }
+
+        public long sleep(int invocation_id, long timeout) {
+            long id=Thread.currentThread().getId();
+            System.out.printf("-- [%d] [%s] [#%d] %s: sleeping for %d ms\n", id, new Date(), invocation_id, name, timeout);
+            long start=System.currentTimeMillis();
+            Util.sleep(timeout);
+            long retval=System.currentTimeMillis() - start;
+            System.out.printf("-- [%d] [%s] [#%d] %s: slept for %d ms\n", id, new Date(), invocation_id, name, retval);
+            return retval;
         }
 
 

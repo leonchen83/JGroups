@@ -4,31 +4,26 @@ package org.jgroups.conf;
 
 import org.jgroups.logging.Log;
 import org.jgroups.logging.LogFactory;
+import org.jgroups.util.Tuple;
 import org.jgroups.util.Util;
-import org.w3c.dom.*;
-import org.xml.sax.ErrorHandler;
-import org.xml.sax.InputSource;
-import org.xml.sax.SAXException;
-import org.xml.sax.SAXParseException;
 
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.URL;
+import java.io.*;
 import java.util.*;
-import java.util.concurrent.atomic.AtomicReference;
+
+import static org.jgroups.util.Util.readTillMatchingCharacter;
 
 /**
  * Uses XML to configure a protocol stack
  * @author Vladimir Blagojevic
+ * @author Bela Ban
  */
 public class XmlConfigurator implements ProtocolStackConfigurator {
     private final List<ProtocolConfiguration> configuration=new ArrayList<>();
     protected static final Log                log=LogFactory.getLog(XmlConfigurator.class);
 
+    protected enum ElementType {
+        START, COMPLETE, END, COMMENT, UNDEFINED
+    }
     
     protected XmlConfigurator(List<ProtocolConfiguration> protocols) {
         configuration.addAll(protocols);
@@ -78,117 +73,249 @@ public class XmlConfigurator implements ProtocolStackConfigurator {
 
 
     protected static XmlConfigurator parse(InputStream stream) throws java.io.IOException {
-
-        // CAUTION: crappy code ahead ! I (bela) am not an XML expert, so the code below is pretty amateurish...
-        // But it seems to work, and it is executed only on startup, so no perf loss on the critical path.
-        // If somebody wants to improve this, please be my guest.
         try {
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            DocumentBuilder builder = factory.newDocumentBuilder();
-            builder.setEntityResolver((publicId, systemId) -> {
-                if (systemId != null && systemId.startsWith("http://www.jgroups.org/schema/JGroups-")) {
-                    String schemaName = systemId.substring("http://www.jgroups.org/".length());
-                    InputStream schemaIs = getAsInputStreamFromClassLoader(schemaName);
-                    if (schemaIs == null) {
-                        throw new IOException("Schema not found from classloader: " + schemaName);
+            XmlNode root=parseXmlDocument(stream);
+
+            // check if we have any include
+            boolean has_includes=root.getChildren().stream().anyMatch(c -> c.getName().equals("include"));
+            if(has_includes) {
+                List<XmlNode> children=root.getChildren(), new_children=new ArrayList<>(children.size() + 5);
+                for(XmlNode child: children) {
+                    if("include".equals(child.getName())) {
+                        String filename=child.getAttribute("file");
+                        filename=Util.substituteVariable(filename);
+                        try(InputStream input_stream=ConfiguratorFactory.getConfigStream(filename)) {
+                            if(input_stream == null)
+                                throw new FileNotFoundException(String.format(Util.getMessage("FileNotFound"), filename));
+                            XmlNode new_child=parseXmlDocument(input_stream);
+                            if(!new_child.getName().equals("config")) // no <config> tag present (optional)
+                                new_children.add(new_child);
+                            else
+                                new_children.addAll(new_child.getChildren());
+                        }
                     }
-                    InputSource source = new InputSource(schemaIs);
-                    source.setPublicId(publicId);
-                    source.setSystemId(systemId);
-                    return source;
+                    else
+                        new_children.add(child);
                 }
-                return null;
-            });
-            // Use AtomicReference to allow make variable final, not for atomicity
-            // We store only last exception
-            final AtomicReference<SAXParseException> exceptionRef = new AtomicReference<>();
-            builder.setErrorHandler(new ErrorHandler() {
-
-                public void warning(SAXParseException exception) throws SAXException {
-                    log.warn(Util.getMessage("ParseFailure"), exception);
-                }
-
-                public void fatalError(SAXParseException exception) throws SAXException {
-                    exceptionRef.set(exception);
-                }
-
-                public void error(SAXParseException exception) throws SAXException {
-                    exceptionRef.set(exception);
-                }
-            });
-            Document document = builder.parse(stream);
-            if (exceptionRef.get() != null) {
-                throw exceptionRef.get();
+                root.setChildren(new_children);
             }
-
-            // The root element of the document should be the "config" element,
-            // but the parser(Element) method checks this so a check is not
-            // needed here.
-            Element configElement = document.getDocumentElement();
-            return parse(configElement);
-        } catch (Exception x) {
+            return parse(root);
+        }
+        catch (Exception x) {
             throw new IOException(String.format(Util.getMessage("ParseError"), x.getLocalizedMessage()));
         }
     }
 
-    private static InputStream getAsInputStreamFromClassLoader(String filename) {
-        ClassLoader cl = Thread.currentThread().getContextClassLoader();
-        InputStream is = cl == null ? null : cl.getResourceAsStream(filename);
-        if (is == null) {
-            // check system class loader
-            is = XmlConfigurator.class.getClassLoader().getResourceAsStream(filename);
-        }
-        return is;
-    }
-    
-    protected static XmlConfigurator parse(Element root_element) throws Exception {
-        return new XmlConfigurator(parseProtocols(root_element));
+    protected static XmlConfigurator parse(XmlNode root) throws Exception {
+        return new XmlConfigurator(parseProtocols(root));
     }
 
 
-    public static List<ProtocolConfiguration> parseProtocols(Element root_element) throws Exception {
-        // CAUTION: crappy code ahead ! I (bela) am not an XML expert, so the code below is pretty amateurish...
-        // But it seems to work, and it is executed only on startup, so no perf loss on the critical path.
-        // If somebody wants to improve this, please be my guest.
-        String root_name=root_element.getNodeName().trim().toLowerCase();
+    public static List<ProtocolConfiguration> parseProtocols(XmlNode root) throws Exception {
+        String root_name=root.getName().trim().toLowerCase();
         if(!"config".equals(root_name))
             throw new IOException("the configuration does not start with a <config> element: " + root_name);
 
-        final List<ProtocolConfiguration> prot_data=new ArrayList<>();
-        NodeList prots=root_element.getChildNodes();
-        for(int i=0;i < prots.getLength();i++) {
-            Node node=prots.item(i);
-            if(node.getNodeType() != Node.ELEMENT_NODE)
-                continue;
-
-            Element tag=(Element)node;
-            String  protocol=tag.getTagName();
-            Map<String,String> params=new HashMap<>();
-
-            NamedNodeMap attrs=tag.getAttributes();
-            int attrLength=attrs.getLength();
-            for(int a=0;a < attrLength;a++) {
-                Attr attr=(Attr)attrs.item(a);
-                String name=attr.getName();
-                String value=attr.getValue();
-                params.put(name, value);
-            }
-            ProtocolConfiguration cfg=new ProtocolConfiguration(protocol, params);
+        List<ProtocolConfiguration> prot_data=new ArrayList<>();
+        for(XmlNode node: root.getChildren()) {
+            String  protocol=node.getName();
+            Map<String,String> attrs=node.getAttributes();
+            ProtocolConfiguration cfg=new ProtocolConfiguration(protocol, attrs);
             prot_data.add(cfg);
 
             // store protocol-specific configuration (if available); this will be passed to the protocol on
             // creation to to parse
-            NodeList subnodes=node.getChildNodes();
-            for(int j=0; j < subnodes.getLength(); j++) {
-                Node subnode=subnodes.item(j);
-                if(subnode.getNodeType() != Node.ELEMENT_NODE)
-                    continue;
+            List<XmlNode> subnodes=node.getChildren();
+            if(subnodes == null)
+                continue;
+            for(XmlNode subnode: subnodes) {
                 cfg.addSubtree(subnode);
             }
         }
         return prot_data;
     }
 
+
+    /** Reads XML and returns a simple tree of XmlNodes */
+    public static XmlNode parseXmlDocument(InputStream in) throws IOException {
+        Deque<XmlNode> stack=new ArrayDeque<>();
+        XmlNode        current=null;
+        while(true) {
+            String s=readNode(in);
+            if(s == null)
+                break;
+
+            s=sanitize(s);
+            ElementType type=getType(s);
+            if(type == ElementType.COMMENT)
+                continue;
+
+            // remove "<", "/> and ">"
+            s=s.replace("<", "").replace( "/>", "").replace(">", "")
+              .trim();
+
+            InputStream input=new ByteArrayInputStream(s.getBytes());
+            String name=Util.readToken(input);
+            XmlNode n=new XmlNode(name);
+            for(;;) {
+                Tuple<String,String> tuple=readAttribute(input);
+                if(tuple == null)
+                    break;
+                n.addAttribute(tuple.getVal1(), tuple.getVal2());
+            }
+
+            current=stack.peekFirst();
+            switch(type) {
+                case COMPLETE:
+                    if(current == null)
+                        current=n;
+                    else
+                        current.addChild(n);
+                    break;
+                case START:
+                    if(current != null)
+                        current.addChild(n);
+                    stack.push(n);
+                    break;
+                case END:
+                    stack.pop();
+            }
+        }
+        return current;
+    }
+
+
+    protected static String readNode(InputStream in) throws IOException {
+        StringBuilder sb=new StringBuilder();
+        boolean       eof=false, in_comment=false;
+        int           comments=0;
+
+        for(;;) {
+            int ch=in.read();
+            if(ch == -1) {
+                eof=true;
+                break;
+            }
+            switch(ch) {
+                case '<':
+                    if(isCommentStart(in, sb, in_comment)) {
+                        comments++;
+                        in_comment=true;
+                    }
+                    continue;
+                case '-':
+                    if(isCommentEnd(in, sb, in_comment)) {
+                        comments--;
+                        if(comments < 0)
+                            throw new IllegalStateException("found '-->' without corresponding '<!--'");
+                        if(comments == 0)
+                            in_comment=false;
+                    }
+                    continue;
+                case '>':
+                    if(!in_comment) {
+                        sb.append((char)ch);
+                        return sb.toString();
+                    }
+                    break;
+            }
+            if(!in_comment)
+                sb.append((char)ch);
+        }
+
+        String retval=sb.toString().trim();
+        return eof && retval.isEmpty()? null : retval;
+    }
+
+    /** Searches for a sequence of '!--' */
+    protected static boolean isCommentStart(InputStream in, StringBuilder sb, boolean drop) throws IOException {
+        return find('<', "!--", in, sb, drop);
+    }
+
+    /* Searches for an end comment, e.g. '-->' */
+    protected static boolean isCommentEnd(InputStream in, StringBuilder sb, boolean drop) throws IOException {
+        return find('-', "->", in, sb, drop);
+    }
+
+    protected static boolean find(char starting_ch, String s, InputStream in, StringBuilder sb, boolean drop)
+      throws IOException {
+        StringBuilder tmp=new StringBuilder().append(starting_ch);
+        for(int i=0; i < s.length(); i++) {
+            int c=s.codePointAt(i);
+            for(;;) {
+                int ch=in.read();
+                if(ch == -1) {
+                    sb.append(tmp);
+                    return false;
+                }
+                tmp.append((char)ch);
+                if(Character.isWhitespace(ch))
+                    continue;
+                if(ch != c) {
+                    if(!drop)
+                        sb.append(tmp);
+                    return false;
+                }
+                else
+                    break;
+            }
+        }
+        return true;
+    }
+
+    /** Fixes errors like "/  >" with "/>" */
+    protected static String sanitize(String s) {
+        return s.replaceAll("/\\s*>", "/>");
+    }
+
+    protected static Tuple<String,String> readAttribute(InputStream in) throws IOException {
+        String attr_name=readTillMatchingCharacter(in, '=');
+        if(attr_name == null)
+            return null;
+        attr_name=attr_name.replace("=", "").trim();
+        String val=readQuotedString(in);
+        if(val == null)
+            return null;
+        return new Tuple<>(attr_name, val);
+    }
+
+    /** Reads the characters between a start and end quote ("). Skips chars escaped with '\' */
+    protected static String readQuotedString(InputStream in) throws IOException {
+        String s=readTillMatchingCharacter(in, '"');
+        if(s == null)
+            return null;
+        StringBuilder sb=new StringBuilder();
+        boolean escaped=false;
+        for(;;) {
+            int ch=in.read();
+            if(ch == -1)
+                break;
+            if(ch == '\\') {
+                escaped=true;
+                continue;
+            }
+
+            if(escaped)
+                escaped=false;
+            else if(ch == '"')
+                break;
+            sb.append((char)ch);
+        }
+        return sb.toString();
+    }
+
+    protected static ElementType getType(String s) {
+        s=s.trim();
+        if(s.startsWith("<!--"))
+            return ElementType.COMMENT;
+        if(s.startsWith("</"))
+            return ElementType.END;
+        if(s.endsWith("/>"))
+            return ElementType.COMPLETE;
+        if(s.endsWith(">"))
+            return ElementType.START;
+        return ElementType.UNDEFINED;
+    }
 
     public static void main(String[] args) throws Exception {
         String input_file=null;
@@ -207,16 +334,9 @@ public class XmlConfigurator implements ProtocolStackConfigurator {
             InputStream input=null;
 
             try {
-                input=new FileInputStream(new File(input_file));
+                input=new FileInputStream(input_file);
             }
-            catch(Throwable t) {
-            }
-            if(input == null) {
-                try {
-                    input=new URL(input_file).openStream();
-                }
-                catch(Throwable t) {
-                }
+            catch(Throwable ignored) {
             }
 
             if(input == null)
@@ -228,75 +348,6 @@ public class XmlConfigurator implements ProtocolStackConfigurator {
         }
         else
             throw new Exception("no input file given");
-    }
-
-    
-    private static String dump(Collection<ProtocolConfiguration> configs) {
-        StringBuilder sb=new StringBuilder();
-        String indent="  ";
-        sb.append("<config>\n");
-
-        for(ProtocolConfiguration cfg: configs) {
-            sb.append(indent).append("<").append(cfg.getProtocolName());
-            Map<String,String> props=cfg.getProperties();
-            if(!props.isEmpty()) {
-                sb.append("\n").append(indent).append(indent);
-                for(Map.Entry<String,String> entry : props.entrySet()) {
-                    String key=entry.getKey();
-                    String val=entry.getValue();
-                    key=trim(key);
-                    val=trim(val);
-                    sb.append(key).append("=\"").append(val).append("\" ");
-                }
-            }
-            sb.append(" />\n");
-        }
-
-        sb.append("</config>\n");
-        return sb.toString();
-    }
-
-    private static String trim(String val) {
-        StringBuilder retval=new StringBuilder();
-        int index;
-
-        val=val.trim();
-        while(true) {
-            index=val.indexOf('\n');
-            if(index == -1) {
-                retval.append(val);
-                break;
-            }
-            retval.append(val, 0, index);
-            val=val.substring(index + 1);
-        }
-
-        return retval.toString();
-    }
-
-    private static String inputAsString(InputStream input) throws IOException {
-        int len=input.available();
-        byte[] buf=new byte[len];
-        input.read(buf, 0, len);
-        return new String(buf);
-    }
-
-    public static String replace(String input, final String expr, String replacement) {
-        StringBuilder sb=new StringBuilder();
-        int new_index=0, index=0, len=expr.length(), input_len=input.length();
-
-        while(true) {
-            new_index=input.indexOf(expr, index);
-            if(new_index == -1) {
-                sb.append(input, index, input_len);
-                break;
-            }
-            sb.append(input, index, new_index);
-            sb.append(replacement);
-            index=new_index + len;
-        }
-
-        return sb.toString();
     }
 
     static void help() {

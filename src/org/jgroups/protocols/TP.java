@@ -3,16 +3,14 @@ package org.jgroups.protocols;
 
 import org.jgroups.*;
 import org.jgroups.annotations.*;
-import org.jgroups.blocks.LazyRemovalCache;
+import org.jgroups.util.LazyRemovalCache;
 import org.jgroups.conf.AttributeType;
 import org.jgroups.conf.ClassConfigurator;
 import org.jgroups.conf.PropertyConverters;
-import org.jgroups.jmx.AdditionalJmxObjects;
 import org.jgroups.logging.LogFactory;
 import org.jgroups.stack.DiagnosticsHandler;
 import org.jgroups.stack.MessageProcessingPolicy;
 import org.jgroups.stack.Protocol;
-import org.jgroups.util.ThreadFactory;
 import org.jgroups.util.UUID;
 import org.jgroups.util.*;
 
@@ -24,9 +22,13 @@ import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+
+import static org.jgroups.conf.AttributeType.SCALAR;
 
 
 /**
@@ -40,7 +42,6 @@ import java.util.concurrent.locks.ReentrantLock;
  * </ul>
  * A subclass has to override
  * <ul>
- * <li>{@link #sendMulticast(byte[], int, int)}
  * <li>{@link #sendUnicast(org.jgroups.PhysicalAddress, byte[], int, int)}
  * <li>{@link #init()}
  * <li>{@link #start()}: subclasses <em>must</em> call super.start() <em>after</em> they initialize themselves
@@ -54,11 +55,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * @author Bela Ban
  */
 @MBean(description="Transport protocol")
-public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHandler, AdditionalJmxObjects {
-
+public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHandler {
     public static final    byte    LIST=1; // we have a list of messages rather than a single message when set
     public static final    byte    MULTICAST=2; // message is a multicast (versus a unicast) message when set
-    public static final    int     MSG_OVERHEAD=Global.SHORT_SIZE + Global.BYTE_SIZE; // version + flags
+    public static final    int     MSG_OVERHEAD=Global.SHORT_SIZE*2 + Global.BYTE_SIZE; // version + flags
     protected static final long    MIN_WAIT_BETWEEN_DISCOVERIES=TimeUnit.NANOSECONDS.convert(10, TimeUnit.SECONDS);  // ns
 
 
@@ -120,85 +120,25 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
       "0 only binds to bind_port and fails if taken")
     protected int port_range=10; // 27-6-2003 bgooren, Only try one port by default
 
-    @Property(description="Whether or not to make a copy of a message before looping it back up. Don't use this; might " +
-      "get removed without warning")
-    protected boolean loopback_copy;
-
-    @Property(description="Loop back the message on a separate thread or use the current thread. Don't use this; " +
-      "might get removed without warning")
-    protected boolean loopback_separate_thread=true;
-
     @Property(description="The fully qualified name of a class implementing MessageProcessingPolicy")
-    protected String message_processing_policy;
+    protected String  message_processing_policy="max";
 
+    @Property(description="The fully qualified name of a class implementing LocalTransport")
+    protected String  local_transport_class;
 
-    @Property(name="message_processing_policy.max_buffer_size",
-      description="Max number of messages buffered for consumption of the delivery thread in MaxOneThreadPerSender. 0 creates an unbounded buffer")
-    protected int msg_processing_max_buffer_size=5000;
+    @Property(description="If true, create virtual threads, otherwise create native threads")
+    protected boolean use_vthreads=true;
 
-    @Property(description="Thread naming pattern for threads in this channel. Valid values are \"pcl\": " +
-      "\"p\": includes the thread name, e.g. \"Incoming thread-1\", \"UDP ucast receiver\", " +
+    @Property(description="Thread naming pattern for threads in this channel. Valid values are \"cl\": " +
       "\"c\": includes the cluster name, e.g. \"MyCluster\", " +
-      "\"l\": includes the local address of the current member, e.g. \"192.168.5.1:5678\"")
+      "\"l\": includes the local address of the current member, e.g. \"A\"")
     protected String thread_naming_pattern="cl";
-
-    @Property(description="Create fibers (if true) or regular threads (if false). This requires Java 15/Loom. " +
-      "If not present, use_fibers will be set to false and regular threads will be created. Note that the ThreadFactory" +
-      "needs to support this (DefaultThreadFactory does)")
-    protected boolean use_fibers;
-
-    @Property(name="thread_pool.enabled",description="Enable or disable the thread pool")
-    protected boolean thread_pool_enabled=true;
-
-    @Property(name="thread_pool.min_threads",description="Minimum thread pool size for the thread pool")
-    protected int thread_pool_min_threads;
-
-    @Property(name="thread_pool.max_threads",description="Maximum thread pool size for the thread pool")
-    protected int thread_pool_max_threads=100;
-
-    @Property(name="thread_pool.keep_alive_time",description="Timeout (ms) to remove idle threads from the pool",
-      type=AttributeType.TIME)
-    protected long thread_pool_keep_alive_time=30000;
-
 
     @Property(description="Interval (in ms) at which the time service updates its timestamp. 0 disables the time service",
       type=AttributeType.TIME)
     protected long time_service_interval=500;
 
-    @Property(description="Switch to enable diagnostic probing. Default is true")
-    protected boolean enable_diagnostics=true;
-
-    @Property(description="Use a multicast socket to listen for probe requests (ignored if enable_diagnostics is false)")
-    protected boolean diag_enable_udp=true;
-
-    @Property(description="Use a TCP socket to listen for probe requests (ignored if enable_diagnostics is false)")
-    protected boolean diag_enable_tcp;
-
-    @Property(description="Multicast address for diagnostic probing. Used when diag_enable_udp is true",
-              defaultValueIPv4="224.0.75.75",defaultValueIPv6="ff0e::0:75:75")
-    protected InetAddress diagnostics_addr;
-
-    @Property(description="Bind address for diagnostic probing. Used when diag_enable_tcp is true")
-    protected InetAddress diagnostics_bind_addr;
-
-    @Property(converter=PropertyConverters.NetworkInterfaceList.class,
-              description="Comma delimited list of interfaces (IP addresses or interface names) that the " +
-                "diagnostics multicast socket should bind to")
-    protected List<NetworkInterface> diagnostics_bind_interfaces;
-
-    @Property(description="Port for diagnostic probing. Default is 7500")
-    protected int diagnostics_port=7500;
-
-    @Property(description="The number of ports to be probed for an available port (TCP)")
-    protected int diagnostics_port_range=50;
-
-    @Property(description="TTL of the diagnostics multicast socket")
-    protected int diagnostics_ttl=8;
-    
-    @Property(description="Authorization passcode for diagnostics. If specified every probe query will be authorized")
-    protected String diagnostics_passcode;
-
-    /** Whether or not warnings about messages from different groups are logged - private flag, not for common use */
+    /** Whether warnings about messages from different groups are logged - private flag, not for common use */
     @Property(description="whether or not warnings about messages from different groups are logged")
     protected boolean log_discard_msgs=true;
 
@@ -220,234 +160,67 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
       "disables this.",type=AttributeType.TIME)
     protected long suppress_time_different_cluster_warnings=60000;
 
-    @Property(description="The fully qualified name of a MessageFactory implementation",exposeAsManagedAttribute=false)
-    protected String msg_factory_class;
-
-    protected MessageFactory msg_factory=new DefaultMessageFactory();
-
-    @Property(description="The number of times a thread pool needs to be full before a thread dump is logged")
-    protected int                 thread_dumps_threshold=1;
-
-    // Incremented when a message is rejected due to a full thread pool. When this value exceeds thread_dumps_threshold,
-    // the threads will be dumped at FATAL level, and thread_dumps will be reset to 0
-    protected final AtomicInteger thread_dumps=new AtomicInteger();
-
-
-    /**
-     * Maximum number of bytes for messages to be queued until they are sent.
-     * This value needs to be smaller than the largest datagram packet size in case of UDP
-     */
-    @Property(name="max_bundle_size", type=AttributeType.BYTES,
-      description="Maximum number of bytes for messages to be queued until they are sent")
-    protected int max_bundle_size=64000;
-
     @Property(description="The type of bundler used (\"ring-buffer\", \"transfer-queue\" (default), \"sender-sends\" or " +
       "\"no-bundler\") or the fully qualified classname of a Bundler implementation")
     protected String bundler_type="transfer-queue";
-
-    @Property(description="The max number of elements in a bundler if the bundler supports size limitations")
-    protected int bundler_capacity=16384;
-
-    @Property(description="Number of spins before a real lock is acquired")
-    protected int bundler_num_spins=5;
-
-    @Property(description="The wait strategy for a RingBuffer")
-    protected String bundler_wait_strategy="park";
 
     @ManagedAttribute(description="Fully qualified classname of bundler")
     public String getBundlerClass() {
         return bundler != null? bundler.getClass().getName() : "null";
     }
 
-    public <T extends TP> T setMaxBundleSize(int size) {
-        if(size <= 0)
-            throw new IllegalArgumentException("max_bundle_size (" + size + ") is <= 0");
-        max_bundle_size=size;
-        return (T)this;
-    }
-    public final int        getMaxBundleSize()                  {return max_bundle_size;}
-    public int              getBundlerCapacity()                {return bundler_capacity;}
-    public <T extends TP> T setBundlerCapacity(int c)           {this.bundler_capacity=c; return (T)this;}
-    public int              getMessageProcessingMaxBufferSize() {return msg_processing_max_buffer_size;}
-    public MessageFactory   getMessageFactory()                 {return msg_factory;}
-    public boolean          useFibers()                         {return use_fibers;}
-
-    public InetAddress getBindAddr() {return bind_addr;}
+    public InetAddress      getBindAddr() {return bind_addr;}
     public <T extends TP> T setBindAddr(InetAddress b) {this.bind_addr=b; return (T)this;}
 
-    public InetAddress getExternalAddr() {return external_addr;}
+    public InetAddress      getExternalAddr() {return external_addr;}
     public <T extends TP> T setExternalAddr(InetAddress e) {this.external_addr=e; return (T)this;}
 
-    public int getExternalPort() {return external_port;}
+    public int              getExternalPort() {return external_port;}
     public <T extends TP> T setExternalPort(int e) {this.external_port=e; return (T)this;}
 
-    public boolean isTrace() {return is_trace;}
+    public boolean          isTrace() {return is_trace;}
     public <T extends TP> T isTrace(boolean i) {this.is_trace=i; return (T)this;}
 
-    public boolean receiveOnAllInterfaces() {return receive_on_all_interfaces;}
+    public boolean          receiveOnAllInterfaces() {return receive_on_all_interfaces;}
     public <T extends TP> T receiveOnAllInterfaces(boolean r) {this.receive_on_all_interfaces=r; return (T)this;}
 
-    public int getLogicalAddrCacheMaxSize() {return logical_addr_cache_max_size;}
+    public int              getLogicalAddrCacheMaxSize() {return logical_addr_cache_max_size;}
     public <T extends TP> T setLogicalAddrCacheMaxSize(int l) {this.logical_addr_cache_max_size=l; return (T)this;}
 
-    public long getLogicalAddrCacheExpiration() {return logical_addr_cache_expiration;}
+    public long             getLogicalAddrCacheExpiration() {return logical_addr_cache_expiration;}
     public <T extends TP> T setLogicalAddrCacheExpiration(long l) {this.logical_addr_cache_expiration=l; return (T)this;}
 
-    public long getLogicalAddrCacheReaperInterval() {return logical_addr_cache_reaper_interval;}
+    public long             getLogicalAddrCacheReaperInterval() {return logical_addr_cache_reaper_interval;}
     public <T extends TP> T setLogicalAddrCacheReaperInterval(long l) {this.logical_addr_cache_reaper_interval=l; return (T)this;}
 
-    public boolean loopbackCopy() {return loopback_copy;}
-    public <T extends TP> T loopbackCopy(boolean l) {this.loopback_copy=l; return (T)this;}
-
-    public boolean loopbackSeparateThread() {return loopback_separate_thread;}
-    public <T extends TP> T loopbackSeparateThread(boolean l) {this.loopback_separate_thread=l; return (T)this;}
-
-    public int getMsgProcessingMaxBufferSize() {return msg_processing_max_buffer_size;}
-    public <T extends TP> T setMsgProcessingMaxBufferSize(int m) {this.msg_processing_max_buffer_size=m; return (T)this;}
-
-    public boolean threadPoolEnabled() {return thread_pool_enabled;}
-    public <T extends TP> T threadPoolEnabled(boolean t) {this.thread_pool_enabled=t; return (T)this;}
-
-    public long getTimeServiceInterval() {return time_service_interval;}
+    public long             getTimeServiceInterval() {return time_service_interval;}
     public <T extends TP> T setTimeServiceInterval(long t) {this.time_service_interval=t; return (T)this;}
 
-    public InetAddress getDiagnosticsAddr() {return diagnostics_addr;}
-    public <T extends TP> T setDiagnosticsAddr(InetAddress d) {
-        this.diagnostics_addr=d; if(diag_handler != null) diag_handler.setDiagnosticsBindAddress(d); return (T)this;
-    }
-
-    public InetAddress getDiagnosticsBindAddr() {return diagnostics_bind_addr;}
-    public <T extends TP> T setDiagnosticsBindAddr(InetAddress d) {
-        this.diagnostics_bind_addr=d; if(diag_handler != null) diag_handler.setDiagnosticsBindAddress(d); return (T)this;
-    }
-
-    public int getDiagnosticsPort() {return diagnostics_port;}
-    public <T extends TP> T setDiagnosticsPort(int d) {
-        this.diagnostics_port=d; if(diag_handler != null) diag_handler.setDiagnosticsPort(d); return (T)this;}
-
-    public int getDiagnosticsPortRange() {return diagnostics_port_range;}
-    public <T extends TP> T setDiagnosticsPortRange(int d) {this.diagnostics_port_range=d; return (T)this;}
-
-    public int getDiagnosticsTtl() {return diagnostics_ttl;}
-    public <T extends TP> T setDiagnosticsTtl(int d) {this.diagnostics_ttl=d; return (T)this;}
-
-    public String getDiagnosticsPasscode() {return diagnostics_passcode;}
-    public <T extends TP> T setDiagnosticsPasscode(String d) {this.diagnostics_passcode=d; return (T)this;}
-
-    public boolean logDiscardMsgs() {return log_discard_msgs;}
+    public boolean          logDiscardMsgs() {return log_discard_msgs;}
     public <T extends TP> T logDiscardMsgs(boolean l) {this.log_discard_msgs=l; return (T)this;}
 
-    public boolean logDiscardMsgsVersion() {return log_discard_msgs_version;}
+    public boolean          logDiscardMsgsVersion() {return log_discard_msgs_version;}
     public <T extends TP> T logDiscardMsgsVersion(boolean l) {this.log_discard_msgs_version=l; return (T)this;}
 
-    public long getWhoHasCacheTimeout() {return who_has_cache_timeout;}
+    public long             getWhoHasCacheTimeout() {return who_has_cache_timeout;}
     public <T extends TP> T setWhoHasCacheTimeout(long w) {this.who_has_cache_timeout=w; return (T)this;}
 
-    public long getSuppressTimeDifferentVersionWarnings() {return suppress_time_different_version_warnings;}
+    public long             getSuppressTimeDifferentVersionWarnings() {return suppress_time_different_version_warnings;}
     public <T extends TP> T setSuppressTimeDifferentVersionWarnings(long s) {this.suppress_time_different_version_warnings=s; return (T)this;}
 
-    public long getSuppressTimeDifferentClusterWarnings() {return suppress_time_different_cluster_warnings;}
+    public long             getSuppressTimeDifferentClusterWarnings() {return suppress_time_different_cluster_warnings;}
     public <T extends TP> T setSuppressTimeDifferentClusterWarnings(long s) {this.suppress_time_different_cluster_warnings=s; return (T)this;}
 
-    public String getMsgFactoryClass() {return msg_factory_class;}
-    public <T extends TP> T setMsgFactoryClass(String m) {this.msg_factory_class=m; return (T)this;}
-
-    public String getBundlerType() {return bundler_type;}
+    public String           getBundlerType()         {return bundler_type;}
     public <T extends TP> T setBundlerType(String b) {this.bundler_type=b; return (T)this;}
 
-    public int getBundlerNumSpins() {return bundler_num_spins;}
-    public <T extends TP> T setBundlerNumSpins(int b) {this.bundler_num_spins=b; return (T)this;}
-
-    public String getBundlerWaitStrategy() {return bundler_wait_strategy;}
-    public <T extends TP> T setBundlerWaitStrategy(String b) {this.bundler_wait_strategy=b; return (T)this;}
-
-    public int              getThreadDumpsThreshold() {return thread_dumps_threshold;}
-    public <T extends TP> T setThreadDumpsThreshold(int t) {this.thread_dumps_threshold=t; return (T)this;}
-
-
-    @ManagedAttribute
-    public String getMessageFactoryClass() {
-        return msg_factory != null? msg_factory.getClass().getName() : "n/a";
-    }
-
-    @ManagedAttribute(type=AttributeType.BYTES)
-    public int getBundlerBufferSize() {
-        if(bundler instanceof TransferQueueBundler)
-            return ((TransferQueueBundler)bundler).getBufferSize();
-        return bundler != null? bundler.size() : 0;
-    }
-
-    @ManagedAttribute(description="The wait strategy for a RingBuffer")
-    public String bundlerWaitStrategy() {
-        return bundler instanceof RingBufferBundler? ((RingBufferBundler)bundler).waitStrategy() : bundler_wait_strategy;
-    }
-
-    @ManagedAttribute(description="Sets the wait strategy in the RingBufferBundler. Allowed values are \"spin\", " +
-      "\"yield\", \"park\", \"spin-park\" and \"spin-yield\" or a fully qualified classname")
-    public <T extends TP> T bundlerWaitStrategy(String strategy) {
-        if(bundler instanceof RingBufferBundler)
-            ((RingBufferBundler)bundler).waitStrategy(strategy);
-        this.bundler_wait_strategy=strategy;
-        return (T)this;
-    }
-
-    @ManagedAttribute(description="Number of spins before a real lock is acquired")
-    public int bundlerNumSpins() {
-        return bundler instanceof RingBufferBundler? ((RingBufferBundler)bundler).numSpins() : bundler_num_spins;
-    }
-
-    @ManagedAttribute(description="Sets the number of times a thread spins until a real lock is acquired")
-    public <T extends TP> T bundlerNumSpins(int spins) {
-        this.bundler_num_spins=spins;
-        if(bundler instanceof RingBufferBundler)
-            ((RingBufferBundler)bundler).numSpins(spins);
-        return (T)this;
-    }
+    @Property
+    public <T extends TP> T useVirtualThreads(boolean f) {use_vthreads=f; return (T)this;}
+    public boolean          useVirtualThreads()          {return use_vthreads;}
 
     @ManagedAttribute(description="Is the logical_addr_cache reaper task running")
     public boolean isLogicalAddressCacheReaperRunning() {
         return logical_addr_cache_reaper != null && !logical_addr_cache_reaper.isDone();
-    }
-
-    @ManagedAttribute(description="Returns the average batch size of received batches")
-    public String getAvgBatchSize() {
-        return avg_batch_size.toString();
-    }
-
-    public AverageMinMax avgBatchSize() {return avg_batch_size;}
-
-
-    public <T extends TP> T setThreadPoolMinThreads(int size) {
-        thread_pool_min_threads=size;
-        if(thread_pool instanceof ThreadPoolExecutor)
-            ((ThreadPoolExecutor)thread_pool).setCorePoolSize(size);
-        return (T)this;
-    }
-
-    public int getThreadPoolMinThreads() {return thread_pool_min_threads;}
-
-
-    public <T extends TP> T setThreadPoolMaxThreads(int size) {
-        thread_pool_max_threads=size;
-        if(thread_pool instanceof ThreadPoolExecutor)
-            ((ThreadPoolExecutor)thread_pool).setMaximumPoolSize(size);
-        return (T)this;
-    }
-
-    public int getThreadPoolMaxThreads() {return thread_pool_max_threads;}
-
-
-    public <T extends TP> T setThreadPoolKeepAliveTime(long time) {
-        thread_pool_keep_alive_time=time;
-        if(thread_pool instanceof ThreadPoolExecutor)
-            ((ThreadPoolExecutor)thread_pool).setKeepAliveTime(time, TimeUnit.MILLISECONDS);
-        return (T)this;
-    }
-
-    public long getThreadPoolKeepAliveTime() {return thread_pool_keep_alive_time;}
-
-    public Object[] getJmxObjects() {
-        return new Object[]{msg_stats, msg_processing_policy, bundler};
     }
 
     @Property(name="level", description="Sets the level")
@@ -457,44 +230,42 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
         return retval;
     }
 
-    @ManagedAttribute(description="Number of thread dumps")
-    public int getNumberOfThreadDumps() {return thread_dumps.get();}
-
-    @ManagedOperation(description="Resets the thread_dumps counter")
-    public void resetThreadDumps() {thread_dumps.set(0);}
 
     @ManagedOperation(description="Changes the message processing policy. The fully qualified name of a class " +
       "implementing MessageProcessingPolicy needs to be given")
-    public void setMessageProcessingPolicy(String policy) {
+    public <T extends TP> T setMessageProcessingPolicy(String policy) {
         if(policy == null)
-            return;
-        if(policy.startsWith("submit")) {
+            return (T)this;
+
+        if(policy.startsWith("submit"))
             msg_processing_policy=new SubmitToThreadPool();
-            msg_processing_policy.init(this);
-            return;
-        }
-        else if(policy.startsWith("max")) {
+        else if(policy.startsWith("max"))
             msg_processing_policy=new MaxOneThreadPerSender();
-            msg_processing_policy.init(this);
-            return;
-        }
+        else if(policy.startsWith("direct"))
+            msg_processing_policy=new PassRegularMessagesUpDirectly();
+        else if(policy.startsWith("unbatch"))
+            msg_processing_policy=new UnbatchOOBBatches();
         try {
-            Class<MessageProcessingPolicy> clazz=(Class<MessageProcessingPolicy>)Util.loadClass(policy, getClass());
-            msg_processing_policy=clazz.getDeclaredConstructor().newInstance();
-            message_processing_policy=policy;
+            if(msg_processing_policy == null) {
+                Class<MessageProcessingPolicy> clazz=(Class<MessageProcessingPolicy>)Util.loadClass(policy, getClass());
+                msg_processing_policy=clazz.getDeclaredConstructor().newInstance();
+                message_processing_policy=policy;
+            }
             msg_processing_policy.init(this);
         }
         catch(Exception e) {
             log.error("failed setting message_processing_policy", e);
         }
+        if(msg_processing_policy != null)
+            message_processing_policy=policy;
+        return (T)this;
     }
 
+    public MessageProcessingPolicy getMessageProcessingPolicy() {return msg_processing_policy;}
+
     /* --------------------------------------------- JMX  ---------------------------------------------- */
-
+    @Component(name="msg_stats")
     protected final MsgStats msg_stats=new MsgStats();
-
-
-
 
     /** The name of the group to which this member is connected. With a shared transport, the channel name is
      * in TP.ProtocolAdapter (cluster_name), and this field is not used */
@@ -518,12 +289,12 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
     public AsciiString getClusterNameAscii() {return cluster_name;}
 
-    @ManagedAttribute(description="Number of messages from members in a different cluster")
+    @ManagedAttribute(description="Number of messages from members in a different cluster",type=SCALAR)
     public int getDifferentClusterMessages() {
         return suppress_log_different_cluster != null? suppress_log_different_cluster.getCache().size() : 0;
     }
 
-    @ManagedAttribute(description="Number of messages from members with a different JGroups version")
+    @ManagedAttribute(description="Number of messages from members with a different JGroups version",type=SCALAR)
     public int getDifferentVersionMessages() {
         return suppress_log_different_version != null? suppress_log_different_version.getCache().size() : 0;
     }
@@ -542,6 +313,12 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
         return (T)this;
     }
 
+    @ManagedOperation(description="Enabled or disabled all stats in all protocols")
+    public void enableAllStats(boolean flag) {
+        for(Protocol p=this; p != null; p=p.getUpProtocol()) {
+            p.enableStats(flag);
+        }
+    }
 
     @ManagedAttribute(description="Type of logger used")
     public static String loggerType() {return LogFactory.loggerType();}
@@ -560,30 +337,29 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
 
     /** The address (host and port) of this member */
-    protected Address         local_addr;
     protected PhysicalAddress local_physical_addr;
-    protected volatile        View view;
+    protected volatile View   view;
 
     /** The members of this group (updated when a member joins or leaves). With a shared transport,
      * members contains _all_ members from all channels sitting on the shared transport */
     protected final Set<Address> members=new CopyOnWriteArraySet<>();
 
 
-    //http://jira.jboss.org/jira/browse/JGRP-849
+    //https://issues.redhat.com/browse/JGRP-849
     protected final ReentrantLock connectLock = new ReentrantLock();
     
 
     // ================================== Thread pool ======================
 
     /** The thread pool which handles unmarshalling, version checks and dispatching of messages */
-    protected Executor                thread_pool;
+    @Component(name="thread_pool")
+    protected ThreadPool              thread_pool=new ThreadPool().log(this.log);
+
+    @Component(name="async_executor")
+    protected AsyncExecutor<Object>   async_executor=new AsyncExecutor<>(thread_pool);
 
     /** Factory which is used by the thread pool */
     protected ThreadFactory           thread_factory;
-
-    protected ThreadFactory           internal_thread_factory;
-
-    protected Executor                internal_pool; // only created if thread_pool is enabled, to handle internal msgs
 
     // ================================== Timer thread pool  =========================
     protected TimeScheduler           timer;
@@ -594,16 +370,22 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     // ================================= Default SocketFactory ========================
     protected SocketFactory           socket_factory=new DefaultSocketFactory();
 
+    @Component(name="bundler")
     protected Bundler                 bundler;
 
+    @Component(name="msg_processing_policy")
     protected MessageProcessingPolicy msg_processing_policy=new MaxOneThreadPerSender();
 
+    @Component(name="local_transport")
+    protected LocalTransport          local_transport;
+
+    @Component(name="diag")
     protected DiagnosticsHandler      diag_handler;
-    protected final List<DiagnosticsHandler.ProbeHandler> preregistered_probe_handlers=new LinkedList<>();
 
+    @Component
+    protected RTT                     rtt=new RTT();
 
-    /** The header including the cluster name, sent with each message. Not used with a shared transport (instead
-     * TP.ProtocolAdapter attaches the header to the message */
+    /** The header including the cluster name, sent with each message */
     protected TpHeader                header;
 
 
@@ -618,8 +400,6 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     protected long last_discovery_request;
 
     protected Future<?> logical_addr_cache_reaper;
-
-    protected final AverageMinMax avg_batch_size=new AverageMinMax();
 
     protected static final LazyRemovalCache.Printable<Address,LazyRemovalCache.Entry<PhysicalAddress>> print_function=
       (logical_addr, entry) -> {
@@ -646,29 +426,39 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
     
 
-
-    /**
-     * Creates the TP protocol, and initializes the state variables, does
-     * however not start any sockets or threads.
-     */
     protected TP() {
     }
 
-    public MsgStats getMessageStats() {return msg_stats;}
+    public MsgStats                getMessageStats()     {return msg_stats;}
+    public MessageProcessingPolicy msgProcessingPolicy() {return msg_processing_policy;}
+    public <T extends TP> T        msgProcessingPolicy(MessageProcessingPolicy p) {this.msg_processing_policy=p; return (T)this;}
+    public RTT                     getRTT()              {return rtt;}
 
-    /** Whether or not hardware multicasting is supported */
+    @Override
+    public void enableStats(boolean flag) {
+        super.enableStats(flag);
+        msg_stats.enable(flag);
+    }
+
+    /** Whether hardware multicasting is supported */
     public abstract boolean supportsMulticasting();
 
     public boolean isMulticastCapable() {return supportsMulticasting();}
+
+    public LazyRemovalCache<Address,PhysicalAddress> getLogicalAddressCache() {return logical_addr_cache;}
 
     public String toString() {
         return local_addr != null? getName() + "(local address: " + local_addr + ')' : getName();
     }
 
-    @ManagedAttribute(description="The address of the channel")
-    public String  getLocalAddress() {return local_addr != null? local_addr.toString() : null;}
-    public Address localAddress()    {return local_addr;}
-    public View    view()            {return view;}
+    public <T extends Protocol> T setAddress(Address addr) {
+        super.setAddress(addr);
+        registerLocalAddress(addr);
+        return (T)this;
+    }
+
+    public PhysicalAddress localPhysicalAddress() {return local_physical_addr;}
+    public View            view()                 {return view;}
 
     @ManagedAttribute(description="The physical address of the channel")
     public String getLocalPhysicalAddress() {return local_physical_addr != null? local_physical_addr.printIpAddress() : null;}
@@ -677,24 +467,20 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
     public void resetStats() {
         msg_stats.reset();
-        avg_batch_size.clear();
         msg_processing_policy.reset();
+        if(local_transport != null)
+            local_transport.resetStats();
+        thread_pool.resetStats();
+        async_executor.resetStats();
     }
 
     public <T extends TP> T registerProbeHandler(DiagnosticsHandler.ProbeHandler handler) {
-        if(diag_handler != null)
-            diag_handler.registerProbeHandler(handler);
-        else {
-            synchronized(preregistered_probe_handlers) {
-                preregistered_probe_handlers.add(handler);
-            }
-        }
+        diag_handler.registerProbeHandler(handler);
         return (T)this;
     }
 
     public <T extends TP> T unregisterProbeHandler(DiagnosticsHandler.ProbeHandler handler) {
-        if(diag_handler != null)
-            diag_handler.unregisterProbeHandler(handler);
+        diag_handler.unregisterProbeHandler(handler);
         return (T)this;
     }
 
@@ -702,70 +488,108 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
     /**
      * Sets a {@link DiagnosticsHandler}. Should be set before the stack is started
-     * @param handler
      */
     public <T extends TP> T setDiagnosticsHandler(DiagnosticsHandler handler) throws Exception {
         if(handler != null) {
-            if(diag_handler != null)
-                diag_handler.stop();
+            diag_handler.stop();
             diag_handler=handler;
-            if(diag_handler != null)
-                diag_handler.start();
+            diag_handler.start();
         }
         return (T)this;
     }
 
-    public Bundler getBundler() {return bundler;}
-
-    /** Installs a bundler. Needs to be done before the channel is connected */
-    public <T extends TP> T setBundler(Bundler bundler) {
-        if(bundler != null)
-            this.bundler=bundler;
+    public LocalTransport    getLocalTransport()                 {return local_transport;}
+    public <T extends TP> T  setLocalTransport(LocalTransport l) {
+        if(this.local_transport != null) {
+            this.local_transport.resetStats();
+            this.local_transport.stop();
+            this.local_transport.destroy();
+            this.local_transport_class=null;
+        }
+        this.local_transport=l;
+        if(this.local_transport != null) {
+            try {
+                this.local_transport_class=l.getClass().toString();
+                this.local_transport.init(this);
+                this.local_transport.start();
+            }
+            catch(Exception ex) {
+                log.error("failed setting new local transport", ex);
+            }
+        }
         return (T)this;
     }
 
+    public <T extends TP> T setLocalTransport(String tp_class) throws Exception {
+        if(tp_class == null || tp_class.trim().equals("null"))
+            return setLocalTransport((LocalTransport)null);
+        Class<?> cl=Util.loadClass(tp_class, getClass());
+        LocalTransport ltp=(LocalTransport)cl.getDeclaredConstructor().newInstance();
+        return setLocalTransport(ltp);
+    }
 
-    public Executor getThreadPool() {
+    public Bundler           getBundler()             {return bundler;}
+
+    /** Installs a bundler */
+    public <T extends TP> T setBundler(Bundler new_bundler) {
+        String old_bundler_class=null;
+        if(bundler != null) {
+            bundler.stop();
+            old_bundler_class=bundler.getClass().getName();
+            new_bundler.init(this);
+            new_bundler.start();
+        }
+        bundler=new_bundler;
+        bundler_type=bundler.getClass().getName();
+        if(old_bundler_class != null)
+            log.debug("%s: replaced bundler %s with %s", local_addr, old_bundler_class, bundler.getClass().getName());
+        return (T)this;
+    }
+
+    public ThreadPool getThreadPool() {
         return thread_pool;
     }
 
     public <T extends TP> T setThreadPool(Executor thread_pool) {
-        if(this.thread_pool != null)
-            shutdownThreadPool(this.thread_pool);
-        this.thread_pool=thread_pool;
+        this.thread_pool.destroy();
+        this.thread_pool.setThreadPool(thread_pool);
         if(timer instanceof TimeScheduler3)
             ((TimeScheduler3)timer).setThreadPool(thread_pool);
         return (T)this;
     }
 
-    public ThreadFactory getThreadPoolThreadFactory() {
+    /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public long getNumRejectedMsgs() {return thread_pool.numberOfRejectedMessages();}
+
+    /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public static long getNumberOfThreadDumps() {return ThreadPool.getNumberOfThreadDumps();}
+
+    /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public long     getNumUcastMsgsSent()       {return msg_stats.getNumUcastsSent();}
+    /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public long     getNumMcastMsgsSent()       {return msg_stats.getNumMcastsSent();}
+    /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public long     getNumUcastMsgsReceived()   {return msg_stats.getNumUcastsReceived();}   /** Don't remove! https://issues.redhat.com/browse/JGRP-2814 */
+    @ManagedAttribute(type=SCALAR) @Deprecated
+    public long     getNumMcastMsgsReceived()   {return msg_stats.getNumMcastsReceived();}
+
+    public ThreadFactory getThreadFactory() {
         return thread_factory;
     }
 
-    public <T extends TP> T setThreadPoolThreadFactory(ThreadFactory factory) {
+    public <T extends TP> T setThreadFactory(ThreadFactory factory) {
         thread_factory=factory;
-        if(thread_pool instanceof ThreadPoolExecutor)
-            ((ThreadPoolExecutor)thread_pool).setThreadFactory(factory);
+        thread_pool.setThreadFactory(factory);
         return (T)this;
     }
 
-    public Executor getInternalThreadPool() {return internal_pool;}
-
-    public <T extends TP> T setInternalThreadPool(Executor thread_pool) {
-        if(this.internal_pool != null)
-            shutdownThreadPool(this.internal_pool);
-        this.internal_pool=thread_pool;
-        return (T)this;
-    }
-
-    public ThreadFactory getInternalThreadPoolThreadFactory() {return internal_thread_factory;}
-
-    public <T extends TP> T setInternalThreadPoolThreadFactory(ThreadFactory factory) {
-        internal_thread_factory=factory;
-        if(internal_pool instanceof ThreadPoolExecutor)
-            ((ThreadPoolExecutor)internal_pool).setThreadFactory(factory);
-        return (T)this;
-    }
+    public AsyncExecutor<Object> getAsyncExecutor()                        {return async_executor;}
+    public <T extends TP> T      setAsyncExecutor(AsyncExecutor<Object> e) {async_executor=e; return (T)this;}
 
     public TimeScheduler getTimer() {return timer;}
 
@@ -788,11 +612,6 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
         return (T)this;
     }
 
-    public ThreadFactory getThreadFactory() {
-        return thread_factory;
-    }
-
-    public <T extends TP> T setThreadFactory(ThreadFactory factory) {thread_factory=factory; return (T)this;}
 
     public SocketFactory getSocketFactory() {
         return socket_factory;
@@ -804,17 +623,13 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     }
 
     /**
-     * Names the current thread. Valid values are "pcl":
-     * p: include the previous (original) name, e.g. "Incoming thread-1", "UDP ucast receiver"
+     * Names the current thread. Valid values are "cl":
      * c: include the cluster name, e.g. "MyCluster"
      * l: include the local address of the current member, e.g. "192.168.5.1:5678"
      */
     public String getThreadNamingPattern() {return thread_naming_pattern;}
 
 
-    public long                   getNumMessagesSent()              {return msg_stats.getNumMsgsSent();}
-    public <T extends TP> T       incrBatchesSent(int delta)        {if(stats) msg_stats.incrNumBatchesSent(delta); return (T)this;}
-    public <T extends TP> T       incrNumSingleMsgsSent(int d)      {if(stats) msg_stats.incrNumSingleMsgsSent(d); return (T)this;}
     public InetAddress            getBindAddress()                  {return bind_addr;}
     public <T extends TP> T       setBindAddress(InetAddress a)     {this.bind_addr=a; return (T)this;}
     public int                    getBindPort()                     {return bind_port;}
@@ -827,43 +642,7 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
 
 
-    @ManagedAttribute(description="Current number of threads in the thread pool")
-    public int getThreadPoolSize() {
-        if(thread_pool instanceof ThreadPoolExecutor)
-            return ((ThreadPoolExecutor)thread_pool).getPoolSize();
-        return 0;
-    }
-
-
-    @ManagedAttribute(description="Current number of active threads in the thread pool")
-    public int getThreadPoolSizeActive() {
-        if(thread_pool instanceof ThreadPoolExecutor)
-            return ((ThreadPoolExecutor)thread_pool).getActiveCount();
-        return 0;
-    }
-
-    @ManagedAttribute(description="Largest number of threads in the thread pool")
-    public int getThreadPoolSizeLargest() {
-        if(thread_pool instanceof ThreadPoolExecutor)
-            return ((ThreadPoolExecutor)thread_pool).getLargestPoolSize();
-        return 0;
-    }
-
-    @ManagedAttribute(description="Current number of threads in the internal thread pool")
-    public int getInternalThreadPoolSize() {
-        if(internal_pool instanceof ThreadPoolExecutor)
-            return ((ThreadPoolExecutor)internal_pool).getPoolSize();
-        return 0;
-    }
-
-    @ManagedAttribute(description="Largest number of threads in the internal thread pool")
-    public int getInternalThreadPoolSizeLargest() {
-        if(internal_pool instanceof ThreadPoolExecutor)
-            return ((ThreadPoolExecutor)internal_pool).getLargestPoolSize();
-        return 0;
-    }
-
-    @ManagedAttribute(name="timer_tasks",description="Number of timer tasks queued up for execution")
+    @ManagedAttribute(name="timer_tasks",description="Number of timer tasks queued up for execution",type=SCALAR)
     public int getNumTimerTasks() {return timer.size();}
 
     @ManagedOperation public String dumpTimerTasks() {return timer.dumpTimerTasks();}
@@ -871,27 +650,17 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     @ManagedOperation(description="Purges cancelled tasks from the timer queue")
     public void removeCancelledTimerTasks() {timer.removeCancelledTasks();}
 
-    @ManagedAttribute(description="Number of threads currently in the pool")
+    @ManagedAttribute(description="Number of threads currently in the pool",type=SCALAR)
     public int getTimerThreads() {return timer.getCurrentThreads();}
 
-    @ManagedAttribute(description="Returns the number of live threads in the JVM")
+    @ManagedAttribute(description="Returns the number of live threads in the JVM",type=SCALAR)
     public static int getNumThreads() {return ManagementFactory.getThreadMXBean().getThreadCount();}
-
-    @ManagedAttribute(description="Whether the diagnostics handler is running or not")
-    public boolean isDiagnosticsRunning() {return diag_handler != null && diag_handler.isRunning();}
 
     public <T extends TP> T setLogDiscardMessages(boolean flag)     {log_discard_msgs=flag; return (T)this;}
     public boolean          getLogDiscardMessages()                 {return log_discard_msgs;}
     public <T extends TP> T setLogDiscardMessagesVersion(boolean f) {log_discard_msgs_version=f; return (T)this;}
     public boolean          getLogDiscardMessagesVersion()          {return log_discard_msgs_version;}
-    public boolean          isDiagnosticsEnabled()                  {return enable_diagnostics;}
-    public <T extends TP> T setDiagnosticsEnabled(boolean f)        {enable_diagnostics=f; return (T)this;}
-    public boolean          isDiagUdEnabled()                       {return diag_handler != null && diag_handler.udpEnabled();}
-    public <T extends TP> T diagEnableUdp(boolean f)                {diag_enable_udp=f;
-                                                                       if(diag_handler != null) diag_handler.enableUdp(f); return (T)this;}
-    public boolean          diagTcpEnabled()                        {return diag_enable_tcp;}
-    public <T extends TP> T diagEnableTcp(boolean f)                {diag_enable_tcp=f;
-                                                                       if(diag_handler != null) diag_handler.enableTcp(f); return (T)this;}
+
 
     @ManagedOperation(description="Dumps the contents of the logical address cache")
     public String printLogicalAddressCache() {
@@ -911,23 +680,19 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
         fetchLocalAddresses();
     }
 
-    /**
-     * Send to all members in the group. UDP would use an IP multicast message, whereas TCP would send N
-     * messages, one for each member
-     * @param data The data to be sent. This is not a copy, so don't modify it
-     * @param offset
-     * @param length
-     * @throws Exception
-     */
-    public abstract void sendMulticast(byte[] data, int offset, int length) throws Exception;
+    public String defaultHeaders(boolean detailed) {
+        int num_members=view != null? view.size() : 0;
+        String fmt=detailed? "%s (ip=%s)\nview=%s\ncluster=%s\nversion=%s %s\n"
+          : "%s [ip=%s, %d mbr(s), cluster=%s, version=%s %s]\n";
+        return String.format(fmt, local_addr != null? local_addr.toString() : "n/a", local_physical_addr,
+                             detailed? view : num_members, cluster_name, Version.description,
+                             Util.JAVA_VERSION.isEmpty()? "" : String.format("(java %s)", Util.JAVA_VERSION));
+    }
 
     /**
-     * Send a unicast to 1 member. Note that the destination address is a *physical*, not a logical address
+     * Send a unicast to a member. Note that the destination address is a *physical*, not a logical address
      * @param dest Must be a non-null unicast address
      * @param data The data to be sent. This is not a copy, so don't modify it
-     * @param offset
-     * @param length
-     * @throws Exception
      */
     public abstract void sendUnicast(PhysicalAddress dest, byte[] data, int offset, int length) throws Exception;
 
@@ -943,57 +708,31 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     public void init() throws Exception {
         this.id=ClassConfigurator.getProtocolId(TP.class);
 
-        if(use_fibers) {
-            if(!Util.fibersAvailable()) {
-                log.warn("use_fibers was set to false, as fibers are not available in this Java version");
-                use_fibers=false;
-            }
+        if(use_vthreads && !Util.virtualThreadsAvailable()) {
+            log.debug("use_virtual_threads was set to false, as virtual threads are not available in this Java version");
+            use_vthreads=false;
+        }
+        if(local_transport_class != null) {
+            Class<?> cl=Util.loadClass(local_transport_class, getClass());
+            local_transport=(LocalTransport)cl.getDeclaredConstructor().newInstance();
+            local_transport.init(this);
         }
 
         if(thread_factory == null)
-            //thread_factory=new DefaultThreadFactory("jgroups", false, true);
-          thread_factory=new LazyThreadFactory("jgroups", false, true)
-            .useFibers(use_fibers).log(this.log);
+            setThreadFactory(new LazyThreadFactory("jgroups", false, true)
+                               .useVirtualThreads(use_vthreads).log(this.log));
 
-        if(internal_thread_factory == null)
-            internal_thread_factory=new LazyThreadFactory("jgroups-int", false, true)
-              .useFibers(use_fibers).log(this.log);
-        
         // local_addr is null when shared transport, channel_name is not used
         setInAllThreadFactories(cluster_name != null? cluster_name.toString() : null, local_addr, thread_naming_pattern);
 
-        if(enable_diagnostics && diag_handler == null)
-            diag_handler=createDiagnosticsHandler();
+        diag_handler=createDiagnosticsHandler();
 
         who_has_cache=new ExpiryCache<>(who_has_cache_timeout);
 
         if(suppress_time_different_version_warnings > 0)
-            suppress_log_different_version=new SuppressLog<>(log, "VersionMismatch", "SuppressMsg");
+            suppress_log_different_version=new SuppressLog<>(log, "VersionMismatch");
         if(suppress_time_different_cluster_warnings > 0)
-            suppress_log_different_cluster=new SuppressLog<>(log, "MsgDroppedDiffCluster", "SuppressMsg");
-
-
-        // ====================================== Thread pool ===========================
-        if(thread_pool == null || (thread_pool instanceof ExecutorService && ((ExecutorService)thread_pool).isShutdown())) {
-            if(thread_pool_enabled) {
-                if(use_fibers) {
-                    internal_pool=thread_pool=Util.createFiberThreadPool(); // Executors.newVirtualThreadExecutor();
-                }
-                else {
-                    int num_cores=Runtime.getRuntime().availableProcessors();
-                    int max_internal_size=Math.max(4, num_cores);
-                    log.debug("thread pool min/max/keep-alive: %d/%d/%d, internal pool: %d/%d/%d (%d cores available)",
-                              thread_pool_min_threads, thread_pool_max_threads, thread_pool_keep_alive_time,
-                              0, max_internal_size, 30000, num_cores);
-                    thread_pool=createThreadPool(thread_pool_min_threads, thread_pool_max_threads, thread_pool_keep_alive_time,
-                                                 "abort", new SynchronousQueue<>(), thread_factory);
-                    internal_pool=createThreadPool(0, max_internal_size, 30000, "abort",
-                                                   new SynchronousQueue<>(), internal_thread_factory);
-                }
-            }
-            else // otherwise use the caller's thread to unmarshal the byte buffer into a message
-                thread_pool=new DirectExecutor();
-        }
+            suppress_log_different_cluster=new SuppressLog<>(log, "MsgDroppedDiffCluster");
 
         // ========================================== Timer ==============================
         if(timer == null) {
@@ -1015,7 +754,6 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
             up(new Event(Event.CONFIG, m));
 
         logical_addr_cache=new LazyRemovalCache<>(logical_addr_cache_max_size, logical_addr_cache_expiration);
-        
         if(logical_addr_cache_reaper_interval > 0 && (logical_addr_cache_reaper == null || logical_addr_cache_reaper.isDone())) {
             logical_addr_cache_reaper=timer.scheduleWithFixedDelay(new Runnable() {
                 public void run() {
@@ -1033,23 +771,26 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
         else
             msg_processing_policy.init(this);
 
-        if(msg_factory_class != null) {
-            Class<MessageFactory> clazz=(Class<MessageFactory>)Util.loadClass(msg_factory_class, getClass());
-            msg_factory=clazz.getDeclaredConstructor().newInstance();
-        }
+        if(bundler == null)
+            bundler=createBundler(bundler_type, getClass());
+        bundler.init(this);
+        rtt.init(this);
+        // When stats is false, we'll set msg_stats.enabled to false, too. However, msg_stats.enabled=false can be
+        // set to false even if stats is true
+        if(!stats)
+            msg_stats.enable(false);
     }
 
 
     /** Creates the unicast and multicast sockets and starts the unicast and multicast receiver threads */
     public void start() throws Exception {
         timer.start();
+        thread_pool.setAddress(local_addr);
+        async_executor.start();
         if(time_service != null)
             time_service.start();
         fetchLocalAddresses();
         startDiagnostics();
-        if(bundler == null)
-            bundler=createBundler(bundler_type);
-        bundler.init(this);
         bundler.start();
         // local_addr is null when shared transport
         setInAllThreadFactories(cluster_name != null? cluster_name.toString() : null, local_addr, thread_naming_pattern);
@@ -1057,92 +798,59 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
     public void stop() {
         stopDiagnostics();
-        if(bundler != null) {
-            bundler.stop();
-            bundler=null;
-        }
+        bundler.stop();
         if(msg_processing_policy != null)
             msg_processing_policy.destroy();
 
         if(time_service != null)
             time_service.stop();
         timer.stop();
+        async_executor.stop();
     }
 
     public void destroy() {
         super.destroy();
-
+        if(local_transport != null)
+            local_transport.destroy();
         if(logical_addr_cache_reaper != null) {
             logical_addr_cache_reaper.cancel(false);
             logical_addr_cache_reaper=null;
         }
-
-        // Stop the thread pools
-        shutdownThreadPool(thread_pool);
-        shutdownThreadPool(internal_pool);
+        thread_pool.destroy();
+        bundler.destroy();
     }
 
-
-    @ManagedAttribute(description="Returns stats about the current bundler")
-    public String bundlerStats() {
-        Map<String,Object> tmp=bundler != null? bundler.getStats() : null;
-        return tmp != null? tmp.toString() : "n/a";
-    }
-
-    @ManagedOperation(description="Resets stats of the current bundler")
-    public void bundlerStatsReset() {bundler.resetStats();}
 
     @ManagedOperation(description="Creates and sets a new bundler. Type has to be either a bundler_type or the fully " +
       "qualified classname of a Bundler impl. Stops the current bundler (if running)")
-    public <T extends TP> T bundler(String type) {
-        Bundler new_bundler=createBundler(type);
-        String old_bundler_class=null;
-        if(bundler != null) {
-            bundler.stop();
-            old_bundler_class=bundler.getClass().getName();
-        }
-        new_bundler.init(this);
-        new_bundler.start();
-        bundler=new_bundler;
-        bundler_type=type;
-        if(old_bundler_class != null)
-            log.debug("%s: replaced bundler %s with %s", local_addr, old_bundler_class, bundler.getClass().getName());
-        return (T)this;
+    public <T extends TP> T bundler(String type) throws Exception {
+        return setBundler(createBundler(type, getClass()));
     }
 
 
 
 
     @ManagedOperation(description="Enables diagnostics and starts DiagnosticsHandler (if not running)")
-    public void enableDiagnostics() {
-        enable_diagnostics=true;
+    public <T extends TP> T enableDiagnostics() {
+        diag_handler.setEnabled(true);
         try {
             startDiagnostics();
         }
         catch(Exception e) {
             log.error(Util.getMessage("FailedStartingDiagnostics"), e);
         }
+        return (T)this;
     }
 
     @ManagedOperation(description="Disables diagnostics and stops DiagnosticsHandler (if running)")
     public void disableDiagnostics() {
-        enable_diagnostics=false;
         stopDiagnostics();
     }
 
     protected void startDiagnostics() throws Exception {
-        if(enable_diagnostics) {
-            if(diag_handler == null)
-                diag_handler=createDiagnosticsHandler();
+        if(diag_handler != null) {
             diag_handler.registerProbeHandler(this);
             diag_handler.start();
-            synchronized(preregistered_probe_handlers) {
-                for(DiagnosticsHandler.ProbeHandler handler : preregistered_probe_handlers)
-                    diag_handler.registerProbeHandler(handler);
-            }
-        }
-        synchronized(preregistered_probe_handlers) {
-            preregistered_probe_handlers.clear(); // https://issues.jboss.org/browse/JGRP-1834
         }
     }
 
@@ -1150,9 +858,6 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
         if(diag_handler != null) {
             diag_handler.unregisterProbeHandler(this);
             diag_handler.stop();
-        }
-        synchronized(preregistered_probe_handlers) {
-            preregistered_probe_handlers.clear();
         }
     }
 
@@ -1174,13 +879,11 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
                     break;
                 case "keys":
                     StringBuilder sb=new StringBuilder();
-                    if(diag_handler != null) {
-                        for(DiagnosticsHandler.ProbeHandler handler : diag_handler.getProbeHandlers()) {
-                            String[] tmp=handler.supportedKeys();
-                            if(tmp != null && tmp.length > 0) {
-                                for(String s : tmp)
-                                    sb.append(s).append(" ");
-                            }
+                    for(DiagnosticsHandler.ProbeHandler handler : diag_handler.getProbeHandlers()) {
+                        String[] tmp=handler.supportedKeys();
+                        if(tmp != null) {
+                            for(String s : tmp)
+                                sb.append(s).append(" ");
                         }
                     }
                     retval.put(key, sb.toString());
@@ -1220,7 +923,7 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
                     members.clear();
                     members.addAll(v.getMembers());
 
-                    // fix for https://jira.jboss.org/jira/browse/JGRP-918
+                    // fix for https://issues.redhat.com/browse/JGRP-918
                     logical_addr_cache.retainAll(members);
                     fetchLocalAddresses();
 
@@ -1238,20 +941,33 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
                     bundler.viewChange(evt.getArg());
                 if(msg_processing_policy instanceof MaxOneThreadPerSender)
                     ((MaxOneThreadPerSender)msg_processing_policy).viewChange(view.getMembers());
+
+                if(local_transport != null)
+                    local_transport.viewChange(this.view);
+
+                // Increase thread pool size when view.size() > max_threads (https://issues.redhat.com/browse/JGRP-2655)
+                if(ergonomics && thread_pool.getIncreaseMaxSizeDynamically()) {
+                    int size=view.size();
+                    if(size >= thread_pool.getMaxThreads()) {
+                        int new_size=size+thread_pool.getDelta();
+                        log.warn("%s: view size=%d, thread_pool.max-threads=%d: increasing max-threads to %d",
+                                 local_addr, size, thread_pool.getMaxThreads(), new_size);
+                        thread_pool.setMaxThreads(new_size);
+                    }
+                }
+                thread_pool.removeExpired();
                 break;
 
             case Event.CONNECT:
             case Event.CONNECT_WITH_STATE_TRANSFER:
-            case Event.CONNECT_USE_FLUSH:
-            case Event.CONNECT_WITH_STATE_TRANSFER_USE_FLUSH:
                 cluster_name=new AsciiString((String)evt.getArg());
                 header=new TpHeader(cluster_name);
-
-                // local_addr is null when shared transport
                 setInAllThreadFactories(cluster_name != null? cluster_name.toString() : null, local_addr, thread_naming_pattern);
                 setThreadNames();
                 connectLock.lock();
                 try {
+                    if(local_transport != null)
+                        local_transport.start();
                     handleConnect();
                 }
                 catch(Exception e) {
@@ -1266,6 +982,8 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
                 unsetThreadNames();
                 connectLock.lock();
                 try {
+                    if(local_transport != null)
+                        local_transport.stop();
                     handleDisconnect();
                 }
                 finally {
@@ -1299,11 +1017,7 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
             case Event.REMOVE_ADDRESS:
                 removeLogicalAddressFromCache(evt.getArg());
-                break;
-
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                registerLocalAddress(evt.getArg());
+                local_addr=null;
                 break;
         }
         return null;
@@ -1312,35 +1026,26 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     /** A message needs to be sent to a single member or all members */
     public Object down(Message msg) {
         if(header != null)
-            msg.putHeader(this.id, header); // added patch by Roland Kurmann (March 20 2003)
-
+            msg.putHeaderIfAbsent(this.id, header); // added patch by Roland Kurmann (March 20, 2003)
         setSourceAddress(msg); // very important !! listToBuffer() will fail with a null src address !!
-
-        Address dest=msg.getDest(), sender=msg.getSrc();
+        Address dest=msg.getDest();
         if(is_trace)
-            log.trace("%s: sending msg to %s, src=%s, size=%d, headers are %s", local_addr, dest, sender, msg.size(), msg.printHeaders());
-
-        // Don't send if dest is local address. Instead, send it up the stack. If multicast message, loop back directly
-        // to us (but still multicast). Once we receive this, we discard our own multicast message
-        boolean multicast=dest == null, do_send=multicast || !dest.equals(sender),
-          loop_back=(multicast || dest.equals(sender)) && !msg.isFlagSet(Message.TransientFlag.DONT_LOOPBACK);
-
-        if(dest instanceof PhysicalAddress && dest.equals(local_physical_addr)) {
-            loop_back=true;
-            do_send=false;
+            log.trace("%s: sending msg to %s, src=%s, size=%d, hdrs: %s", local_addr, dest, msg.src(), msg.size(), msg.printHeaders());
+        try {
+            Bundler tmp_bundler=bundler;
+            if(tmp_bundler != null) {
+                tmp_bundler.send(msg);
+                msg_stats.sent(msg);
+            }
         }
-
-        if(loopback_separate_thread) {
-            if(loop_back)
-                loopback(msg, multicast);
-            if(do_send)
-                _send(msg, dest);
+        catch(InterruptedIOException ignored) {
         }
-        else {
-            if(do_send)
-                _send(msg, dest);
-            if(loop_back)
-                loopback(msg, multicast);
+        catch(InterruptedException interruptedEx) {
+            Thread.currentThread().interrupt(); // let someone else handle the interrupt
+        }
+        catch(Throwable e) {
+            log.trace(Util.getMessage("SendFailure"),
+                      local_addr, (dest == null? "cluster" : dest), msg.size(), e.toString(), msg.printHeaders());
         }
         return null;
     }
@@ -1352,108 +1057,61 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
     /* ------------------------------ Private Methods -------------------------------- */
 
-  protected DiagnosticsHandler createDiagnosticsHandler() {
-      return new DiagnosticsHandler(diagnostics_addr, diagnostics_port, diagnostics_bind_interfaces,
-                                    diagnostics_ttl, log, getSocketFactory(), getThreadFactory(), diagnostics_passcode)
-        .transport(this).setDiagnosticsBindAddress(diagnostics_bind_addr)
-        .enableUdp(diag_enable_udp).enableTcp(diag_enable_tcp)
-        .setDiagnosticsPortRange(diagnostics_port_range);
-  }
+    protected DiagnosticsHandler createDiagnosticsHandler() {
+        return new DiagnosticsHandler(log, socket_factory, thread_factory)
+          .printHeaders(this::defaultHeaders).sameCluster(this::sameCluster);
+    }
 
-    protected Bundler createBundler(String type) {
+    public static Bundler createBundler(String type, Class<?> cl) throws Exception {
         if(type == null)
             throw new IllegalArgumentException("bundler type has to be non-null");
 
         switch(type) {
             case "transfer-queue":
             case "tq":
-                return new TransferQueueBundler(bundler_capacity);
-            case "simplified-transfer-queue":
-            case "stq":
-                return new SimplifiedTransferQueueBundler(bundler_capacity);
+                return new TransferQueueBundler();
             case "sender-sends":
             case "ss":
                 return new SenderSendsBundler();
             case "ring-buffer":
             case "rb":
-                return new RingBufferBundler(bundler_capacity).numSpins(bundler_num_spins).waitStrategy(bundler_wait_strategy);
+                return new RingBufferBundler();
             case "ring-buffer-lockless":
             case "rbl":
-                return new RingBufferBundlerLockless(bundler_capacity);
+                return new RingBufferBundlerLockless();
             case "ring-buffer-lockless2":
             case "rbl2":
-                return new RingBufferBundlerLockless2(bundler_capacity);
+                return new RingBufferBundlerLockless2();
             case "no-bundler":
             case "nb":
                 return new NoBundler();
             case "async-no-bundler":
-            case "anb":
-                return new AsyncNoBundler();
             case "ab":
             case "alternating-bundler":
                 return new AlternatingBundler();
             case "rqb": case "rq":
             case "remove-queue-bundler": case "remove-queue":
                 return new RemoveQueueBundler();
+            case "pd":
+            case "pdb":
+            case "per-destination":
+                return new PerDestinationBundler();
+            case "bb":
+                return new BatchBundler();
         }
-
-        try {
-            Class<Bundler> clazz=(Class<Bundler>)Util.loadClass(type, getClass());
-            return clazz.getDeclaredConstructor().newInstance();
-        }
-        catch(Throwable t) {
-            log.warn("failed creating instance of bundler %s: %s", type, t);
-        }
-        return new TransferQueueBundler(bundler_capacity);
+        Class<Bundler> clazz=(Class<Bundler>)Util.loadClass(type, cl);
+        return clazz.getDeclaredConstructor().newInstance();
     }
-
-    protected void loopback(Message msg, final boolean multicast) {
-        final Message copy=loopback_copy? msg.copy(true, true) : msg;
-        if(is_trace)
-            log.trace("%s: looping back message %s, headers are %s", local_addr, copy, copy.printHeaders());
-
-        if(!loopback_separate_thread) {
-            passMessageUp(copy, null, false, multicast, false);
-            return;
-        }
-
-        // changed to fix http://jira.jboss.com/jira/browse/JGRP-506
-        boolean internal=msg.isFlagSet(Message.Flag.INTERNAL);
-        boolean oob=msg.isFlagSet(Message.Flag.OOB);
-        // submitToThreadPool(() -> passMessageUp(copy, null, false, multicast, false), internal);
-        msg_processing_policy.loopback(msg, oob, internal);
-    }
-
-    protected void _send(Message msg, Address dest) {
-        try {
-            Bundler tmp_bundler=bundler;
-            if(tmp_bundler != null)
-                tmp_bundler.send(msg);
-        }
-        catch(InterruptedIOException ignored) {
-        }
-        catch(InterruptedException interruptedEx) {
-            Thread.currentThread().interrupt(); // let someone else handle the interrupt
-        }
-        catch(Throwable e) {
-            log.trace(Util.getMessage("SendFailure"),
-                      local_addr, (dest == null? "cluster" : dest), msg.size(), e.toString(), msg.printHeaders());
-        }
-    }
-
 
 
     /**
-     * If the sender is null, set our own address. We cannot just go ahead and set the address
-     * anyway, as we might be sending a message on behalf of someone else ! E.g. in case of
-     * retransmission, when the original sender has crashed, or in a FLUSH protocol when we
-     * have to return all unstable messages with the FLUSH_OK response.
+     * If the sender is null, set our own address. We cannot just go ahead and set the address anyway, as we might send
+     * a message on behalf of someone else, e.g. in case of retransmission, when the original sender has crashed.
      */
     protected void setSourceAddress(Message msg) {
-        if(msg.getSrc() == null && local_addr != null) // should already be set by TP.ProtocolAdapter in shared transport case !
+        if(msg.getSrc() == null && local_addr != null)
             msg.setSrc(local_addr);
     }
-
 
     public void passMessageUp(Message msg, byte[] cluster_name, boolean perform_cluster_name_matching,
                               boolean multicast, boolean discard_own_mcast) {
@@ -1478,6 +1136,13 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
                     log.warn(Util.getMessage("MsgDroppedDiffCluster"), new AsciiString(cluster_name),this.cluster_name, sender);
             }
             return;
+        }
+        if(rtt.enabled()) {
+            TpHeader hdr=msg.getHeader(id);
+            if(hdr != null && hdr.flag() > 0) {
+                rtt.handleMessage(msg, hdr);
+                return;
+            }
         }
         up_prot.up(msg);
     }
@@ -1505,7 +1170,26 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
         if(batch.multicast() && discard_own_mcast && local_addr != null && local_addr.equals(batch.sender()))
             return;
-        up_prot.up(batch);
+        if(rtt.enabled()) {
+            for(Iterator<Message> it=batch.iterator(); it.hasNext(); ) {
+                Message msg=it.next();
+                TpHeader hdr=msg.getHeader(id);
+                if(hdr != null && hdr.flag() > 0) {
+                    it.remove();
+                    rtt.handleMessage(msg, hdr);
+                }
+            }
+        }
+        if(!batch.isEmpty())
+            up_prot.up(batch);
+    }
+
+    protected boolean sameCluster(String req) {
+        if(!req.startsWith("cluster="))
+            return true;
+        String cluster_name_pattern=req.substring("cluster=".length()).trim();
+        String cname=getClusterName();
+        return cluster_name_pattern == null || Util.patternMatch(cluster_name_pattern, cname);
     }
 
 
@@ -1515,7 +1199,7 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     public void receive(Address sender, byte[] data, int offset, int length) {
         if(data == null) return;
 
-        // drop message from self; it has already been looped back up (https://issues.jboss.org/browse/JGRP-1765)
+        // drop message from self; it has already been looped back up (https://issues.redhat.com/browse/JGRP-1765)
         if(Objects.equals(local_physical_addr, sender))
             return;
 
@@ -1533,15 +1217,15 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
         boolean is_message_list=(flags & LIST) == LIST, multicast=(flags & MULTICAST) == MULTICAST;
         ByteArrayDataInputStream in=new ByteArrayDataInputStream(data, offset, length);
         if(is_message_list) // used if message bundling is enabled
-            handleMessageBatch(in, multicast, msg_factory);
+            handleMessageBatch(in, multicast);
         else
             handleSingleMessage(in, multicast);
     }
 
-    public void receive(Address sender, DataInput in) throws Exception {
+    public void receive(Address sender, DataInput in, int ignoredLength) throws Exception {
         if(in == null) return;
 
-        // drop message from self; it has already been looped back up (https://issues.jboss.org/browse/JGRP-1765)
+        // drop message from self; it has already been looped back up (https://issues.redhat.com/browse/JGRP-1765)
         if(Objects.equals(local_physical_addr, sender))
             return;
 
@@ -1552,21 +1236,22 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
         boolean is_message_list=(flags & LIST) == LIST, multicast=(flags & MULTICAST) == MULTICAST;
         if(is_message_list) // used if message bundling is enabled
-            handleMessageBatch(in, multicast, msg_factory);
+            handleMessageBatch(in, multicast);
         else
             handleSingleMessage(in, multicast);
     }
 
 
-    protected void handleMessageBatch(DataInput in, boolean multicast, MessageFactory factory) {
+    protected void handleMessageBatch(DataInput in, boolean multicast) {
         try {
-            final MessageBatch[] batches=Util.readMessageBatch(in, multicast, factory);
-            final MessageBatch regular=batches[0], oob=batches[1], internal_oob=batches[2], internal=batches[3];
+            final MessageBatch[] batches=Util.readMessageBatch(in, multicast);
+            final MessageBatch regular=batches[0], oob=batches[1];
 
-            processBatch(oob,          true,  false);
-            processBatch(regular,      false, false);
-            processBatch(internal_oob, true,  true);
-            processBatch(internal,     false, true);
+            // we need to update the stats *before* processing the batches: protocols can remove msgs from the batch
+            if(oob != null) msg_stats.received(oob);
+            if(regular != null) msg_stats.received(regular);
+            processBatch(oob,    true);
+            processBatch(regular,false);
         }
         catch(Throwable t) {
             log.error(String.format(Util.getMessage("IncomingMsgFailure"), local_addr), t);
@@ -1577,24 +1262,25 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     protected void handleSingleMessage(DataInput in, boolean multicast) {
         try {
             short type=in.readShort();
-            Message msg=msg_factory.create(type); // don't create headers, readFrom() will do this
+            Message msg=MessageFactory.create(type); // don't create headers, readFrom() will do this
             msg.readFrom(in);
 
             if(!multicast && unicastDestMismatch(msg.getDest()))
                 return;
 
-            boolean oob=msg.isFlagSet(Message.Flag.OOB), internal=msg.isFlagSet(Message.Flag.INTERNAL);
-            msg_processing_policy.process(msg, oob, internal);
+            boolean oob=msg.isFlagSet(Message.Flag.OOB);
+            msg_processing_policy.process(msg, oob);
+            msg_stats.received(msg);
         }
         catch(Throwable t) {
             log.error(String.format(Util.getMessage("IncomingMsgFailure"), local_addr), t);
         }
     }
 
-    protected void processBatch(MessageBatch batch, boolean oob, boolean internal) {
+    protected void processBatch(MessageBatch batch, boolean oob) {
         try {
             if(batch != null && !batch.isEmpty() && !unicastDestMismatch(batch.getDest()))
-                msg_processing_policy.process(batch, oob, internal);
+                msg_processing_policy.process(batch, oob);
         }
         catch(Throwable t) {
             log.error("processing batch failed", t);
@@ -1605,57 +1291,6 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
         return dest != null && !(Objects.equals(dest, local_addr) || Objects.equals(dest, local_physical_addr));
     }
 
-
-    public boolean submitToThreadPool(Runnable task, boolean internal) {
-        if(internal && internal_pool != null)
-            return submitToThreadPool(internal_pool, task, internal, false);
-        return submitToThreadPool(thread_pool, task, internal, true);
-    }
-
-    public boolean submitToThreadPool(Executor pool, Runnable task, boolean internal, boolean forward_to_internal_pool) {
-        try {
-            pool.execute(task);
-        }
-        catch(RejectedExecutionException ex) {
-            if(!internal) {
-                msg_stats.incrNumRejectedMsgs(1);
-                // https://issues.redhat.com/browse/JGRP-2403
-                if(thread_dumps.incrementAndGet() == thread_dumps_threshold) {
-                    log.fatal("%s: thread pool is full (max=%d, active=%d); " +
-                                "thread dump (dumped once, until thread_dump is reset):\n%s",
-                              local_addr, getThreadPoolMaxThreads(), getThreadPoolSize(), Util.dumpThreads());
-                }
-                return false;
-            }
-
-            if(forward_to_internal_pool && internal_pool != null)
-                return submitToThreadPool(internal_pool, task, internal, false);
-            else {
-                msg_stats.incrNumThreadsSpawned(1);
-                return runInNewThread(task);
-            }
-        }
-        catch(Throwable t) {
-            log.error("failure submitting task to thread pool", t);
-            msg_stats.incrNumRejectedMsgs(1);
-            return false;
-        }
-        return true;
-    }
-
-
-    protected boolean runInNewThread(Runnable task) {
-        try {
-            Thread thread=thread_factory != null? thread_factory.newThread(task, "jgroups-temp-thread")
-              : new Thread(task, "jgroups-temp-thread");
-            thread.start();
-            return true;
-        }
-        catch(Throwable t) {
-            log.error("failed spawning new thread", t);
-            return false;
-        }
-    }
 
 
     protected boolean versionMatch(short version, Address sender) {
@@ -1674,18 +1309,25 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
 
     public void doSend(byte[] buf, int offset, int length, Address dest) throws Exception {
-        if(stats) {
-            msg_stats.incrNumMsgsSent(1);
-            msg_stats.incrNumBytesSent(length);
-        }
-        if(dest == null)
-            sendMulticast(buf, offset, length);
+        if(dest != null)
+            sendTo(dest, buf, offset, length);
         else
-            sendToSingleMember(dest, buf, offset, length);
+            sendToAll(buf, offset, length);
     }
 
 
-    protected void sendToSingleMember(final Address dest, byte[] buf, int offset, int length) throws Exception {
+    protected void sendTo(final Address dest, byte[] buf, int offset, int length) throws Exception {
+        if(local_transport != null && local_transport.isLocalMember(dest)) {
+            try {
+                local_transport.sendTo(dest, buf, offset, length);
+                return;
+            }
+            catch(Exception ex) {
+                log.warn("failed sending message to %s via local transport, sending message via regular transport: %s",
+                         dest, ex);
+            }
+        }
+
         PhysicalAddress physical_dest=dest instanceof PhysicalAddress? (PhysicalAddress)dest : getPhysicalAddressFromCache(dest);
         if(physical_dest != null) {
             sendUnicast(physical_dest,buf,offset,length);
@@ -1712,16 +1354,31 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     }
 
 
-
-    /** Fetches the physical addrs for mbrs and sends the msg to each physical address. Asks discovery for missing
+    /** Fetches the physical addrs for all mbrs and sends the msg to each physical address. Asks discovery for missing
      * members' physical addresses if needed */
-    protected void sendToMembers(Collection<Address> mbrs, byte[] buf, int offset, int length) throws Exception {
+    protected void sendToAll(byte[] buf, int offset, int length) throws Exception {
         List<Address> missing=null;
+        Set<Address>  mbrs=members;
+        boolean       local_send_successful=true;
 
         if(mbrs == null || mbrs.isEmpty())
             mbrs=logical_addr_cache.keySet();
 
+        if(local_transport != null) {
+            try {
+                local_transport.sendToAll(buf, offset, length);
+            }
+            catch(Exception ex) {
+                log.warn("failed sending group message via local transport, sending it via regular transport", ex);
+                local_send_successful=false;
+            }
+        }
+
+        List<PhysicalAddress> dests=new ArrayList<>(mbrs.size());
         for(Address mbr: mbrs) {
+            if(local_send_successful && local_transport != null && local_transport.isLocalMember(mbr))
+                continue; // skip if local transport sent the message successfully
+
             PhysicalAddress target=mbr instanceof PhysicalAddress? (PhysicalAddress)mbr : logical_addr_cache.get(mbr);
             if(target == null) {
                 if(missing == null)
@@ -1729,22 +1386,28 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
                 missing.add(mbr);
                 continue;
             }
-
-            try {
-                if(!Objects.equals(local_physical_addr, target))
-                    sendUnicast(target, buf, offset, length);
-            }
-            catch(SocketException | SocketTimeoutException sock_ex) {
-                log.debug(Util.getMessage("FailureSendingToPhysAddr"), local_addr, mbr, sock_ex);
-            }
-            catch(Throwable t) {
-                log.error(Util.getMessage("FailureSendingToPhysAddr"), local_addr, mbr, t);
-            }
+            if(!Objects.equals(local_physical_addr, target))
+                dests.add(target);
         }
+        if(!dests.isEmpty())
+            sendUnicasts(dests, buf, offset, length);
         if(missing != null)
             fetchPhysicalAddrs(missing);
     }
 
+    protected void sendUnicasts(List<PhysicalAddress> dests, byte[] data, int offset, int length) throws Exception {
+        for(PhysicalAddress dest: dests) {
+            try {
+                sendUnicast(dest, data, offset, length);
+            }
+            catch(SocketException | SocketTimeoutException sock_ex) {
+                log.trace(Util.getMessage("FailureSendingToPhysAddr"), local_addr, dest, sock_ex);
+            }
+            catch(Throwable t) {
+                log.error(Util.getMessage("FailureSendingToPhysAddr"), local_addr, dest, t);
+            }
+        }
+    }
 
     protected void fetchPhysicalAddrs(List<Address> missing) {
         long current_time=0;
@@ -1768,7 +1431,6 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     protected Responses fetchResponsesFromDiscoveryProtocol(List<Address> missing) {
         return (Responses)up_prot.up(new Event(Event.FIND_MBRS, missing));
     }
-
 
     protected long timestamp() {return time_service != null? time_service.timestamp() : System.nanoTime();}
 
@@ -1803,29 +1465,20 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     protected void setThreadNames() {
         if(diag_handler != null)
             diag_handler.setThreadNames();
-        if(bundler instanceof TransferQueueBundler)
-            thread_factory.renameThread(TransferQueueBundler.THREAD_NAME, ((TransferQueueBundler)bundler).getThread());
+        if(bundler != null)
+            bundler.renameThread();
     }
 
 
     protected void unsetThreadNames() {
         if(diag_handler != null)
             diag_handler.unsetThreadNames();
-        if(bundler instanceof TransferQueueBundler) {
-            Thread thread=((TransferQueueBundler)bundler).getThread();
-            if(thread != null)
-                thread_factory.renameThread(TransferQueueBundler.THREAD_NAME, thread);
-        }
-        else if(bundler instanceof RingBufferBundler) {
-            Thread thread=((RingBufferBundler)bundler).getThread();
-            if(thread != null)
-                thread_factory.renameThread(RingBufferBundler.THREAD_NAME, thread);
-        }
+        if(bundler != null)
+            bundler.renameThread();
     }
 
     protected void setInAllThreadFactories(String cluster_name, Address local_address, String pattern) {
-        ThreadFactory[] factories= {thread_factory,internal_thread_factory};
-
+        ThreadFactory[] factories={thread_factory};
         for(ThreadFactory factory: factories) {
             if(pattern != null)
                 factory.setPattern(pattern);
@@ -1837,32 +1490,7 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     }
 
 
-
-    protected static ExecutorService createThreadPool(int min_threads, int max_threads, long keep_alive_time,
-                                                      String rejection_policy,
-                                                      BlockingQueue<Runnable> queue, final ThreadFactory factory) {
-        ThreadPoolExecutor pool=new ThreadPoolExecutor(min_threads, max_threads, keep_alive_time, TimeUnit.MILLISECONDS,
-                                                       queue, factory);
-        RejectedExecutionHandler handler=Util.parseRejectionPolicy(rejection_policy);
-        pool.setRejectedExecutionHandler(new ShutdownRejectedExecutionHandler(handler));
-        return pool;
-    }
-
-
-    protected static void shutdownThreadPool(Executor thread_pool) {
-        if(thread_pool instanceof ExecutorService) {
-            ExecutorService service=(ExecutorService)thread_pool;
-            service.shutdownNow();
-            try {
-                service.awaitTermination(Global.THREADPOOL_SHUTDOWN_WAIT_TIME, TimeUnit.MILLISECONDS);
-            }
-            catch(InterruptedException ignored) {
-            }
-        }
-    }
-
-
-    protected boolean addPhysicalAddressToCache(Address logical_addr, PhysicalAddress physical_addr) {
+    public boolean addPhysicalAddressToCache(Address logical_addr, PhysicalAddress physical_addr) {
         return addPhysicalAddressToCache(logical_addr, physical_addr, true);
     }
 
@@ -1871,7 +1499,7 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
           overwrite? logical_addr_cache.add(logical_addr, physical_addr) : logical_addr_cache.addIfAbsent(logical_addr, physical_addr);
     }
 
-    protected PhysicalAddress getPhysicalAddressFromCache(Address logical_addr) {
+    public PhysicalAddress getPhysicalAddressFromCache(Address logical_addr) {
         return logical_addr != null? logical_addr_cache.get(logical_addr) : null;
     }
 

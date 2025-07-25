@@ -30,7 +30,7 @@ import java.util.stream.Stream;
  * @author Bela Ban
  * @since  4.0
  */
-@Test(groups={Global.FUNCTIONAL,Global.ENCRYPT},singleThreaded=true)
+@Test(groups=Global.ENCRYPT,singleThreaded=true)
 public abstract class EncryptTest {
     protected JChannel                a,b,c,d,rogue;
     protected MyReceiver<Message>     ra, rb, rc, r_rogue;
@@ -129,7 +129,6 @@ public abstract class EncryptTest {
         secretKey.setAccessible(true);
         Util.setField(secretKey, encrypt, secret_key);
         encrypt.init();
-        encrypt.msgFactory(new DefaultMessageFactory());
 
         short encrypt_id=ClassConfigurator.getProtocolId(SYM_ENCRYPT.class);
         byte[] iv = encrypt.makeIv();
@@ -194,7 +193,7 @@ public abstract class EncryptTest {
     /**
      * Tests the scenario where the non-member R captures a message from some cluster member in {A,B,C}, then
      * increments the NAKACK2 seqno and resends that message. The message must not be received by {A,B,C};
-     * it should be discarded. see https://issues.jboss.org/browse/JGRP-2273
+     * it should be discarded. see https://issues.redhat.com/browse/JGRP-2273
      */
     public void testCapturingOfMessageByNonMemberAndResending() throws Exception {
 
@@ -235,17 +234,15 @@ public abstract class EncryptTest {
         a.send(null, "Hello world from A");
 
         // everybody in {A,B,C} should receive this message, but NOT the rogue's resent message
-        for(int i=0; i < 10; i++) {
-            if(ra.size() > 1 || rb.size() > 1 || rc.size() > 1)
-                break; // this should NOT happen
-            Util.sleep(500);
-        }
+        Util.waitUntilTrue(5000, 500, () -> ra.size() > 1 || rb.size() > 1 || rc.size() > 1);
+        // note: this should not happen
 
-        Stream.of(ra, rb, rc).map(MyReceiver::list).map(l -> l.stream().map(msg -> (String)msg.getObject())
+        List<Message> la=ra.list(), lb=rb.list(), lc=rc.list();
+        Stream.of(la, lb, lc).map(l -> l.stream().map(msg -> (String)msg.getObject())
           .collect(Collectors.toList())).forEach(System.out::println);
-        assert ra.size() == 1 : String.format("received msgs from non-member: '%s'; this should not be the case", print(ra.list()));
-        assert rb.size() == 1 : String.format("received msgs from non-member: '%s'; this should not be the case", print(rb.list()));
-        assert rc.size() == 1 : String.format("received msgs from non-member: '%s'; this should not be the case", print(rc.list()));
+        assert la.size() == 1 : String.format("received msgs from non-member: '%s'; this should not be the case", print(la));
+        assert lb.size() == 1 : String.format("received msgs from non-member: '%s'; this should not be the case", print(lb));
+        assert lc.size() == 1 : String.format("received msgs from non-member: '%s'; this should not be the case", print(lc));
     }
 
 

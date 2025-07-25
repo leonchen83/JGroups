@@ -7,7 +7,7 @@ import org.jgroups.util.Util;
 import java.util.*;
 
 /**
- * Represents a membership of a cluster group. Class Membership is not exposed to clients and is
+ * Represents a membership of a cluster group. Membership is not exposed to clients and is
  * used by JGroups internally. The membership object holds a list of Address objects that are in the
  * same membership. Each unique address can only exist once.
  * 
@@ -43,7 +43,6 @@ public class Membership {
 
 
 
-
    /**
     * Returns a copy (clone) of the members in this membership. The vector returned is immutable in
     * reference to this object. ie, modifying the vector that is being returned in this method will
@@ -63,8 +62,10 @@ public class Membership {
     * returns true then the member will not be added to the membership
     */
     public Membership add(Address new_member) {
+        if(new_member == null)
+            return this;
         synchronized(members) {
-            if(new_member != null && !members.contains(new_member)) {
+            if(!members.contains(new_member)) {
                 members.add(new_member);
             }
         }
@@ -88,13 +89,10 @@ public class Membership {
         return this;
     }
 
-
    /**
-    * Removes an member from the membership. If this member doesn't exist, no action will be
+    * Removes a member from the membership. If this member doesn't exist, no action will be
     * performed on the existing membership
-    * 
-    * @param old_member
-    *           - the member to be removed
+    * @param old_member The member to be removed
     */
     public Membership remove(Address old_member) {
         if(old_member != null) {
@@ -105,10 +103,8 @@ public class Membership {
         return this;
     }
 
-
    /**
     * Removes all the members contained in v from this membership
-    * 
     * @param v a list of all the members to be removed
     */
     public Membership remove(Collection<Address> v) {
@@ -120,7 +116,6 @@ public class Membership {
         return this;
     }
 
-
     public Membership retainAll(Collection<Address> v) {
         if(v != null) {
             synchronized(members) {
@@ -129,7 +124,6 @@ public class Membership {
         }
         return this;
     }
-
 
     /**
      * Removes all the members from this membership
@@ -146,12 +140,13 @@ public class Membership {
     * of this membership by invoking the {@code Clear} method. Then it will add all the all
     * members provided in the vector v
     * 
-    * @param v
-    *           - a vector containing all the members this membership will contain
+    * @param v List containing all the members this membership will contain
     */
     public Membership set(Collection<Address> v) {
-        clear();
-        return add(v);
+        synchronized(members) {
+            clear();
+            return add(v);
+        }
     }
 
 
@@ -162,9 +157,11 @@ public class Membership {
     * @param m a membership containing all the members this membership will contain
     */
     public Membership set(Membership m) {
-        clear();
-        if(m != null)
-            add(m.getMembers());
+        synchronized(members) {
+            clear();
+            if(m != null)
+                add(m.getMembers());
+        }
         return this;
     }
 
@@ -181,8 +178,10 @@ public class Membership {
      * @param suspects - a vector containing a list of members (Address) to be removed from this membership
      */
     public Membership merge(Collection<Address> new_mems, Collection<Address> suspects) {
-        remove(suspects);
-        return add(new_mems);
+        synchronized(members) {
+            remove(suspects);
+            return add(new_mems);
+        }
     }
 
 
@@ -208,42 +207,87 @@ public class Membership {
     }
 
 
-
-
     /**
      * Returns a copy of this membership
-     *
      * @return an exact copy of this membership
      */
     public Membership copy() {
-        return new Membership(this.members);
+        synchronized(this.members) {
+            return new Membership(this.members);
+        }
     }
 
 
-   /**
-    * Returns the number of addresses in this membership
-    * 
-    * @return the number of addresses in this membership
-    */
+   /** Returns the number of addresses in this membership */
     public int size() {
         synchronized(members) {
             return members.size();
         }
     }
 
+    public boolean isEmpty() {
+        return size() == 0;
+    }
+
+
    /**
     * Returns the component at the specified index
     * 
-    * @param index
-    *           - 0..size()-1
-    * @throws ArrayIndexOutOfBoundsException
-    *            - if the index is negative or not less than the current size of this Membership
-    *            object.
+    * @param index 0..size()-1
+    * @throws ArrayIndexOutOfBoundsException If the index is negative or not less than the current size of this object
     */
     public Address elementAt(int index) {
         synchronized(members) {
             return members.get(index);
         }
+    }
+
+    public Address getFirst() {
+        synchronized(members) {
+            return members.isEmpty()? null : members.get(0);
+        }
+    }
+
+    public boolean isCoord(Address mbr) {
+        synchronized(members) {
+            return mbr != null && Objects.equals(mbr, getFirst());
+        }
+    }
+
+    public Address nextCoord() {
+        synchronized(members) {
+            return members.size() > 1? members.get(1) : null;
+        }
+    }
+
+    /**
+     * Returns the members to the left of mbr
+     * @param mbr The member whose neighbor to the left should be returned
+     * @return The neighbor to the left, or null if mbr is null, or the size is less than 2.
+     */
+    public Address getPrevious(Address mbr) {
+        if(mbr == null)
+            return null;
+        Address next;
+        synchronized(members) {
+            next=Util.pickPrevious(members, mbr);
+        }
+        return Objects.equals(mbr, next) ? null : next;
+    }
+
+    /**
+     * Returns the members next to mbr.
+     * @param mbr The member whose neighbor to the right should be returned
+     * @return The neighbor to the right, or null if mbr is null, or the size is less than 2.
+     */
+    public Address getNext(Address mbr) {
+        if(mbr == null)
+            return null;
+        Address next;
+        synchronized(members) {
+            next=Util.pickNext(members, mbr);
+        }
+        return Objects.equals(mbr, next) ? null : next;
     }
 
 

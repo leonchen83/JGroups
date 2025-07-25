@@ -1,0 +1,261 @@
+
+
+## Measures the time for down- and up-messages for each protocol individually
+## JIRA: https://issues.redhat.com/browse/JGRP-2640
+
+## See [1] for an explanation of why the COMPILE directive requires AS TRIGGER or the type
+## definition of org.jgroups.stack.Protocol
+## [1] https://issues.redhat.com/browse/BYTEMAN-425
+
+## For UNICAST3 and NAKACK2, an up message (or batch) is added to the table for the given sender, then passed up.
+## When the thread returns, it checks if there are messages to deliver in the table. If so, and no other thread is
+## already delivering messges up the stack, the current thread continues draining the table (possibly fed by other
+## threads, and passing them up.
+## In terms of timestamps, this works as follows:
+## - up(MessageBatch) is called with a new timestamp set by the protocol below
+## - the batch is added to the table
+## - if another thread is already delivering messages from that table -> return (no time recorded for this action)
+## - else deliver batch. As soon as up(batch) for the protocol above is called, the time will be recorded
+##   - the batch is passed all the way to the top, each protocol sets a new timestamp in the header (or batch directly)
+##   - the thread return with a recent timestamp set by the top protocol
+##   - the thread drains more messages (if available) and passes them up: the time is recorded by the next prot
+##   ==> because the timestamp is updated by the top protocol, every iteration of message draining is started
+##       with a 'fresh' timestamp, so the accumulated times are correct
+
+
+RULE DiagnosticHandler creation
+CLASS ^TP
+HELPER org.jgroups.util.ProtPerfHelper
+METHOD handleConnect()
+AT ENTRY
+BIND tp=$this, diag=tp.getDiagnosticsHandler();
+IF TRUE
+   DO diagCreated(diag, tp);
+ENDRULE
+
+
+## If they're is an up_prot, compute the time for it from the header, then set the current time in the header
+RULE down(Message) entry
+CLASS ^org.jgroups.stack.Protocol
+HELPER org.jgroups.util.ProtPerfHelper
+METHOD down(Message)
+COMPILE
+AT ENTRY
+BIND msg=$1, p:org.jgroups.stack.Protocol=$this, prot=p.getUpProtocol();
+IF TRUE
+   DO downTime(msg, prot);
+ENDRULE
+
+
+
+RULE down(Message) exit
+CLASS ^TP
+HELPER org.jgroups.util.ProtPerfHelper
+METHOD down(Message)
+COMPILE
+AT EXIT
+BIND msg=$1, prot:org.jgroups.stack.Protocol=$this;
+IF TRUE
+   DO downTime(msg, prot);
+ENDRULE
+
+
+RULE up(Message)
+CLASS ^org.jgroups.stack.Protocol
+HELPER org.jgroups.util.ProtPerfHelper
+METHOD up(Message)
+COMPILE
+AT ENTRY
+BIND msg=$1, p:org.jgroups.stack.Protocol=$this, prot=p.getDownProtocol();
+IF TRUE
+   DO upTime(msg, prot);
+ENDRULE
+
+
+RULE up(MessageBatch)
+CLASS ^org.jgroups.stack.Protocol
+HELPER org.jgroups.util.ProtPerfHelper
+METHOD up(MessageBatch)
+COMPILE
+AT ENTRY
+BIND batch=$1, p:org.jgroups.stack.Protocol=$this, prot=p.getDownProtocol();
+IF TRUE
+   DO upTime(batch, prot);
+ENDRULE
+
+
+RULE ProtocolStack.up(Message)
+CLASS org.jgroups.stack.ProtocolStack
+HELPER org.jgroups.util.ProtPerfHelper
+METHOD up(Message)
+COMPILE
+AT EXIT
+BIND msg=$1, prot=$this;
+IF TRUE
+   DO upTime(msg, prot);
+ENDRULE
+
+
+RULE ProtocolStack.up(MessageBatch)
+CLASS org.jgroups.stack.ProtocolStack
+HELPER org.jgroups.util.ProtPerfHelper
+METHOD up(MessageBatch)
+COMPILE
+AT EXIT
+BIND batch=$1, prot=$this;
+IF TRUE
+   DO upTime(batch, prot);
+ENDRULE
+
+
+RULE loopback
+CLASS ^TP
+HELPER org.jgroups.util.ProtPerfHelper
+METHOD loopback(Message,boolean)
+COMPILE
+AT ENTRY
+BIND msg=$1, prot:org.jgroups.stack.Protocol=$this;
+IF TRUE
+   DO upTime(msg, prot);
+ENDRULE
+
+RULE TP: set up-time for a single message
+CLASS ^SubmitToThreadPool
+HELPER org.jgroups.util.ProtPerfHelper
+METHOD process(Message,boolean)
+COMPILE
+AT ENTRY
+BIND msg=$1;
+IF TRUE
+   DO setTime(msg, false);
+ENDRULE
+
+RULE TP: set up-time for a message batch
+CLASS ^SubmitToThreadPool
+HELPER org.jgroups.util.ProtPerfHelper
+METHOD process(MessageBatch,boolean)
+COMPILE
+AT ENTRY
+BIND batch=$1;
+IF TRUE
+   DO setTime(batch);
+ENDRULE
+
+
+# When creating new batches from existing ones (e.g. in MaxOneThreadPerSender), and passing the newly created batch up,
+# the timestamp is 0. Setting the timestamp allows for accurate recording of the time for a given transport
+RULE Set MessageBatch.timestamp on batch creation
+CLASS MessageBatch
+HELPER org.jgroups.util.ProtPerfHelper
+COMPILE
+METHOD <init>
+AT EXIT
+BIND batch=$0;
+IF NOT callerEquals("<init>") ## exclude self() or super() methods
+   DO batch.timestamp(System.nanoTime());
+ENDRULE
+
+
+RULE MaxOneSenderPerThread - reset batch.timestamp after each run()
+CLASS SubmitToThreadPool$BatchHandler
+HELPER org.jgroups.util.ProtPerfHelper
+COMPILE
+METHOD run
+AT ENTRY
+BIND batch=$this.batch;
+IF NOT callerEquals("run")
+   DO batch.timestamp(System.nanoTime());
+ENDRULE
+
+# Retransmission of a message will cause an incorrect time measurement, as the start time was on the original send
+# ProtPerfHeader.start_down is set to *0*, as we don't want to measure retransmissions times (they're very short,
+# because they just fetch the message and send it down)
+# This rule applies to (1) retransmission by sender, (2) resending of the first msg, and (3) retransmission via XMIT-REQ
+RULE UNICAST3 retransmission
+CLASS org.jgroups.protocols.UNICAST3
+HELPER org.jgroups.util.ProtPerfHelper
+COMPILE
+METHOD resend(Message)
+AT ENTRY
+BIND msg=$1;
+IF TRUE
+   DO setTime(msg, 0, true);
+ENDRULE
+
+# Same as above, but for NAKACKK2
+RULE NAKACK2 retransmission
+CLASS org.jgroups.protocols.pbcast.NAKACK2
+HELPER org.jgroups.util.ProtPerfHelper
+COMPILE
+METHOD resend(Message)
+AT ENTRY
+BIND msg=$1;
+IF TRUE
+   DO setTime(msg, 0, true);
+ENDRULE
+
+# Measures time for sending a message via TP.doSend()
+RULE Begin TP.doSend()
+CLASS ^TP
+HELPER org.jgroups.util.ProtPerfHelper
+COMPILE
+METHOD doSend
+AT ENTRY
+BIND curr_thread=Thread.currentThread();
+IF TRUE
+   DO link(curr_thread, System.nanoTime());
+ENDRULE
+
+RULE End TP.doSend()
+CLASS ^TP
+HELPER org.jgroups.util.ProtPerfHelper
+COMPILE
+METHOD doSend
+AT EXIT
+BIND curr_thread=Thread.currentThread();
+     cluster=$this.getClusterName();
+     start_time:Long=unlink(curr_thread);
+     diff:long=System.nanoTime() - start_time;
+IF TRUE
+   DO downTime(cluster, "doSend", diff);
+ENDRULE
+
+
+# Measures the time from when a message is added to the TQB's queue (TQB.send()), until it is serialized (and then sent)
+RULE Begin QueueTime
+CLASS TransferQueueBundler
+HELPER org.jgroups.util.ProtPerfHelper
+COMPILE
+METHOD send(Message)
+AT ENTRY
+BIND msg=$1;
+IF TRUE
+   DO setTime(msg, true);
+ENDRULE
+
+
+RULE TransferQueueBundler.sendSingleMessage()
+CLASS BaseBundler
+HELPER org.jgroups.util.ProtPerfHelper
+COMPILE
+METHOD sendSingleMessage
+AT ENTRY
+BIND msg=$1;
+     cluster=$this.transport.getClusterName();
+IF TRUE
+   DO System.out.println("-- sending single msg " + msg);
+      downTime(cluster, message, "tqb");
+ENDRULE
+
+RULE TransferQueueBundler.sendMessageList()
+CLASS BaseBundler
+HELPER org.jgroups.util.ProtPerfHelper
+COMPILE
+METHOD sendMessageList
+AT ENTRY
+BIND dest=$1;
+     cluster=$this.transport.getClusterName();
+     list=$3;
+IF TRUE
+   DO downTime(cluster, list, "tqb");
+ENDRULE

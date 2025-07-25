@@ -1,7 +1,7 @@
 package org.jgroups.conf;
 
+import org.jgroups.stack.Protocol;
 import org.jgroups.util.Util;
-import org.w3c.dom.Node;
 
 import java.util.*;
 
@@ -15,7 +15,7 @@ public class ProtocolConfiguration {
     private final ClassLoader         loader;
     private String                    properties_str;
     private final Map<String,String>  properties=new HashMap<>();
-    private List<Node>                subtrees; // roots to DOM elements, passed to protocol on creation
+    private List<XmlNode>             subtrees; // root to XmlNode tree, passed to protocol on creation
 
 
     /**
@@ -52,13 +52,13 @@ public class ProtocolConfiguration {
     public ProtocolConfiguration(String protocol_name, Map<String,String> properties, ClassLoader loader) {
         this.protocol_name=protocol_name;
         this.loader = loader;
-        if(!properties.isEmpty()) {
+        if(properties != null && !properties.isEmpty()) {
             this.properties.putAll(properties);
             properties_str=propertiesToString();
         }
     }
 
-    public void addSubtree(Node node){
+    public void addSubtree(XmlNode node) {
         if(node == null)
             return;
         if(subtrees == null)
@@ -66,7 +66,7 @@ public class ProtocolConfiguration {
         subtrees.add(node);
     }
 
-    public List<Node> getSubtrees() {
+    public List<XmlNode> getSubtrees() {
         return subtrees;
     }
 
@@ -82,26 +82,45 @@ public class ProtocolConfiguration {
         return properties;
     }
 
+    /**
+     * Load the class of the {@link Protocol} configured by this instance.
+     *
+     * @param loadingClass The {@link Class} to fetch the preferred {@link ClassLoader}. It can be null.
+     * @return The {@link Class} of the {@link Protocol}.
+     * @throws Exception If unable to find or load the class.
+     */
+    public Class<? extends Protocol> loadProtocolClass(Class<?> loadingClass) throws Exception {
+        return Util.loadProtocolClass(protocol_name, loadingClass);
+    }
 
-
+    /**
+     * Determines if the class {@code other} is the same or superclass (or superinterface) as the {@link Protocol}
+     * configured by this instance.
+     *
+     * @param other        The {@link Class} to check.
+     * @param loadingClass The {@link Class} to fetch the preferred {@link ClassLoader}. It can be null.
+     * @return {@code true} if {@code other} is the same or superclass/interface as the {@link Protocol} configured by this instance.
+     * @throws Exception If unable to find or load the class.
+     */
+    public boolean isAssignableProtocol(Class<? extends Protocol> other, Class<?> loadingClass) throws Exception {
+        return loadProtocolClass(loadingClass).isAssignableFrom(other);
+    }
 
     public void substituteVariables() {
         for(Iterator<Map.Entry<String, String>> it=properties.entrySet().iterator(); it.hasNext();) {
             Map.Entry<String, String> entry=it.next();
             String key=entry.getKey();
             String val=entry.getValue();
-            String tmp=Util.substituteVariable(val);
-            if(!val.equals(tmp)) {
-                properties.put(key, tmp);
-            }
-            else {
-                if(tmp.contains("${"))
+            if(val.contains("${")) {
+                String replacement=Util.substituteVariable(val);
+                if(replacement != null)
+                    properties.put(key, replacement);
+                else
                     it.remove();
             }
         }
         properties_str=propertiesToString();
     }
-
 
     public String toString() {
         StringBuilder retval=new StringBuilder();
@@ -137,7 +156,6 @@ public class ProtocolConfiguration {
         }
         return buf.toString();
     }
-
 
     public String getProtocolStringNewXml() {
         StringBuilder buf=new StringBuilder(protocol_name + ' ');

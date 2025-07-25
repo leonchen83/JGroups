@@ -1,21 +1,19 @@
 package org.jgroups;
 
-import org.jgroups.annotations.ManagedOperation;
-import org.jgroups.blocks.MethodCall;
-import org.jgroups.jmx.AdditionalJmxObjects;
-import org.jgroups.jmx.ResourceDMBean;
+import org.jgroups.jmx.ReflectUtils;
 import org.jgroups.logging.Log;
 import org.jgroups.logging.LogFactory;
 import org.jgroups.stack.DiagnosticsHandler;
 import org.jgroups.stack.Protocol;
+import org.jgroups.util.Metrics;
 import org.jgroups.util.Util;
 
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadInfo;
 import java.lang.management.ThreadMXBean;
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.*;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
@@ -56,6 +54,19 @@ public class JChannelProbeHandler implements DiagnosticsHandler.ProbeHandler {
                         log.error(Util.getMessage("OperationInvocationFailure"), key.substring(index + 1), throwable);
                     }
                 }
+                continue;
+            }
+            if(key.startsWith("metrics")) {
+                Map<String,Map<String,Metrics.Entry<Object>>> m=Metrics.extract(ch, Metrics.IS_NUMBER);
+                Map<String,Map<String,Metrics.Entry<Number>>> metrics=Metrics.convert(m);
+                StringBuilder sb=new StringBuilder();
+                for(Map.Entry<String,Map<String,Metrics.Entry<Number>>> e: metrics.entrySet()) {
+                    sb.append(String.format("%s:\n", e.getKey()));
+                    for(Map.Entry<String,Metrics.Entry<Number>> e2: e.getValue().entrySet()) {
+                        sb.append(String.format("   %s: %s\n", e2.getKey(), e2.getValue().supplier().get()));
+                    }
+                }
+                map.put(key, sb.toString());
                 continue;
             }
             if(key.startsWith("threads")) {
@@ -146,12 +157,42 @@ public class JChannelProbeHandler implements DiagnosticsHandler.ProbeHandler {
             if(key.startsWith("disable-cont")) {
                 map.put(key, enable(2, false));
             }
+
+            // everything else could be an attribute query (without prefix "jmx=") or an operation (without "op=")
+            // https://issues.redhat.com/browse/JGRP-2413
+            String protocol;
+            int index=key.indexOf('.');
+            if(index == -1)
+                protocol=key;
+            else
+                protocol=key.substring(0, index);
+
+            Protocol prot=ch.getProtocolStack().findProtocol(protocol);
+            if(prot != null) {
+                String tmp=key.substring(index+1);
+                int left=tmp.indexOf('['), right=left != -1? tmp.indexOf(']', left) : -1;
+                if(left != -1 && right != -1) { // it is most likely an operation
+                    try {
+                        Map<String,String> m=handleProbe("op=" + key);
+                        if(m != null && !m.isEmpty())
+                            map.putAll(m);
+                    }
+                    catch(Throwable throwable) {
+                        log.error(Util.getMessage("OperationInvocationFailure"), key.substring(index + 1), throwable);
+                    }
+                }
+                else {// try JMX
+                    Map<String,String> m=handleProbe("jmx=" + key);
+                    if(m != null && !m.isEmpty())
+                        map.putAll(m);
+                }
+            }
         }
         return map;
     }
 
     public String[] supportedKeys() {
-        return new String[]{"reset-stats", "jmx", "op=<operation>[<args>]", "ops",
+        return new String[]{"reset-stats", "jmx", "op=<operation>[<args>]", "ops", "metrics",
           "threads[=<filter>[=<limit>]]", "enable-cpu", "enable-contention", "disable-cpu", "disable-contention"};
     }
 
@@ -227,7 +268,12 @@ public class JChannelProbeHandler implements DiagnosticsHandler.ProbeHandler {
                 it.remove();
                 String attrname=tmp.substring(0, index);
                 String attrvalue=tmp.substring(index+1);
-                handleAttrWrite(protocol_name, attrname, attrvalue);
+                try {
+                    handleAttrWrite(protocol_name, attrname, attrvalue);
+                }
+                catch(Exception e) {
+                    log.error("failed writing: %s", e.toString());
+                }
             }
         }
         if(!list.isEmpty()) {
@@ -239,49 +285,25 @@ public class JChannelProbeHandler implements DiagnosticsHandler.ProbeHandler {
 
     protected void listOperations(Map<String, String> map, String key) {
         if(!key.contains("=")) {
-            map.put("ops", listAllOperations());
+            map.put("ops", listAllOperations(ch.getProtocolStack().getProtocols()));
             return;
         }
         String p=key.substring(key.indexOf("=")+1).trim();
         try {
             Class<? extends Protocol> cl=Util.loadProtocolClass(p, getClass());
-            StringBuilder sb=new StringBuilder();
-            listAllOperations(sb, cl);
-            map.put("ops", sb.toString());
+            map.put("ops", ReflectUtils.listOperations(cl));
         }
         catch(Exception e) {
             log.warn("%s: protocol %s not found", ch.getAddress(), p);
         }
     }
 
-    protected String listAllOperations() {
-        StringBuilder sb=new StringBuilder();
-        for(Protocol p: ch.getProtocolStack().getProtocols()) {
-            listAllOperations(sb, p.getClass());
-        }
-
-        return sb.toString();
+    protected static String listAllOperations(Collection<?> objects) {
+        if(objects == null)
+            return"";
+        return objects.stream().map(o -> ReflectUtils.listOperations(o.getClass())).collect(Collectors.joining());
     }
 
-    protected static void listAllOperations(StringBuilder sb, Class<? extends Protocol> cl) {
-        sb.append(cl.getSimpleName()).append(":\n");
-        Method[] methods=Util.getAllDeclaredMethodsWithAnnotations(cl, ManagedOperation.class);
-        for(Method m: methods)
-            sb.append("  ").append(methodToString(m)).append("\n");
-    }
-
-
-    protected static String methodToString(Method m) {
-        StringBuilder sb=new StringBuilder(m.getName());
-        sb.append('(');
-        StringJoiner sj = new StringJoiner(",");
-        for (Class<?> parameterType : m.getParameterTypes()) {
-            sj.add(parameterType.getTypeName());
-        }
-        sb.append(sj);
-        sb.append(')');
-        return sb.toString();
-    }
 
     /**
      * Invokes an operation and puts the return value into map
@@ -309,122 +331,41 @@ public class JChannelProbeHandler implements DiagnosticsHandler.ProbeHandler {
             return; // less drastic than throwing an exception...
         }
 
-        int args_index=operation.indexOf('[');
-        String method_name;
-        if(args_index != -1)
-            method_name=operation.substring(index +1, args_index).trim();
-        else
-            method_name=operation.substring(index+1).trim();
-
-        String[] args=null;
-        if(args_index != -1) {
-            int end_index=operation.indexOf(']');
-            if(end_index == -1)
-                throw new IllegalArgumentException("] not found");
-            List<String> str_args=Util.parseCommaDelimitedStrings(operation.substring(args_index + 1, end_index));
-            Object[] strings=str_args.toArray();
-            args=new String[strings.length];
-            for(int i=0; i < strings.length; i++)
-                args[i]=(String)strings[i];
-        }
-
-        Method method=findMethod(prot, method_name, args);
-        if(method == null)
-            throw new IllegalArgumentException(String.format("method %s not found in %s", method_name, prot.getName()));
-        MethodCall call=new MethodCall(method);
-        Object[] converted_args=null;
-        if(args != null) {
-            converted_args=new Object[args.length];
-            Class<?>[] types=method.getParameterTypes();
-            for(int i=0; i < args.length; i++)
-                converted_args[i]=Util.convert(args[i], types[i]);
-        }
-        Object retval=call.invoke(prot, converted_args);
-        if(retval != null)
-            map.put(prot.getName() + "." + method_name, retval.toString());
+        operation=operation.substring(index+1);
+        ReflectUtils.invokeOperation(map, operation, prot);
     }
+
 
     protected Method findMethod(Protocol prot, String method_name, String[] args) throws Exception {
-        Object target=prot;
-        Method method=Util.findMethod(target.getClass(), method_name, args);
-        if(method == null) {
-            if(prot instanceof AdditionalJmxObjects) {
-                for(Object obj: ((AdditionalJmxObjects)prot).getJmxObjects()) {
-                    method=Util.findMethod(obj.getClass(), method_name, args);
-                    if(method != null) {
-                        target=obj;
-                        break;
-                    }
-                }
-            }
-            if(method == null) {
-                log.warn(Util.getMessage("MethodNotFound"), ch.getAddress(), target.getClass().getSimpleName(), method_name);
-                return null;
-            }
-        }
-        return method;
+        return null; // not used atm, but subclass needs to be changed before we can remove this method
     }
 
-    protected void handleAttrWrite(String protocol_name, String attr_name, String attr_value) {
-        Object target=ch.getProtocolStack().findProtocol(protocol_name);
-        Field field=target != null? Util.getField(target.getClass(), attr_name) : null;
-        if(field == null && target instanceof AdditionalJmxObjects) {
-            Object[] objs=((AdditionalJmxObjects)target).getJmxObjects();
-            if(objs != null && objs.length > 0) {
-                for(Object o: objs) {
-                    field=o != null? Util.getField(o.getClass(), attr_name) : null;
-                    if(field != null) {
-                        target=o;
-                        break;
-                    }
-                }
-            }
+    protected void handleAttrWrite(String protocol_name, String attr_name, String attr_value) throws Exception {
+        final Object target=ch.getProtocolStack().findProtocol(protocol_name);
+        if(target == null) {
+            log.error("protocol %s not found", protocol_name);
+            return;
         }
-        if(field != null) {
-            Object value=Util.convert(attr_value, field.getType());
-            if(value != null) {
-                if(target instanceof Protocol)
-                    ((Protocol)target).setValue(attr_name, value);
-                else
-                    Util.setField(field, target, value);
-            }
-        }
-        else {
-            // try to find a setter for X, e.g. x(type-of-x) or setX(type-of-x)
-            ResourceDMBean.Accessor setter=ResourceDMBean.findSetter(target, attr_name);
-            if(setter == null && target instanceof AdditionalJmxObjects) {
-                Object[] objs=((AdditionalJmxObjects)target).getJmxObjects();
-                if(objs != null && objs.length > 0) {
-                    for(Object o: objs) {
-                        setter=o != null? ResourceDMBean.findSetter(o, attr_name) : null;
-                        if(setter!= null)
-                            break;
-                    }
-                }
-            }
-            if(setter != null) {
-                try {
-                    Class<?> type=setter instanceof ResourceDMBean.FieldAccessor?
-                      ((ResourceDMBean.FieldAccessor)setter).getField().getType() :
-                      setter instanceof ResourceDMBean.MethodAccessor?
-                        ((ResourceDMBean.MethodAccessor)setter).getMethod().getParameterTypes()[0] : null;
-                    Object converted_value=Util.convert(attr_value, type);
-                    setter.invoke(converted_value);
-                }
-                catch(Exception e) {
-                    log.error("unable to invoke %s() on %s: %s", setter, protocol_name, e);
-                }
-            }
-            else {
-                log.warn(Util.getMessage("FieldNotFound"), attr_name, protocol_name);
-                setter=new ResourceDMBean.NoopAccessor();
-            }
-        }
+        ReflectUtils.handleAttrWrite(target, attr_name, attr_value);
     }
+
 
     protected static void convert(Map<String,Map<String,Object>> in, Map<String,String> out) {
-        if(in != null)
+        if(in != null) {
+            for(Map<String,Object> m: in.values()) {
+                for(Map.Entry<String,Object> e: m.entrySet()) {
+                    Object val=e.getValue();
+                    if(val instanceof String) {
+                        String trimmed=((String)val).trim();
+                        if(!trimmed.equals(val)) {
+                            // replace "min_interval=15s " -> "min_interval=15s"
+                            m.replace(e.getKey(), val, trimmed);
+                        }
+                    }
+                }
+            }
             in.entrySet().stream().filter(e -> e.getValue() != null).forEach(e -> out.put(e.getKey(), e.getValue().toString()));
+        }
     }
 
 

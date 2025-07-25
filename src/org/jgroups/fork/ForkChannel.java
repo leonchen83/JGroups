@@ -9,7 +9,6 @@ import org.jgroups.util.Util;
 
 import java.lang.reflect.Field;
 import java.util.Arrays;
-import java.util.List;
 
 /**
  * Implementation of a ForkChannel, which is a light-weight channel. Not all methods are supported,
@@ -70,14 +69,13 @@ public class ForkChannel extends JChannel implements ChannelListener {
         this.fork_channel_id=fork_channel_id;
 
         FORK fork;
-        // To prevent multiple concurrent FORK creations https://issues.jboss.org/browse/JGRP-1842
+        // To prevent multiple concurrent FORK creations https://issues.redhat.com/browse/JGRP-1842
         synchronized(this.main_channel) {
             fork=getFORK(main_channel, position, neighbor, create_fork_if_absent);
         }
 
         // Returns the existing fork stack for fork_stack_id, or creates a new one
         prot_stack=fork.createForkStack(fork_stack_id, protocols == null? null : Arrays.asList(protocols), true);
-        flush_supported=main_channel.flushSupported();
         state=State.OPEN;
     }
 
@@ -115,9 +113,8 @@ public class ForkChannel extends JChannel implements ChannelListener {
     @Override public void channelConnected(JChannel channel) {
         copyFields();
         if(local_addr == null) return;
-        Event evt=new Event(Event.SET_LOCAL_ADDRESS, local_addr);
         if(up_handler != null)
-            up_handler.up(evt);
+            up_handler.setLocalAddress(local_addr);
     }
 
     @Override public void channelDisconnected(JChannel channel) {
@@ -224,26 +221,6 @@ public class ForkChannel extends JChannel implements ChannelListener {
     }
 
     @Override
-    public ForkChannel startFlush(List<Address> flushParticipants, boolean automatic_resume) throws Exception {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ForkChannel startFlush(boolean automatic_resume) throws Exception {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ForkChannel stopFlush() {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ForkChannel stopFlush(List<Address> flushParticipants) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
     public ForkChannel getState(Address target, long timeout) throws Exception {
         main_channel.getState(target, timeout);
         return this;
@@ -257,10 +234,9 @@ public class ForkChannel extends JChannel implements ChannelListener {
 
     protected ForkChannel setLocalAddress(Address local_addr) {
         if(local_addr != null) {
-            Event evt=new Event(Event.SET_LOCAL_ADDRESS, local_addr);
             ((ForkProtocolStack)prot_stack).setLocalAddress(local_addr); // sets the address only in the protocols managed by the fork-prot-stack
             if(up_handler != null)
-                up_handler.up(evt);
+                up_handler.setLocalAddress(local_addr);
         }
         return this;
     }

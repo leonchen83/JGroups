@@ -4,8 +4,10 @@ package org.jgroups.tests;
 import org.jgroups.*;
 import org.jgroups.Message.Flag;
 import org.jgroups.Message.TransientFlag;
+import org.jgroups.protocols.relay.SiteUUID;
 import org.jgroups.stack.IpAddress;
-import org.jgroups.util.Bits;
+import org.jgroups.tests.perf.PerfUtil.AverageSummary;
+import org.jgroups.util.UUID;
 import org.jgroups.util.*;
 import org.testng.Assert;
 import org.testng.annotations.Test;
@@ -16,6 +18,7 @@ import java.net.*;
 import java.nio.ByteBuffer;
 import java.text.DecimalFormatSymbols;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -181,35 +184,20 @@ public class UtilTest {
 
     public void testReplaceProperties() {
         String input="hello ${my.name:Bela}";
-
         String out=Util.substituteVariable(input);
         System.out.println("out = " + out);
-
         assert out.equals("hello Bela");
+
         Properties props=new Properties();
         props.put("my.name", "Michelle");
         out=Util.substituteVariable(input, props);
         System.out.println("out = " + out);
         assert out.equals("hello Michelle");
 
-        input="hello \\${my.name:Bela}"; // no replacement as the trailing slash prevents this
-        out=Util.substituteVariable(input, props);
-        System.out.println("out = " + out);
-
-        assert out.equals(input);
-
-        input="\\${escape:bla}";
+        input="<UDP bind_addr=\"${my.bind_addr:127.0.0.1}\" ... />";
         out=Util.substituteVariable(input);
         System.out.println("out = " + out);
-
-        assert input.equals(out);
-
-
-        input="<UDP bind_addr=\"\\${my.bind_addr:127.0.0.1}\" ... />";
-        out=Util.substituteVariable(input);
-        System.out.println("out = " + out);
-
-        assert input.equals(out);
+        assert out.equals("<UDP bind_addr=\"127.0.0.1\" ... />");
     }
 
 
@@ -367,6 +355,13 @@ public class UtilTest {
         assert !Util.isAsciiString("\u1F601");
     }
 
+    public void testReadBytes2() throws IOException {
+        byte[] input="hello world".getBytes();
+        InputStream in=new ByteArrayInputStream(input);
+        ByteArray output=Util.readBytes(in);
+        byte[] tmp=output.getBytes();
+        assert Arrays.equals(input, tmp);
+    }
 
     public static void testReadBytes() {
         assert 10 == Util.readBytesInteger("10");
@@ -512,17 +507,16 @@ public class UtilTest {
     }
 
     public void testMessageToByteBuffer() throws Exception {
-        MessageFactory mf=new DefaultMessageFactory();
-        _testMessage(new EmptyMessage(), mf);
-        _testMessage(new BytesMessage(null, "hello world"), mf);
-        _testMessage(new EmptyMessage(null).setSrc(Util.createRandomAddress()), mf);
-        _testMessage(new EmptyMessage(null).setSrc(Util.createRandomAddress()), mf);
-        _testMessage(new BytesMessage(null, "bela").setSrc(Util.createRandomAddress()), mf);
+        _testMessage(new EmptyMessage());
+        _testMessage(new BytesMessage(null, "hello world"));
+        _testMessage(new EmptyMessage(null).setSrc(Util.createRandomAddress()));
+        _testMessage(new EmptyMessage(null).setSrc(Util.createRandomAddress()));
+        _testMessage(new BytesMessage(null, "bela").setSrc(Util.createRandomAddress()));
     }
 
-    private static void _testMessage(Message msg, final MessageFactory mf) throws Exception {
+    private static void _testMessage(Message msg) throws Exception {
         ByteArray buf=Util.messageToByteBuffer(msg);
-        Message msg2=Util.messageFromByteBuffer(buf.getArray(), buf.getOffset(), buf.getLength(), mf);
+        Message msg2=Util.messageFromByteBuffer(buf.getArray(), buf.getOffset(), buf.getLength());
         Assert.assertEquals(msg.getSrc(), msg2.getSrc());
         Assert.assertEquals(msg.getDest(), msg2.getDest());
         Assert.assertEquals(msg.getLength(), msg2.getLength());
@@ -576,6 +570,18 @@ public class UtilTest {
 
      public static void testObjectToByteArrayWithLargeString5() throws Exception {
         marshalString(Short.MAX_VALUE + 100000);
+    }
+
+    public void testPrimitiveToStream() throws IOException {
+        for(Object obj: Arrays.asList(null, 123, true, "hello")) {
+            ByteArrayDataOutputStream out=new ByteArrayDataOutputStream(16);
+            Util.primitiveToStream(obj, out);
+            ByteArray buf=out.getBuffer();
+            try(ByteArrayDataInputStream in=new ByteArrayDataInputStream(buf.getArray(), 0, buf.getLength())) {
+                Object obj2=Util.primitiveFromStream(in);
+                assert obj == obj2 || obj.equals(obj2);
+            }
+        }
     }
 
 
@@ -695,16 +701,25 @@ public class UtilTest {
         assert receiver.name.equals(hello);
     }
 
+    public void testIsAssignable() {
+        assert !Util.isAssignableFrom(null, Long.class);
+        assert !Util.isAssignableFrom(long.class, null);
+        assert Util.isAssignableFrom(Long.class, null);
+        assert Util.isAssignableFrom(Long.class, Integer.class);
+        assert Util.isAssignableFrom(Long.class, Long.class);
+        assert Util.isAssignableFrom(double.class, Integer.class);
+        assert Util.isAssignableFrom(Long.class, long.class);
+        assert Util.isAssignableFrom(long.class, Long.class);
+    }
+
     private static void marshalString(int size) throws Exception {
         byte[] tmp=new byte[size];
-        String str=new String(tmp, 0, tmp.length);
+        String str=new String(tmp);
         byte[] retval=Util.objectToByteBuffer(str);
         System.out.println("length=" + retval.length + " bytes");
         String obj=Util.objectFromByteBuffer(retval);
         System.out.println("read " + obj.length() + " string");
     }
-
-
 
     static void objectToByteBuffer(Object obj) throws Exception {
         byte[] buf=Util.objectToByteBuffer(obj);
@@ -904,6 +919,63 @@ public class UtilTest {
         assert random == 1;
     }
 
+    public void testWithinRange() {
+        boolean within=Util.withinRange(1.0, 1.0, 0.1);
+        assert within;
+
+        within=Util.withinRange(105.0, 100, 0.1);
+        assert within;
+
+        within=Util.withinRange(100.0, 109.0, 0.1);
+        assert within;
+
+        within=Util.withinRange(100.0, 110.0, 0.1);
+        assert within;
+
+        within=Util.withinRange(100.0, 90.0, 0.1);
+        assert within;
+
+        within=Util.withinRange(100.0, 89.9, 0.1);
+        assert !within;
+    }
+
+    public void testAverageSummary() {
+        AverageSummary s1=new AverageSummary(4, 3.5, 22).unit(TimeUnit.MILLISECONDS),
+          s2=new AverageSummary(5, 7.5, 10), s3=new AverageSummary(2, 10, 100);
+        assertSummary(s1, 4, 3.5, 22);
+        s1.merge(s2);
+        assertSummary(s1, 4, 5.5, 22);
+        s1.merge(s3);
+        assertSummary(s1, 2, 7.75, 100);
+    }
+
+    public void testAverageSummarySerialization() throws Exception {
+        AverageSummary s1=new AverageSummary(4, 3.5, 22).unit(TimeUnit.MILLISECONDS);
+        byte[] buf=Util.streamableToByteBuffer(s1);
+        AverageSummary s2=Util.streamableFromByteBuffer(AverageSummary.class, buf);
+        assert s1.min() == s2.min();
+        assert s1.avg() == s2.avg();
+        assert s1.max() == s2.max();
+        assert s1.unit() == s2.unit();
+    }
+
+    public void testAverageSummaryMerge() {
+        AverageSummary s1=new AverageSummary(10,20,50).unit(TimeUnit.NANOSECONDS),
+          s2=new AverageSummary(8,10,30).unit(TimeUnit.NANOSECONDS),
+          s3=new AverageSummary(4,40,40).unit(TimeUnit.NANOSECONDS),
+          s4=new AverageSummary(6,30,300).unit(TimeUnit.NANOSECONDS);
+        AverageSummary sum=new AverageSummary().unit(TimeUnit.NANOSECONDS);
+        sum.set(List.of(s1,s2,s3,s4));
+        assert sum.min() == 4;
+        assert sum.avg() == 25;
+        assert sum.max() == 300;
+    }
+
+    protected static void assertSummary(AverageSummary s, double min, double avg, double max) {
+        assert s.min() == min;
+        assert s.avg() == avg;
+        assert s.max() == max;
+    }
 
     public static void testChanged() {
         Address a=null, b=null;
@@ -1047,6 +1119,80 @@ public class UtilTest {
         assert result.contains(1) && result.contains(2) && result.contains(3);
     }
 
+    public void testPickPrevious() {
+        Integer[] arr={1,2,3,4,5};
+        Map<Integer,Integer> map=Map.of(3, 2, 1, 5, 5, 4);
+        for(Map.Entry<Integer,Integer> e: map.entrySet()) {
+            int num=Util.pickPrevious(arr, e.getKey()), expected=e.getValue();
+            assert num == expected : String.format("input=%d, expected=%d, actual=%d", e.getKey(), num, expected);
+        }
+
+        arr[2]=null;
+        Integer num=Util.pickPrevious(arr, 5);
+        assert num == 4;
+
+        num=Util.pickPrevious(arr, 4);
+        assert num == null;
+
+        arr=null;
+        num=Util.pickPrevious(arr, 4);
+        assert num == null;
+        num=Util.pickPrevious(arr, null);
+        assert num == null;
+
+        arr=new Integer[]{1};
+        num=Util.pickPrevious(arr, 4);
+        assert num == null;
+
+        arr=new Integer[]{2,3,4,5};
+        num=Util.pickPrevious(arr, 1);
+        assert num == null;
+
+        arr=new Integer[]{1,2};
+        num=Util.pickPrevious(arr, 1);
+        assert num == 2;
+        num=Util.pickPrevious(arr, 2);
+        assert num == 1;
+    }
+
+
+    public void testPickPreviousWithList() {
+        List<Integer> arr=List.of(1,2,3,4,5);
+        Map<Integer,Integer> map=Map.of(3, 2, 1, 5, 5, 4);
+        for(Map.Entry<Integer,Integer> e: map.entrySet()) {
+            int num=Util.pickPrevious(arr, e.getKey()), expected=e.getValue();
+            assert num == expected : String.format("input=%d, expected=%d, actual=%d", e.getKey(), num, expected);
+        }
+
+        arr=new ArrayList<>(arr);
+        arr.set(2, null);
+        Integer num=Util.pickPrevious(arr, 5);
+        assert num == 4;
+
+        num=Util.pickPrevious(arr, 4);
+        assert num == null;
+
+        arr=null;
+        num=Util.pickPrevious(arr, 4);
+        assert num == null;
+        num=Util.pickPrevious(arr, null);
+        assert num == null;
+
+        arr=List.of(1);
+        num=Util.pickPrevious(arr, 4);
+        assert num == null;
+
+        arr=List.of(2,3,4,5);
+        num=Util.pickPrevious(arr, 1);
+        assert num == null;
+
+        arr=List.of(1,2);
+        num=Util.pickPrevious(arr, 1);
+        assert num == 2;
+        num=Util.pickPrevious(arr, 2);
+        assert num == 1;
+    }
+
     public void testPickNextWithSingleElementList() {
         List<Integer> list=new ArrayList<>();
         Integer next=Util.pickNext(list, 1);
@@ -1072,23 +1218,63 @@ public class UtilTest {
     }
 
 
-    public static void testParseSemicolonDelimitedString() {
+    public void testParseSemicolonDelimitedString() {
         String input="one;two ; three; four ; five;six";
         List<String> list=Util.parseStringList(input, ";");
         System.out.println("list: " + list);
         Assert.assertEquals(6, list.size());
         Assert.assertEquals("one", list.get(0));
         Assert.assertEquals("six", list.get(list.size() - 1));
+
+        String[] arr=Util.parseStringArray(input, ";");
+        System.out.println("array: " + Arrays.toString(arr));
+        Assert.assertEquals(6, arr.length);
+        Assert.assertEquals("one", arr[0]);
+        Assert.assertEquals("six", arr[arr.length - 1]);
     }
 
 
-    public static void testParseSemicolonDelimitedString2() {
+    public void testParseSemicolonDelimitedString2() {
         String input="  myID1::subID1 ; myID2::mySubID2; myID3 ;myID4::blaSubID4";
         List<String> list=Util.parseStringList(input, ";");
         System.out.println("list: " + list);
         Assert.assertEquals(4, list.size());
         Assert.assertEquals("myID1::subID1", list.get(0));
         Assert.assertEquals("myID4::blaSubID4", list.get(list.size() - 1));
+
+        String[] arr=Util.parseStringArray(input, ";");
+        System.out.println("array: " + Arrays.toString(arr));
+        Assert.assertEquals(4, arr.length);
+        Assert.assertEquals("myID1::subID1", arr[0]);
+        Assert.assertEquals("myID4::blaSubID4", arr[arr.length - 1]);
+    }
+
+    public void testParseHost() throws UnknownHostException {
+        InetSocketAddress h=Util.parseHost("127.0.0.1");
+        assertHostAndPort(h, "127.0.0.1", 0);
+
+        h=Util.parseHost("127.0.0.1:5555");
+        assertHostAndPort(h, "127.0.0.1", 5555);
+
+        h=Util.parseHost("::1:7000");
+        assertHostAndPort(h, "::1", 7000);
+
+        h=Util.parseHost("google.com:9000");
+        assertHostAndPort(h, "google.com", 9000);
+
+    }
+
+    protected static void assertHostAndPort(InetSocketAddress h, String host, int port) throws UnknownHostException {
+        assert InetAddress.getByName(host).equals(h.getAddress());
+        assert h.getPort() == port;
+    }
+
+    public void testReadStringArray() {
+        String s="  A   ,B,  C";
+        String[] arr=Util.parseStringArray(s, ",");
+        System.out.printf("arr: %s\n", Arrays.toString(arr));
+        assert arr.length == 3;
+        assert arr[0].equals("A") && arr[2].equals("C");
     }
 
 
@@ -1103,43 +1289,72 @@ public class UtilTest {
             System.out.println("line = \"" + line + "\"");
             list.add(line);
         }
-
         assert list.size() == 4;
     }
 
 
-    public static void testVariableSubstitution() {
+    public void testVariableSubstitution() {
         String val="hello world", replacement;
         replacement=Util.substituteVariable(val);
-        Assert.assertEquals(val, replacement);
+        assert val.equals(replacement);
 
         val="my name is ${user.name}";
         replacement=Util.substituteVariable(val);
-        Assert.assertNotSame(val, replacement);
-        assert !(val.equals(replacement));
+        assert !val.equals(replacement);
 
         val="my name is ${user.name} and ${user.name}";
         replacement=Util.substituteVariable(val);
         assert !(val.equals(replacement));
-        Assert.assertEquals(-1, replacement.indexOf("${"));
 
         val="my name is ${unknown.var:Bela Ban}";
         replacement=Util.substituteVariable(val);
         assert replacement.contains("Bela Ban");
-        Assert.assertEquals(-1, replacement.indexOf("${"));
+        assert !replacement.contains("${");
 
         val="my name is ${unknown.var}";
         replacement=Util.substituteVariable(val);
-        assert replacement.contains("${");
+        assert replacement.equals("my name is ");
 
         val="here is an invalid ${argument because it doesn't contains a closing bracket";
-        try {
-            replacement=Util.substituteVariable(val);
-            assert false : "should be an IllegalArgumentException";
-        }
-        catch(Throwable t) {
-            Assert.assertEquals(IllegalArgumentException.class, t.getClass());
-        }
+        replacement=Util.substituteVariable(val);
+        assert val.equals(replacement);
+
+        System.setProperty("name", "Bela");
+        val="bela${ban ${name} bong}done";
+        replacement=Util.substituteVariable(val);
+        assert replacement.equals("bela${ban Bela bong}done");
+
+        val="be}la${ban ${name} bong}done ${name}. done ";
+        replacement=Util.substituteVariable(val);
+        assert replacement.equals("be}la${ban Bela bong}done Bela. done ");
+
+        val="bla$";
+        replacement=Util.substituteVariable(val);
+        assert val.equals(replacement);
+
+        val="bla${";
+        replacement=Util.substituteVariable(val);
+        assert val.equals(replacement);
+
+        val="bla${b";
+        replacement=Util.substituteVariable(val);
+        assert val.equals(replacement);
+
+        val="bla}";
+        replacement=Util.substituteVariable(val);
+        assert val.equals(replacement);
+
+        val="hello $Bela{";
+        replacement=Util.substituteVariable(val);
+        assert val.equals(replacement);
+
+        val="hello ${name and end";
+        replacement=Util.substituteVariable(val);
+        assert val.equals(replacement);
+
+        val="${hello.world}";
+        replacement=Util.substituteVariable(val);
+        assert replacement == null;
     }
 
 
@@ -1265,7 +1480,7 @@ public class UtilTest {
     }
 
 
-    public static void testAttributeNameToMethodName() {
+    public void testAttributeNameToMethodName() {
         _testAttributeNameToMethodName("my_name", "MyName");
         _testAttributeNameToMethodName("bela", "Bela");
         _testAttributeNameToMethodName("oob_max_input_size", "OobMaxInputSize");
@@ -1276,7 +1491,7 @@ public class UtilTest {
         _testAttributeNameToMethodName("inet_address_method", "InetAddressMethod");
     }
 
-    public static void testMethodNameToAttributeName() {
+    public void testMethodNameToAttributeName() {
         _testMethodNameToAttributeName("setFoo", "foo");
         _testMethodNameToAttributeName("getFoo", "foo");
         _testMethodNameToAttributeName("isLogDiscardMessages", "log_discard_messages");
@@ -1296,8 +1511,8 @@ public class UtilTest {
         JChannel a=null, b=null;
 
         try {
-            a=new JChannel(Util.getTestStack()).name("A").connect("demo");
-            b=new JChannel(Util.getTestStack()).name("B").connect("demo");
+            a=new JChannel(Util.getTestStack()).name("A").connect("testWaitUntilAllChannelsHaveSameView");
+            b=new JChannel(Util.getTestStack()).name("B").connect("testWaitUntilAllChannelsHaveSameView");
             Util.waitUntilAllChannelsHaveSameView(10000, 1000, a,b);
 
             try {
@@ -1338,7 +1553,6 @@ public class UtilTest {
         assert addr instanceof Inet6Address || addr == null;
     }
 
-
     public void testGetAddressByScope() throws SocketException {
         for(Util.AddressScope scope: Util.AddressScope.values()) {
             for(StackType type: StackType.values()) {
@@ -1347,6 +1561,13 @@ public class UtilTest {
                 assert addr == null || addr.getClass() == (type == StackType.IPv6? Inet6Address.class : Inet4Address.class);
             }
         }
+    }
+
+    // Tests JGRP-2897
+    public void testGetAddress() throws Exception {
+        InetAddress local=InetAddress.getLocalHost();
+        InetAddress tmp=Util.getAddress("use-localhost", StackType.IPv4);
+        assert local.equals(tmp);
     }
 
     public void testEnumeration() {
@@ -1365,6 +1586,173 @@ public class UtilTest {
 
         en=Util.enumerate(array, 5, 0);
         check(en, new Integer[]{});
+    }
+
+
+    /** Tests {@link Util#otherSites(View, String)} */
+    public void testBridgeMembers() {
+        Collection<String> sites=Util.otherSites(null, null);
+        assert sites != null && sites.isEmpty();
+
+        Address _a=new SiteUUID(UUID.randomUUID(), "A", "lon"),
+          _b=new SiteUUID(UUID.randomUUID(), "B", "lon"),
+          _x=new SiteUUID(UUID.randomUUID(), "X", "sfc"),
+          _y=new SiteUUID(UUID.randomUUID(), "Y", "sfc"),
+          _z=new SiteUUID(UUID.randomUUID(), "Z", "nyc");
+
+        View v=View.create(_a, 1, _a);
+        sites=Util.otherSites(v, "sfc");
+        assert sites.size() == 1;
+        assert sites.contains("lon");
+
+        v=View.create(_a, 1, _a,_b);
+        sites=Util.otherSites(v, "sfc");
+        assert sites.size() == 1;
+        assert sites.contains("lon");
+
+        v=View.create(_a, 1, _a,_b,_x);
+        sites=Util.otherSites(v, "sfc");
+        assert sites.size() == 1;
+        assert sites.contains("lon");
+        assert !sites.contains("sfc");
+
+        sites=Util.otherSites(v, "foo");
+        assert sites.size() == 2;
+        assert sites.containsAll(List.of("lon", "sfc"));
+
+        v=View.create(_a, 1, _a,_b,_x,_y,_z);
+        Collection<String> sites_old=Util.otherSites(null, "lon"),
+          sites_new=Util.otherSites(v, "lon");
+        boolean removed=sites_new.removeAll(sites_old);
+        assert !removed;
+        assert sites_new.containsAll(List.of("nyc", "sfc"));
+
+        View v2=View.create(_a, 1, _a, _y); // ["lon,"sfc"]
+        sites_old=Util.otherSites(v2, "lon");
+        sites_new=Util.otherSites(v, "lon");
+
+        sites_new.removeAll(sites_old);
+        assert sites_new.size() == 1;
+        assert sites_new.contains("nyc");
+
+        sites_old=Util.otherSites(v, "lon");
+        sites_new=Util.otherSites(v2, "lon");
+        sites_old.removeAll(sites_new);
+        assert sites_old.size() == 1;
+        assert sites_old.contains("nyc");
+    }
+
+    /** Tests {@link Util#getSites(View, String)} */
+    public void testGetSites() {
+        Map<String,List<Address>> sites=Util.getSites(null, null);
+        assert sites != null && sites.isEmpty();
+
+        Address _a=new SiteUUID(UUID.randomUUID(), "A", "lon"),
+          _b=new SiteUUID(UUID.randomUUID(), "B", "lon"),
+          _x=new SiteUUID(UUID.randomUUID(), "X", "sfc"),
+          _y=new SiteUUID(UUID.randomUUID(), "Y", "sfc"),
+          _z=new SiteUUID(UUID.randomUUID(), "Z", "nyc");
+
+        View v=View.create(_a, 1, _a);
+        sites=Util.getSites(v, null);
+        assert sites.size() == 1;
+        assert sites.containsKey("lon");
+
+        sites=Util.getSites(v, "sfc");
+        assert sites.size() == 1;
+        assert sites.containsKey("lon");
+
+        v=View.create(_a, 1, _a,_b);
+        sites=Util.getSites(v, "sfc");
+        assert sites.size() == 1;
+        assert sites.containsKey("lon");
+        List<Address> list=sites.get("lon");
+        assert list.containsAll(List.of(_a,_b));
+
+        v=View.create(_a, 1, _a,_b,_x);
+        sites=Util.getSites(v, "sfc");
+        assert sites.size() == 1;
+        assert sites.containsKey("lon");
+        assert !sites.containsKey("sfc");
+
+        sites=Util.getSites(v, "foo");
+        assert sites.size() == 2;
+        assert sites.containsKey("lon");
+        assert sites.containsKey("sfc");
+
+        v=View.create(_a, 1, _a,_b,_x,_y,_z);
+        Map<String,List<Address>> sites_old=Util.getSites(null, "lon"),
+          sites_new=Util.getSites(v, "lon");
+        boolean removed=sites_new.keySet().removeAll(sites_old.keySet());
+        assert !removed;
+        assert sites_new.containsKey("nyc");
+        assert sites_new.containsKey("sfc");
+
+        View v2=View.create(_a, 1, _a, _y); // ["lon,"sfc"]
+        sites_old=Util.getSites(v2, "lon");
+        sites_new=Util.getSites(v, "lon");
+
+        sites_new.keySet().removeAll(sites_old.keySet());
+        assert sites_new.size() == 1;
+        assert sites_new.containsKey("nyc");
+
+        sites_old=Util.getSites(v, "lon");
+        sites_new=Util.getSites(v2, "lon");
+        sites_old.keySet().removeAll(sites_new.keySet());
+        assert sites_old.size() == 1;
+        assert sites_old.containsKey("nyc");
+    }
+
+    public void testToUUID() throws Exception {
+        Address addr=UUID.randomUUID();
+        String s=Util.addressToString(null);
+        assert s == null;
+        s=Util.addressToString(addr);
+        Address uuid2=Util.addressFromString(s);
+        assert uuid2.equals(addr);
+
+        SiteUUID u1=new SiteUUID(UUID.randomUUID(), "lon", "X");
+        s=Util.addressToString(u1);
+        Address u2=Util.addressFromString(s);
+        assert u2 instanceof SiteUUID;
+        assert u2.equals(u1);
+
+        Address ip1=new IpAddress(7500);
+        s=Util.addressToString(ip1);
+        Address ip2=Util.addressFromString(s);
+        assert ip1.equals(ip2);
+        ip1=new IpAddress("127.0.0.1", 7500);
+        s=Util.addressToString(ip1);
+        ip2=Util.addressFromString(s);
+        assertSame(ip1, ip2);
+
+        addr=ExtendedUUID.randomUUID();
+        s=Util.addressToString(addr);
+        assert s != null;
+        ip2=Util.addressFromString(s);
+        assertSame(addr, ip2);
+
+        addr=FlagsUUID.randomUUID().setFlag((short)22);
+        s=Util.addressToString(addr);
+        assert s != null;
+        ip2=Util.addressFromString(s);
+        assertSame(addr, ip2);
+
+        addr=new MillisAddress(1);
+        s=Util.addressToString(addr);
+        assert s != null;
+        Address addr2=Util.addressFromString(s);
+        assertSame(addr, addr2);
+    }
+
+    protected static void assertSame(Address u1, Address u2) {
+        assert u1.equals(u2);
+        assert u2.equals(u1);
+        assert u1.compareTo(u2) == 0;
+        assert u2.compareTo(u1) == 0;
+        Set<Address> s=new HashSet<>();
+        s.add(u1); s.add(u2);
+        assert s.size() == 1;
     }
 
     protected static void check(Enumeration<Integer> en, Integer[] expected) {

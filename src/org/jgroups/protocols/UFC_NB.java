@@ -16,7 +16,7 @@ import java.util.function.Consumer;
 
 /**
  * Non-blocking alternative to {@link UFC}.<br/>
- * JIRA: https://issues.jboss.org/browse/JGRP-2172
+ * JIRA: https://issues.redhat.com/browse/JGRP-2172
  * @author Bela Ban
  * @since  4.0.4
  */
@@ -72,7 +72,7 @@ public class UFC_NB extends UFC {
             credit_send_task.cancel(true);
     }
 
-    @Override protected Object handleDownMessage(Message msg) {
+    @Override protected Object handleDownMessage(Message msg, int length) {
         Address dest=msg.getDest();
         if(dest == null) { // 2nd line of defense, not really needed
             log.error("%s doesn't handle multicast messages; passing message down", getClass().getSimpleName());
@@ -83,7 +83,6 @@ public class UFC_NB extends UFC {
         if(cred == null)
             return down_prot.down(msg);
 
-        int length=msg.getLength();
         if(running) {
             if(cred.decrementIfEnoughCredits(msg, length, 0)) // timeout is ignored
                 return down_prot.down(msg);
@@ -98,10 +97,8 @@ public class UFC_NB extends UFC {
         return (T)new NonBlockingCredit(initial_credits, max_queue_size, new ReentrantLock(true), send_function);
     }
 
-    /**
-     * Checks the sent table: if some credits are in queueing mode and credits left are less than min_credits:
-     * send a credit request
-     */
+    /** Checks the sent table: if some credits are in queueing mode and credits left are less than min_credits:
+     *  send a credit request */
     protected void sendCreditRequestsIfNeeded() {
         sent.forEach((dest, c) -> {
             NonBlockingCredit cred=(NonBlockingCredit)c;

@@ -165,7 +165,14 @@ public class BytesMessage extends BaseMessage {
         return this;
     }
 
-
+    public byte[] getBytes() {
+        if(array == null) return null;
+        if(offset == 0 && length == array.length)
+            return array;
+        byte[] tmp=new byte[length];
+        System.arraycopy(array, offset, tmp, 0, length);
+        return tmp;
+    }
 
     /**
      * Takes an object and uses Java serialization to generate the byte array which is set in the
@@ -173,20 +180,26 @@ public class BytesMessage extends BaseMessage {
      * Externalizable or Streamable, or be a basic type (e.g. Integer, Short etc)).
      */
     public BytesMessage setObject(Object obj) {
-        if(obj == null) return this;
+        clearFlag(Flag.SERIALIZED);
+        if(obj == null) {
+            array=null;
+            offset=length=0;
+            return this;
+        }
         if(obj instanceof byte[])
             return setArray((byte[])obj, 0, ((byte[])obj).length);
         if(obj instanceof ByteArray)
             return setArray((ByteArray)obj);
         if(obj instanceof ByteBuffer) {
             ByteBuffer bb=(ByteBuffer)obj;
-            if(bb.isDirect())
-                return (BytesMessage)setArray(Util.bufferToArray(bb));
-            else
+            if(bb.hasArray())
                 return setArray(bb.array(), bb.arrayOffset()+bb.position(), bb.remaining());
+            else
+                return (BytesMessage)setArray(Util.bufferToArray(bb));
         }
         try {
             ByteArray tmp=Util.objectToBuffer(obj);
+            setFlag(Flag.SERIALIZED);
             return setArray(tmp);
         }
         catch(Exception ex) {
@@ -210,23 +223,15 @@ public class BytesMessage extends BaseMessage {
      * @return the object
      */
     public <T extends Object> T getObject(ClassLoader loader) {
+        if(array == null)
+            return null;
         try {
-            return Util.objectFromByteBuffer(array, offset, length, loader);
+            return isFlagSet(Flag.SERIALIZED)? Util.objectFromByteBuffer(array, offset, length, loader) : (T)getBytes();
         }
         catch(Exception ex) {
             throw new IllegalArgumentException(ex);
         }
     }
-
-    public <T> T getPayload() {
-        return (T)getArray();
-    }
-
-
-    public int size() {
-        return super.size() +sizeOfPayload();
-    }
-
 
     /**
      * Copies the byte array. If offset and length are used (to refer to another array), the copy will contain only
@@ -241,7 +246,7 @@ public class BytesMessage extends BaseMessage {
         return copy;
     }
 
-    protected int sizeOfPayload() {
+    @Override protected int payloadSize() {
         int retval=Global.INT_SIZE; // length
         if(array != null)
             retval+=length;         // number of bytes in the array

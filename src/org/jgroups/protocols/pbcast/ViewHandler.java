@@ -9,7 +9,6 @@ import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -27,10 +26,9 @@ import java.util.stream.Collectors;
 public class ViewHandler<R> {
     protected final Collection<R>         requests=new ConcurrentLinkedQueue<>();
     protected final Lock                  lock=new ReentrantLock();
-    protected final AtomicInteger         count=new AtomicInteger(); // #threads adding to (and removing from) queue
     protected final AtomicBoolean         suspended=new AtomicBoolean(false);
     @GuardedBy("lock")
-    protected boolean                     processing;
+    protected final AtomicBoolean         processing=new AtomicBoolean(false);
     protected final Condition             processing_done=lock.newCondition();
     protected final GMS                   gms;
     protected Consumer<Collection<R>>     req_processor;
@@ -53,6 +51,7 @@ public class ViewHandler<R> {
     }
 
     public boolean                 suspended()                             {return suspended.get();}
+    public boolean                 processing()                            {return processing.get();}
     public int                     size()                                  {return requests.size();}
     public ViewHandler<R>          reqProcessor(Consumer<Collection<R>> p) {req_processor=p; return this;}
     public Consumer<Collection<R>> reqProcessor()                          {return req_processor;}
@@ -61,28 +60,35 @@ public class ViewHandler<R> {
 
     public ViewHandler<R> add(R req) {
         if(_add(req))
-            process(requests);
+            process();
         return this;
     }
 
     @SuppressWarnings("unchecked")
     public ViewHandler<R> add(R ... reqs) {
         if(_add(reqs))
-            process(requests);
+            process();
         return this;
     }
 
     public ViewHandler<R> add(Collection<R> reqs) {
         if(_add(reqs))
-            process(requests);
+            process();
         return this;
     }
 
 
     /** Clears the queue and discards new requests from now on */
     public void suspend() {
-        if(suspended.compareAndSet(false, true))
-            requests.clear();
+        if(suspended.compareAndSet(false, true)) {
+            lock.lock();
+            try {
+                requests.clear();
+            }
+            finally {
+                lock.unlock();
+            }
+        }
     }
 
 
@@ -95,7 +101,7 @@ public class ViewHandler<R> {
     public void waitUntilComplete() {
         lock.lock();
         try {
-            while(processing || count.get() > 0) {
+            while(processing.get()) {
                 try {
                     processing_done.await();
                 }
@@ -118,7 +124,7 @@ public class ViewHandler<R> {
         long now=0;
         lock.lock();
         try {
-            while(processing || count.get() > 0) {
+            while(processing.get()) {
                 long delay=timeout-now;
                 if(delay <= 0)
                     break;
@@ -139,7 +145,9 @@ public class ViewHandler<R> {
     public <T extends ViewHandler<R>> T processing(boolean flag) {
         lock.lock();
         try {
-            setProcessing(flag);
+            processing.set(flag);
+            if(flag == false)
+                processing_done.signalAll();
             return (T)this;
         }
         finally {
@@ -161,30 +169,22 @@ public class ViewHandler<R> {
 
     protected Log log() {return gms.getLog();}
 
-    @GuardedBy("lock")
-    protected boolean setProcessing(boolean flag) {
-        boolean do_signal=processing && !flag;
-        processing=flag;
-        if(do_signal)
-            processing_done.signalAll();
-        return flag;
-    }
 
     protected boolean _add(R req) {
-        if(req == null || suspended.get()) {
-            log().trace("%s: queue is suspended; request %s is discarded", gms.getLocalAddress(), req);
+        if(req == null)
+            return false;
+        if(suspended.get()) {
+            log().trace("%s: queue is suspended; request %s is discarded", gms.getAddress(), req);
             return false;
         }
-
-        String log=new Date() + ": " + req.toString();
-        count.incrementAndGet();
+        String log= Util.utcNow() + ": " + req;
         lock.lock();
         try {
-            if(!requests.contains(req)) {
+            if(!requests.contains(req)) { // non-null check already performed (above)
                 requests.add(req);
                 history.add(log);
             }
-            return count.decrementAndGet() == 0 && !processing && setProcessing(true);
+            return processing.compareAndSet(false, true);
         }
         finally {
             lock.unlock();
@@ -193,44 +193,29 @@ public class ViewHandler<R> {
 
     @SuppressWarnings("unchecked")
     protected boolean _add(R ... reqs) {
-        if(reqs == null || reqs.length == 0 || suspended.get()) {
-            log().trace("%s: queue is suspended; requests %s are discarded", gms.getLocalAddress(), Arrays.toString(reqs));
+        if(reqs == null || reqs.length == 0)
             return false;
-        }
-
-        count.incrementAndGet();
-        lock.lock();
-        try {
-            for(R req: reqs) {
-                if(!requests.contains(req)) {
-                    requests.add(req);
-                    history.add(new Date() + ": " + req.toString());
-                }
-            }
-            return count.decrementAndGet() == 0 && !processing && setProcessing(true);
-        }
-        finally {
-            lock.unlock();
-        }
+        return _add(Arrays.asList(reqs));
     }
 
 
     protected boolean _add(Collection<R> reqs) {
-        if(reqs == null || reqs.isEmpty() || suspended.get()) {
-            log().trace("%s: queue is suspended; requests %s are discarded", gms.getLocalAddress(), reqs);
+        if(reqs == null || reqs.isEmpty())
+            return false;
+        if(suspended.get()) {
+            log().trace("%s: queue is suspended; requests %s are discarded", gms.getAddress(), reqs);
             return false;
         }
 
-        count.incrementAndGet();
         lock.lock();
         try {
             for(R req: reqs) {
-                if(!requests.contains(req)) {
+                if(req != null && !requests.contains(req)) {
                     requests.add(req);
-                    history.add(new Date() + ": " + req.toString());
+                    history.add(Util.utcNow() + ": " + req);
                 }
             }
-            return count.decrementAndGet() == 0 && !processing && setProcessing(true);
+            return processing.compareAndSet(false, true);
         }
         finally {
             lock.unlock();
@@ -238,15 +223,40 @@ public class ViewHandler<R> {
     }
 
     /** We're guaranteed that only one thread will be called with this method at any time */
-    protected void process(Collection<R> requests) {
+    protected void process() {
         for(;;) {
             while(!requests.isEmpty()) {
-                removeAndProcess(requests); // remove matching requests and process them
+                Collection<R> reqs=null;
+                lock.lock();
+                try {
+                    reqs=remove(requests); // remove matching requests
+                }
+                finally {
+                    lock.unlock();
+                }
+                if(reqs != null && !reqs.isEmpty()) {
+                    try {
+                        req_processor.accept(reqs); // process outside of the lock scope
+                    }
+                    catch(Throwable t) {
+                        log().error("%s: failed processsing requests: %s", gms.addr(), t);
+                        lock.lock();
+                        try {
+                            if(processing.compareAndSet(true, false))
+                                processing_done.signalAll();
+                            throw t;
+                        }
+                        finally {
+                            lock.unlock();
+                        }
+                    }
+                }
             }
             lock.lock();
             try {
                 if(requests.isEmpty()) {
-                    setProcessing(false);
+                    if(processing.compareAndSet(true, false))
+                        processing_done.signalAll();
                     return;
                 }
             }
@@ -260,14 +270,17 @@ public class ViewHandler<R> {
      * Removes requests as long as they match - breaks at the first non-matching request or when requests is empty
      * This method must catch all exceptions; or else process() might return without setting processing to true again!
      */
-    protected void removeAndProcess(Collection<R> requests) {
+    @GuardedBy("lock")
+    protected Collection<R> remove(Collection<R> requests) {
+        Collection<R> removed=new ArrayList<>();
+        R             first_req=null;
+        Iterator<R>   it=requests.iterator();
         try {
-            Collection<R> removed=new ArrayList<>();
-            Iterator<R> it=requests.iterator();
-            R first_req=it.next();
-            removed.add(first_req);
-            it.remove();
-
+            if(it.hasNext()) { // safeguard to prevent https://issues.redhat.com/browse/JGRP-2718
+                first_req=it.next();
+                removed.add(first_req);
+                it.remove();
+            }
             while(it.hasNext()) {
                 R next=it.next();
                 if(req_matcher.test(first_req, next)) {
@@ -277,11 +290,11 @@ public class ViewHandler<R> {
                 else
                     break;
             }
-            req_processor.accept(removed);
         }
         catch(Throwable t) {
             log().error("failed processing requests", t);
         }
+        return removed;
     }
 
 

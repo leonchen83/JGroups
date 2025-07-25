@@ -5,6 +5,7 @@ import org.jgroups.*;
 import org.jgroups.annotations.GuardedBy;
 import org.jgroups.protocols.relay.SiteAddress;
 
+import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -18,7 +19,7 @@ import java.util.function.Supplier;
  * @author Bela Ban
  */
 public class UnicastRequest<T> extends Request<T> {
-    protected final Address    target;
+    protected final Address target;
 
 
     public UnicastRequest(RequestCorrelator corr, Address target, RequestOptions options) {
@@ -53,7 +54,6 @@ public class UnicastRequest<T> extends Request<T> {
         corrDone();
     }
 
-
     public void siteUnreachable(String site) {
         if(!(target instanceof SiteAddress) || !((SiteAddress)target).getSite().equals(site) || isDone())
             return;
@@ -61,14 +61,32 @@ public class UnicastRequest<T> extends Request<T> {
         corrDone();
     }
 
+    @Override
+    public void memberUnreachable(Address mbr) {
+        if(!isDone() && target != null && target.isSiteAddress() && Objects.equals(target, mbr)) {
+            completeExceptionally(new UnreachableException(mbr));
+            corrDone();
+        }
+    }
+
     /**
      * If the target address is not a member of the new view, we'll mark the response as suspected and unblock
      * the caller of execute()
      */
-    public void viewChange(View view) {
+    public void viewChange(View view, boolean handle_previous_subgroups) {
         if(view == null)
             return;
 
+        if(view instanceof MergeView && handle_previous_subgroups) {
+            // if target is not in a subview then we need to suspect it (https://issues.redhat.com/browse/JGRP-2575)
+            for(View v: ((MergeView)view).getSubgroups()) {
+                if(v.containsMember(target) && !v.containsMember(corr.local_addr)) {
+                    completeExceptionally(new SuspectedException(target));
+                    corrDone();
+                    return;
+                }
+            }
+        }
         // SiteAddresses are not checked as they might be in a different cluster
         if(!(target instanceof SiteAddress) && !view.containsMember(target) && !isDone()) {
             completeExceptionally(new SuspectedException(target));

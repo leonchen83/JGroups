@@ -3,30 +3,36 @@ package org.jgroups.util;
 import org.jgroups.Address;
 import org.jgroups.Message;
 import org.jgroups.annotations.ManagedOperation;
+import org.jgroups.annotations.Property;
 import org.jgroups.protocols.TP;
 
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.IntFunction;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
  * {@link org.jgroups.stack.MessageProcessingPolicy} which processes <em>regular</em> messages and message batches by
- * assigning a max of 1 thread per message from the same sender. So if we have sender A, B, C and D, we'll have no more
+ * assigning a max of 1 thread per message from the same sender. So if we have senders A, B, C and D, we'll have no more
  * than 4 threads handling regular unicasts and 4 threads handling regular multicasts.<p>
- * See <a href="https://issues.jboss.org/browse/JGRP-2143">JGRP-2143</a> for details.
+ * See <a href="https://issues.redhat.com/browse/JGRP-2143">JGRP-2143</a> for details.<br/>
+ * When using virtual threads, we probably don't need this anymore, and can use a virtual thread to send messages /
+ * message batches directly up to UNICAST or NAKACK.
  * @author Bela Ban
  * @since  4.0
  */
 public class MaxOneThreadPerSender extends SubmitToThreadPool {
     protected final MessageTable mcasts=new MessageTable();
     protected final MessageTable ucasts=new MessageTable();
+
+    @Property(description="Max number of messages buffered for consumption of the delivery thread in " +
+      "MaxOneThreadPerSender. 0 creates an unbounded buffer")
     protected int                max_buffer_size;
-    protected boolean            resize=true;
 
     @ManagedOperation(description="Dumps unicast and multicast tables")
     public String dump() {
@@ -40,8 +46,6 @@ public class MaxOneThreadPerSender extends SubmitToThreadPool {
 
     public void init(TP transport) {
         super.init(transport);
-        max_buffer_size=tp.getMessageProcessingMaxBufferSize();
-        resize=max_buffer_size == 0;
     }
 
     public void destroy() {
@@ -49,31 +53,32 @@ public class MaxOneThreadPerSender extends SubmitToThreadPool {
         ucasts.clear();
     }
 
-    public void loopback(Message msg, boolean oob, boolean internal) {
-        if(oob || internal) {
-            super.loopback(msg, oob, internal);
-            return;
-        }
+    public boolean loopback(Message msg, boolean oob) {
+        if(oob)
+            return super.loopback(msg, oob);
         MessageTable table=msg.getDest() == null? mcasts : ucasts;
-        table.process(msg, true);
+        return table.process(msg, true);
     }
 
-    public void process(Message msg, boolean oob, boolean internal) {
-        if(oob || internal) {
-            super.process(msg, oob, internal);
-            return;
-        }
-        MessageTable table=msg.getDest() == null? mcasts : ucasts;
-        table.process(msg, false);
-    }
-
-    public void process(MessageBatch batch, boolean oob, boolean internal) {
-        if(oob || internal) {
-            super.process(batch, oob, internal);
-            return;
-        }
+    public boolean loopback(MessageBatch batch, boolean oob) {
+        if(oob)
+            return super.loopback(batch, oob);
         MessageTable table=batch.dest() == null? mcasts : ucasts;
-        table.process(batch);
+        return table.process(batch, true);
+    }
+
+    public boolean process(Message msg, boolean oob) {
+        if(oob)
+            return super.process(msg, oob);
+        MessageTable table=msg.getDest() == null? mcasts : ucasts;
+        return table.process(msg, false);
+    }
+
+    public boolean process(MessageBatch batch, boolean oob) {
+        if(oob)
+            return super.process(batch, oob);
+        MessageTable table=batch.dest() == null? mcasts : ucasts;
+        return table.process(batch, false);
     }
 
     public void viewChange(List<Address> members) {
@@ -88,161 +93,137 @@ public class MaxOneThreadPerSender extends SubmitToThreadPool {
         public MessageTable() {
         }
 
-        protected Entry get(final Address dest, final Address sender) {
-            Entry entry=map.get(sender);
-            if(entry == null) {
-                IntFunction<MessageBatch> creator_func=cap -> new MessageBatch(cap).dest(dest)
-                  .clusterName(tp.getClusterNameAscii()).sender(sender).multicast(dest == null);
-                Entry tmp=map.putIfAbsent(sender, entry=new Entry(creator_func));
-                if(tmp != null)
-                    entry=tmp;
-            }
-            return entry;
+        protected Entry get(final Address sender, boolean multicast) {
+            Entry e=map.get(sender);
+            if(e != null)
+                return e;
+            // not so elegant, but avoids lambda allocation! true?
+            Entry tmp=map.putIfAbsent(sender, (e=new Entry(sender, multicast, tp.getClusterNameAscii())));
+            return tmp!= null? tmp: e;
+            // return map.computeIfAbsent(sender, s -> new Entry(sender, multicast, tp.getClusterNameAscii()));
         }
 
-        protected void clear() {map.clear();}
+        protected void clear() {
+            map.values().forEach(Entry::trimToInitialCapacity);
+            map.clear();
+        }
 
-        protected void process(Message msg, boolean loopback) {
+        protected boolean process(Message msg, boolean loopback) {
             Address dest=msg.getDest(), sender=msg.getSrc();
-            get(dest, sender).process(msg, loopback);
+            return sender != null && get(sender, dest == null).process(msg, loopback);
         }
 
-        protected void process(MessageBatch batch) {
+        protected boolean process(MessageBatch batch, boolean loopback) {
             Address dest=batch.dest(), sender=batch.sender();
-            get(dest, sender).process(batch);
+            return get(sender, dest == null).process(batch, loopback);
         }
 
         protected void viewChange(List<Address> mbrs) {
+            // remove all senders that are not in the new view
             map.keySet().retainAll(mbrs);
+            map.values().forEach(Entry::trimToInitialCapacity);
         }
 
         public String toString() {
-            return map.entrySet().stream().collect(StringBuilder::new, (sb,e) -> sb.append(e).append("\n"), (a,b) -> {}).toString();
+            return map.entrySet().stream().map(e -> String.format("%s: %s", e.getKey(), e.getValue())).collect(Collectors.joining("\n"));
         }
     }
 
 
     protected class Entry {
-        protected final Lock                lock=new ReentrantLock();
-        protected boolean                   running;       // if true, a thread is delivering a message batch to the application
-        protected MessageBatch              batch;         // used to queue messages
-        protected IntFunction<MessageBatch> batch_creator; // creates a batch
+        protected final Lock               lock=new ReentrantLock();
+        protected final boolean            mcast;
+        protected final MessageBatch       batch;     // grabs queued msgs from msg_queue and passes them up the stack
+        protected final FastArray<Message> msg_queue; // used to queue incoming (regular) messages
+        protected final Address            sender;
+        protected final AsciiString        cluster_name;
+        protected final AtomicInteger      adders=new AtomicInteger(0);
+        protected final LongAdder          submitted_batches=new LongAdder();
+        protected final LongAdder          queued_msgs=new LongAdder();
+        protected static final int         DEFAULT_INITIAL_CAPACITY=128;
+        protected static final int         DEFAULT_INCREMENT=128;
 
-        protected final LongAdder           submitted_msgs=new LongAdder();
-        protected final LongAdder           submitted_batches=new LongAdder();
-        protected final LongAdder           queued_msgs=new LongAdder();
-        protected final LongAdder           queued_batches=new LongAdder();
 
-
-        protected Entry(IntFunction<MessageBatch> creator) {
-            batch_creator=creator;
-            batch=batch_creator.apply(max_buffer_size > 0? max_buffer_size : 16); // initial capacity
+        protected Entry(Address sender, boolean mcast, AsciiString cluster_name) {
+            this.mcast=mcast;
+            this.sender=sender;
+            this.cluster_name=cluster_name;
+            int cap=max_buffer_size > 0? max_buffer_size : DEFAULT_INITIAL_CAPACITY; // initial capacity
+            batch=new MessageBatch(cap).dest(tp.getAddress()).sender(sender).clusterName(cluster_name)
+              .multicast(mcast).mode(MessageBatch.Mode.REG); // only regular messages are queued
+            batch.array().increment(DEFAULT_INCREMENT);
+            msg_queue=max_buffer_size > 0? new FastArray<>(max_buffer_size) : new FastArray<>(DEFAULT_INITIAL_CAPACITY);
+            msg_queue.increment(DEFAULT_INCREMENT);
         }
 
-
         public Entry reset() {
-            Stream.of(submitted_msgs, submitted_batches, queued_msgs, queued_batches).forEach(LongAdder::reset);
+            Stream.of(submitted_batches,queued_msgs).forEach(LongAdder::reset);
             return this;
         }
 
-
-        protected void process(Message msg, boolean loopback) {
-            if(!allowedToSubmitToThreadPool(msg))
-                return;
-            // running is true, we didn't queue msg and need to submit a task to the thread pool
-            submit(msg, loopback);
-        }
-
-        protected void process(MessageBatch batch) {
-            if(!allowedToSubmitToThreadPool(batch))
-                return;
-            // running is true, we didn't queue msg and need to submit a task to the thread pool
-            submit(batch);
-        }
-
-        protected void submit(Message msg, boolean loopback) {
-            // running is true, we didn't queue msg and need to submit a task to the thread pool
-            try {
-                submitted_msgs.increment();
-                BatchHandlerLoop handler=new BatchHandlerLoop(batch_creator.apply(16).add(msg), this, loopback);
-                if(!tp.submitToThreadPool(handler, false))
-                    setRunning(false);
-            }
-            catch(Throwable t) {
-                setRunning(false);
-            }
-        }
-
-        protected void submit(MessageBatch mb) {
-            try {
-                submitted_batches.increment();
-                BatchHandlerLoop handler=new BatchHandlerLoop(batch_creator.apply(mb.size()).add(mb), this, false);
-                if(!tp.submitToThreadPool(handler, false))
-                    setRunning(false);
-            }
-            catch(Throwable t) {
-                setRunning(false);
-            }
-        }
-
-
-        /**
-         * Either allows access to submit a task to the thread pool for delivery to the application, or queues the
-         * message
-         * @param msg the message
-         * @return true if the message can be submitted to the thread pool, or false (msg was queued)
-         */
-        protected boolean allowedToSubmitToThreadPool(Message msg) {
+        public Entry trimToInitialCapacity() {
             lock.lock();
             try {
-                if(!running)
-                    return running=true; // the caller can submit a new BatchHandlerLoop task to the thread pool
-                this.batch.add(msg, resize);
-                queued_msgs.increment();
+                msg_queue.trimTo(max_buffer_size > 0? max_buffer_size : DEFAULT_INITIAL_CAPACITY);
+                batch.array().trimTo(max_buffer_size > 0? max_buffer_size : DEFAULT_INITIAL_CAPACITY);
+            }
+            finally {
+                lock.unlock();
+            }
+            return this;
+        }
+
+        protected boolean process(Message msg, boolean loopback) {
+            lock.lock();
+            try {
+                msg_queue.add(msg, max_buffer_size == 0);
+            }
+            finally {
+                lock.unlock();
+            }
+            queued_msgs.increment();
+            if(adders.getAndIncrement() != 0)
+                return false;
+            return submit(loopback);
+        }
+
+        protected boolean process(MessageBatch batch, boolean loopback) {
+            FastArray<Message> fa=batch.array();
+            lock.lock();
+            try {
+                msg_queue.addAll(fa, max_buffer_size == 0);
+            }
+            finally {
+                lock.unlock();
+            }
+            queued_msgs.add(batch.size());
+            if(adders.getAndIncrement() != 0)
+                return false;
+            return submit(loopback);
+        }
+
+        protected boolean submit(boolean loopback) {
+            submitted_batches.increment();
+            BatchHandlerLoop handler=new BatchHandlerLoop(this, loopback);
+            if(!tp.getThreadPool().execute(handler)) {
+                adders.set(0);
                 return false;
             }
-            finally {
-                lock.unlock();
-            }
+            return true;
         }
 
-        protected boolean allowedToSubmitToThreadPool(MessageBatch msg_batch) {
-            lock.lock();
-            try {
-                if(!running)
-                    return running=true; // the caller can submit a new BatchHandlerLoop task to the thread pool
-                this.batch.add(msg_batch, resize);
-                queued_batches.increment();
-                return false;
-            }
-            finally {
-                lock.unlock();
-            }
-        }
-
-        /** Called by {@link BatchHandlerLoop}. Atomically transfer messages from the entry's batch to this batch and
-         * returns true if messages were transferred. If not, sets running to false and returns false. In the latter
-         * case, the handler must terminate (or else, we could have multiple handler running).
-         * @param msg_batch the batch to which messages from this.batch should be transferred to.
+        /** Called by {@link BatchHandlerLoop}. Atomically transfer messages from the entry.msg_queue to entry.batch
+         * and returns true if messages were transferred.
          */
-        protected boolean workAvailable(final MessageBatch msg_batch) {
+        protected boolean workAvailable() {
             lock.lock();
             try {
-                int num_msgs=msg_batch.transferFrom(this.batch, true);
-                return num_msgs > 0 || (running=false);
+                batch.clear();
+                int num_msgs=batch.array().transferFrom(msg_queue, true); // clears msg_queue
+                return num_msgs > 0;
             }
             catch(Throwable t) {
-                return running=false;
-            }
-            finally {
-                lock.unlock();
-            }
-        }
-
-        protected void setRunning(boolean flag) {
-            lock.lock();
-            try {
-                running=flag;
+                return false;
             }
             finally {
                 lock.unlock();
@@ -251,37 +232,43 @@ public class MaxOneThreadPerSender extends SubmitToThreadPool {
 
         // unsynchronized on batch but who cares
         public String toString() {
-            return String.format("batch size=%d queued msgs=%d queued batches=%d submitted msgs=%d submitted batches=%d",
-                                 batch.size(), queued_msgs.sum(), queued_batches.sum(), submitted_msgs.sum(), submitted_batches.sum());
+            return String.format("msg_queue.size=%,d msg_queue.cap: %,d batch.cap=%,d queued msgs=%,d submitted batches=%,d",
+                                 msg_queue.size(), msg_queue.capacity(), batch.capacity(), queued_msgs.sum(),
+                                 submitted_batches.sum());
         }
     }
 
 
-    public class BatchHandlerLoop extends BatchHandler {
-        protected final Entry   entry;
-        protected final boolean loopback;
+    protected class BatchHandlerLoop extends BatchHandler {
+        protected final Entry entry;
 
-        public BatchHandlerLoop(MessageBatch batch, Entry entry, boolean loopback) {
-            super(batch);
+        protected BatchHandlerLoop(Entry entry, boolean loopback) {
+            super(null, loopback);
             this.entry=entry;
             this.loopback=loopback;
         }
 
         public void run() {
-            do {
+            while(entry.workAvailable() || entry.adders.decrementAndGet() != 0) {
                 try {
-                    super.run();
+                    MessageBatch mb=entry.batch;
+                    if(mb.isEmpty())
+                        continue;
+                    if(!mb.multicast()) {
+                        // due to an incorrect (e.g. late) view change, the cached batch's destination might be
+                        // different from our local address. If this is the case, change the cached batch's dest address
+                        if(tp.unicastDestMismatch(mb.dest())) {
+                            Address dest=tp.addr();
+                            if(dest != null)
+                                mb.dest(dest);
+                        }
+                    }
+                    tp.passBatchUp(mb, !loopback, !loopback);
                 }
                 catch(Throwable t) {
                     log.error("failed processing batch", t);
                 }
             }
-            while(entry.workAvailable(this.batch)); // transfers msgs from entry.batch --> this.batch
-            // worker termination: workAvailable() already set running=false
-        }
-
-        @Override protected void passBatchUp() {
-            tp.passBatchUp(batch, !loopback, !loopback);
         }
     }
 }

@@ -34,6 +34,12 @@ public class LOCAL_PING extends Discovery {
         super.stop();
     }
 
+    public static void clear() {
+        synchronized(discovery) {
+            discovery.clear();
+        }
+    }
+
     @ManagedOperation(description="Dumps the contents of the discovery cache")
     public static String print() {
         StringBuilder sb=new StringBuilder();
@@ -85,7 +91,7 @@ public class LOCAL_PING extends Discovery {
                         if(down_prot.down(new Event(Event.GET_PHYSICAL_ADDRESS, mbr)) == null)
                             down_prot.down(new Event(Event.ADD_PHYSICAL_ADDRESS, new Tuple<>(mbr, d.getPhysicalAddr())));
 
-                        // set the coordinator based on the new view (https://issues.jboss.org/browse/JGRP-2381)
+                        // set the coordinator based on the new view (https://issues.redhat.com/browse/JGRP-2381)
                         if(Objects.equals(local_addr, mbr)) {
                             if(!was_coord && is_coord) { // this member became coordinator
                                 d.coord(true);
@@ -115,7 +121,7 @@ public class LOCAL_PING extends Discovery {
                 final List<PingData> list=discovery.computeIfAbsent(cluster_name, FUNC);
                 if(list.isEmpty()) {
                     // the first member will become coord (may be changed by view changes/merges later)
-                    // https://issues.jboss.org/browse/JGRP-2395
+                    // https://issues.redhat.com/browse/JGRP-2395
                     data.coord(true);
                 }
                 list.add(data);
@@ -134,10 +140,6 @@ public class LOCAL_PING extends Discovery {
                     discovery.remove(cluster_name);
             }
         }
-    }
-
-    public String toString() {
-        return String.format("%s(%s)", LOCAL_PING.class.getSimpleName(), local_addr);
     }
 
     protected void addAddressToLocalCache(Address addr, PhysicalAddress phys_addr) {

@@ -2,10 +2,14 @@ package org.jgroups.tests;
 
 import org.jgroups.*;
 import org.jgroups.protocols.DISCARD;
+import org.jgroups.protocols.NAKACK4;
 import org.jgroups.protocols.TP;
+import org.jgroups.protocols.UNICAST3;
 import org.jgroups.protocols.pbcast.NAKACK2;
 import org.jgroups.protocols.pbcast.STABLE;
 import org.jgroups.stack.ProtocolStack;
+import org.jgroups.util.PassRegularMessagesUpDirectly;
+import org.jgroups.util.Tests;
 import org.jgroups.util.Util;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
@@ -28,13 +32,14 @@ public class OOBTest extends ChannelTestBase {
 
     @BeforeMethod
     void init() throws Exception {
-        a=createChannel(true, 2, "A");
-        b=createChannel(a, "B");
+        a=createChannel().name("A");
+        b=createChannel().name("B");
+        makeUnique(a,b);
         setThreadPoolSize(a, b);
         setStableGossip(a,b);
         a.connect("OOBTest");
         b.connect("OOBTest");
-        Util.waitUntilAllChannelsHaveSameView(10000, 1000, a, b);
+        Util.waitUntilAllChannelsHaveSameView(10000, 100, a, b);
     }
 
 
@@ -46,22 +51,29 @@ public class OOBTest extends ChannelTestBase {
      * received by B.
      */
     public void testNonBlockingUnicastOOBMessage() throws Exception {
-        send(b.getAddress());
+        // todo: test again when https://issues.redhat.com/browse/JGRP-2686 is in place
+        if(Tests.ucastRetransmissionAvailable(a, b))
+            send(b.getAddress());
     }
 
     public void testNonBlockingMulticastOOBMessage() throws Exception {
-        send(null);
+        // todo: test again when https://issues.redhat.com/browse/JGRP-2686 is in place
+        if(Tests.mcastRetransmissionAvailable(a,b) && Tests.hasThreadPool(a,b)
+          && !Tests.processingPolicyIs(PassRegularMessagesUpDirectly.class, a, b))
+            send(null);
     }
 
 
     /**
      * Tests sending 1, 2 (OOB) and 3, where they are received in the order 1, 3, 2. Message 3 should not get delivered
-     * until message 4 is received (http://jira.jboss.com/jira/browse/JGRP-780)
+     * until message 4 is received (https://issues.redhat.com/browse/JGRP-780)
      */
     public void testRegularAndOOBUnicasts() throws Exception {
-        DISCARD discard=new DISCARD();
         ProtocolStack stack=a.getProtocolStack();
-        stack.insertProtocol(discard, ProtocolStack.Position.BELOW, Util.getUnicastProtocols());
+        UNICAST3 uni=stack.findProtocol(UNICAST3.class);
+        DISCARD discard=new DISCARD();
+        if(uni != null)
+            stack.insertProtocol(discard, ProtocolStack.Position.BELOW, uni.getClass());
 
         Address dest=b.getAddress();
         Message m1=new BytesMessage(dest, 1);
@@ -71,7 +83,7 @@ public class OOBTest extends ChannelTestBase {
         MyReceiver receiver=new MyReceiver("B");
         b.setReceiver(receiver);
         a.send(m1);
-        discard.dropDownUnicasts(1);
+        discard.dropDownUnicasts(1); // not relevant if UNICAST3 is not present
         a.send(m2);
         a.send(m3);
 
@@ -89,7 +101,8 @@ public class OOBTest extends ChannelTestBase {
     public void testRegularAndOOBUnicasts2() throws Exception {
         DISCARD discard=new DISCARD();
         ProtocolStack stack=a.getProtocolStack();
-        stack.insertProtocol(discard, ProtocolStack.Position.BELOW, Util.getUnicastProtocols());
+        if(stack.findProtocol(UNICAST3.class) != null)
+            stack.insertProtocol(discard, ProtocolStack.Position.BELOW, Util.getUnicastProtocols());
 
         Address dest=b.getAddress();
         Message m1=new BytesMessage(dest, 1);
@@ -120,7 +133,8 @@ public class OOBTest extends ChannelTestBase {
     public void testRegularAndOOBMulticasts() throws Exception {
         DISCARD discard=new DISCARD();
         ProtocolStack stack=a.getProtocolStack();
-        stack.insertProtocol(discard, ProtocolStack.Position.BELOW, NAKACK2.class);
+        if(stack.findProtocol(UNICAST3.class) != null)
+            stack.insertProtocol(discard, ProtocolStack.Position.BELOW, NAKACK2.class, NAKACK4.class);
         a.setDiscardOwnMessages(true);
 
         Address dest=null; // send to all
@@ -151,9 +165,10 @@ public class OOBTest extends ChannelTestBase {
 
     @Test(invocationCount=5)
     public void testRandomRegularAndOOBMulticasts() throws Exception {
-        DISCARD discard=new DISCARD().setLocalAddress(a.getAddress()).setUpDiscardRate(0.5);
+        DISCARD discard=new DISCARD().setAddress(a.getAddress()).setUpDiscardRate(0.5);
         ProtocolStack stack=a.getProtocolStack();
-        stack.insertProtocol(discard, ProtocolStack.Position.ABOVE, TP.class);
+        if(stack.findProtocol(UNICAST3.class) != null)
+            stack.insertProtocol(discard, ProtocolStack.Position.ABOVE, TP.class);
         MyReceiver r1=new MyReceiver("A"), r2=new MyReceiver("B");
         a.setReceiver(r1);
         b.setReceiver(r2);
@@ -174,7 +189,6 @@ public class OOBTest extends ChannelTestBase {
         System.out.println("A: size=" + one.size() + ", B: size=" + two.size());
 
         stack.removeProtocol(DISCARD.class);
-
         System.out.println("A received " + one.size() + " messages (" + NUM_MSGS + " expected)" +
                              "\nB received " + two.size() + " messages (" + NUM_MSGS + " expected)");
 
@@ -183,7 +197,7 @@ public class OOBTest extends ChannelTestBase {
     }
 
     /**
-     * Tests https://jira.jboss.org/jira/browse/JGRP-1079
+     * Tests https://issues.redhat.com/browse/JGRP-1079
      */
     public void testOOBMessageLoss() throws Exception {
         Util.close(b); // we only need 1 channel
@@ -198,7 +212,6 @@ public class OOBTest extends ChannelTestBase {
         if(stable != null)
             stable.gc();
         Collection<Integer> msgs=receiver.getMsgs();
-
         for(int i=0; i < 20; i++) {
             if(msgs.size() == NUM)
                 break;
@@ -214,7 +227,7 @@ public class OOBTest extends ChannelTestBase {
     }
 
     /**
-     * Tests https://jira.jboss.org/jira/browse/JGRP-1079 for unicast messages
+     * Tests https://issues.redhat.com/browse/JGRP-1079 for unicast messages
      */
     public void testOOBUnicastMessageLoss() throws Exception {
         MyReceiver receiver=new MySleepingReceiver("B", 1000);
@@ -275,8 +288,6 @@ public class OOBTest extends ChannelTestBase {
             }
             return;
         }
-
-
         for(int i=0; i < num_msgs; i++) {
             JChannel sender=Util.tossWeightedCoin(0.5) ? a : b;
             boolean oob=Util.tossWeightedCoin(oob_prob);
@@ -344,18 +355,16 @@ public class OOBTest extends ChannelTestBase {
 
 
     private static void setThreadPoolSize(JChannel... channels) {
-        for(JChannel channel: channels) {
-            TP transport=channel.getProtocolStack().getTransport();
-            transport.setThreadPoolMinThreads(4);
-            transport.setThreadPoolMaxThreads(8);
-        }
+        for(JChannel channel: channels)
+            channel.getProtocolStack().getTransport().getThreadPool().setMinThreads(4).setMaxThreads(10);
     }
 
     private static void setStableGossip(JChannel... channels) {
         for(JChannel channel: channels) {
             ProtocolStack stack=channel.getProtocolStack();
             STABLE stable=stack.findProtocol(STABLE.class);
-            stable.setDesiredAverageGossip(2000);
+            if(stable != null)
+                stable.setDesiredAverageGossip(2000);
         }
     }
 
@@ -393,6 +402,7 @@ public class OOBTest extends ChannelTestBase {
 
     private static class MyReceiver implements Receiver {
         private final Collection<Integer> msgs=new ConcurrentLinkedQueue<>();
+        @SuppressWarnings("unused")
         final String name;
 
         public MyReceiver(String name) {this.name=name;}
@@ -401,7 +411,7 @@ public class OOBTest extends ChannelTestBase {
 
         public void receive(Message msg) {
             Integer val=msg.getObject();
-            System.out.println(name + ": <-- " + val);
+            // System.out.println(name + ": <-- " + val);
             msgs.add(val);
         }
     }

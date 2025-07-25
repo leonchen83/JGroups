@@ -2,17 +2,24 @@ package org.jgroups.blocks.cs;
 
 import org.jgroups.Address;
 import org.jgroups.Version;
+import org.jgroups.annotations.GuardedBy;
 import org.jgroups.stack.IpAddress;
+import org.jgroups.util.Bits;
+import org.jgroups.util.ByteArrayDataOutputStream;
 import org.jgroups.util.ThreadFactory;
 import org.jgroups.util.Util;
 
+import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLHandshakeException;
+import javax.net.ssl.SSLSocket;
 import java.io.*;
 import java.net.*;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReentrantLock;
+
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 
 /**
  * Blocking IO (BIO) connection. Starts 1 reader thread for the peer socket and blocks until data is available.
@@ -21,16 +28,16 @@ import java.util.concurrent.locks.ReentrantLock;
  * @since  3.6.5
  */
 public class TcpConnection extends Connection {
-    protected final Socket           sock; // socket to/from peer (result of srv_sock.accept() or new Socket())
-    protected final ReentrantLock    send_lock=new ReentrantLock(); // serialize send()
-    protected DataOutputStream       out;
-    protected DataInputStream        in;
-    protected volatile Receiver      receiver;
-    protected final TcpBaseServer    server;
-    protected final AtomicInteger    writers=new AtomicInteger(0); // to determine the last writer to flush
-    protected boolean                connected;
+    protected final Socket        sock; // socket to/from peer (result of srv_sock.accept() or new Socket())
+    protected OutputStream        out;
+    protected DataInputStream     in;
+    protected volatile Receiver   receiver;
+    protected final AtomicInteger writers=new AtomicInteger(0); // to determine the last writer to flush
+    protected volatile boolean    connected;
+    protected final byte[]        length_buf=new byte[Integer.BYTES]; // used to write the length of the data
+    protected boolean             use_lock_to_send=true; // e.g. a single sender doesn't need to acquire the send_lock
 
-    /** Creates a connection stub and binds it, use {@link #connect(Address)} to connect */
+    /** Creates a connection to a remote peer, use {@link #connect(Address)} to connect */
     public TcpConnection(Address peer_addr, TcpBaseServer server) throws Exception {
         this.server=server;
         if(peer_addr == null)
@@ -39,33 +46,33 @@ public class TcpConnection extends Connection {
         this.sock=server.socketFactory().createSocket("jgroups.tcp.sock");
         setSocketParameters(sock);
         last_access=getTimestamp(); // last time a message was sent or received (ns)
+        if(sock instanceof SSLSocket) // https://issues.redhat.com/browse/JGRP-2748
+            sock.setSoLinger(true, 0);
     }
 
+    /** Called by {@link TcpServer.Acceptor#handleAccept(Socket)} */
     public TcpConnection(Socket s, TcpServer server) throws Exception {
         this.sock=s;
         this.server=server;
         if(s == null)
             throw new IllegalArgumentException("Invalid parameter s=" + s);
         setSocketParameters(s);
-        this.out=new DataOutputStream(createBufferedOutputStream(s.getOutputStream()));
-        this.in=new DataInputStream(createBufferedInputStream(s.getInputStream()));
+        this.out=createDataOutputStream(s.getOutputStream());
+        this.in=createDataInputStream(s.getInputStream());
         this.connected=sock.isConnected();
         this.peer_addr=server.usePeerConnections()? readPeerAddress(s)
           : new IpAddress((InetSocketAddress)s.getRemoteSocketAddress());
         last_access=getTimestamp(); // last time a message was sent or received (ns)
+        if(sock instanceof SSLSocket) // https://issues.redhat.com/browse/JGRP-2748
+            sock.setSoLinger(true, 0);
     }
+
+    public boolean                  useLockToSend() {return use_lock_to_send;}
+    public <T extends Connection> T useLockToSend(boolean u) {this.use_lock_to_send=u; return (T)this;}
 
     public Address localAddress() {
         InetSocketAddress local_addr=sock != null? (InetSocketAddress)sock.getLocalSocketAddress() : null;
         return local_addr != null? new IpAddress(local_addr) : null;
-    }
-
-    public Address peerAddress() {
-        return peer_addr;
-    }
-
-    protected long getTimestamp() {
-        return server.timeService() != null? server.timeService().timestamp() : System.nanoTime();
     }
 
     protected String getSockAddress() {
@@ -77,28 +84,27 @@ public class TcpConnection extends Connection {
         return sb.toString();
     }
 
-    protected void updateLastAccessed() {
-        if(server.connExpireTime() > 0)
-            last_access=getTimestamp();
-    }
-
     public void connect(Address dest) throws Exception {
         connect(dest, server.usePeerConnections());
     }
 
     protected void connect(Address dest, boolean send_local_addr) throws Exception {
-        SocketAddress destAddr=new InetSocketAddress(((IpAddress)dest).getIpAddress(), ((IpAddress)dest).getPort());
+        SocketAddress destAddr=((IpAddress)dest).getSocketAddress();
         try {
             if(!server.defer_client_binding)
                 this.sock.bind(new InetSocketAddress(server.client_bind_addr, server.client_bind_port));
             Util.connect(this.sock, destAddr, server.sock_conn_timeout);
             if(this.sock.getLocalSocketAddress() != null && this.sock.getLocalSocketAddress().equals(destAddr))
                 throw new IllegalStateException("socket's bind and connect address are the same: " + destAddr);
-            this.out=new DataOutputStream(createBufferedOutputStream(sock.getOutputStream()));
-            this.in=new DataInputStream(createBufferedInputStream(sock.getInputStream()));
-            connected=sock.isConnected();
+            if(sock instanceof SSLSocket)
+                ((SSLSocket) sock).startHandshake();
+            this.out=createDataOutputStream(sock.getOutputStream());
+            this.in=createDataInputStream(sock.getInputStream());
             if(send_local_addr)
                 sendLocalAddress(server.localAddress());
+            // needs to be at the end or else isConnected() will return this connection and threads can start sending
+            // even though we haven't yet sent the local address and waited for the ack (if use_acks==true)
+            connected=sock.isConnected();
         }
         catch(Exception t) {
             Util.close(this.sock);
@@ -107,38 +113,35 @@ public class TcpConnection extends Connection {
         }
     }
 
-
     public void start() {
         if(receiver != null)
             receiver.stop();
         receiver=new Receiver(server.factory).start();
     }
 
-
-
-    /**
-     *
-     * @param data Guaranteed to be non null
-     * @param offset
-     * @param length
-     */
     public void send(byte[] data, int offset, int length) throws Exception {
         if(out == null)
             return;
+        if(!use_lock_to_send) {
+            locklessSend(data, offset, length);
+            return;
+        }
         writers.incrementAndGet();
         send_lock.lock();
         try {
-            doSend(data, offset, length);
-            updateLastAccessed();
-        }
-        catch(InterruptedException iex) {
-            Thread.currentThread().interrupt(); // set interrupt flag again
+            doSend(data, offset, length, false);
         }
         finally {
+            send_lock.unlock();
             if(writers.decrementAndGet() == 0) // only the last active writer thread calls flush()
                 flush(); // won't throw an exception
-            send_lock.unlock();
         }
+    }
+
+    public void locklessSend(byte[] data, int offset, int length) throws Exception {
+        if(out == null)
+            return;
+        doSend(data, offset, length, true);
     }
 
     public void send(ByteBuffer buf) throws Exception {
@@ -155,13 +158,16 @@ public class TcpConnection extends Connection {
         }
     }
 
-
-    protected void doSend(byte[] data, int offset, int length) throws Exception {
-        out.writeInt(length); // write the length of the data buffer first
-        out.write(data,offset,length);
+    @GuardedBy("send_lock")
+    protected void doSend(byte[] data, int offset, int length, boolean flush) throws Exception {
+        Bits.writeInt(length, length_buf, 0); // write the length of the data buffer first
+        out.write(length_buf, 0, length_buf.length);
+        out.write(data, offset, length);
+        if(flush)
+            out.flush();
     }
 
-    protected void flush() {
+    public void flush() {
         try {
             out.flush();
         }
@@ -169,14 +175,14 @@ public class TcpConnection extends Connection {
         }
     }
 
-    protected BufferedOutputStream createBufferedOutputStream(OutputStream out) {
-        int size=(server instanceof TcpServer)? ((TcpServer)server).getBufferedOutputStreamSize() : 0;
-        return size == 0? new BufferedOutputStream(out) : new BufferedOutputStream(out, size);
+    protected OutputStream createDataOutputStream(OutputStream out) {
+        int size=((TcpBaseServer)server).getBufferedOutputStreamSize();
+        return size == 0? out : new BufferedOutputStream(out, size);
     }
 
-    protected BufferedInputStream createBufferedInputStream(InputStream in) {
-        int size=(server instanceof TcpServer)? ((TcpServer)server).getBufferedInputStreamSize() : 0;
-        return size == 0? new BufferedInputStream(in) : new BufferedInputStream(in, size);
+    protected DataInputStream createDataInputStream(InputStream in) {
+        int size=((TcpBaseServer)server).getBufferedInputStreamSize();
+        return size == 0? new DataInputStream(in) : new DataInputStream(new BufferedInputStream(in, size));
     }
 
     protected void setSocketParameters(Socket client_sock) throws SocketException {
@@ -197,34 +203,25 @@ public class TcpConnection extends Connection {
 
         client_sock.setKeepAlive(true);
         client_sock.setTcpNoDelay(server.tcp_nodelay);
-        try { // todo: remove try-catch clause one https://github.com/oracle/graal/issues/1087 has been fixed
-            if(server.linger > 0)
-                client_sock.setSoLinger(true, server.linger);
-            else
-                client_sock.setSoLinger(false, -1);
-        }
-        catch(Throwable t) {
-            server.log().warn("%s: failed setting SO_LINGER option: %s", server.localAddress(), t);
-        }
+        if(server.linger > 0)
+            client_sock.setSoLinger(true, server.linger);
     }
 
 
     /**
-     * Send the cookie first, then the our port number. If the cookie
-     * doesn't match the receiver's cookie, the receiver will reject the
-     * connection and close it.
+     * Send the cookie first, then our port number. If the cookie doesn't match the receiver's cookie,
+     * the receiver will reject the connection and close it.
      */
     protected void sendLocalAddress(Address local_addr) throws Exception {
         try {
-            // write the cookie
-            out.write(cookie, 0, cookie.length);
-
-            // write the version
-            out.writeShort(Version.version);
-            out.writeShort(local_addr.serializedSize()); // address size
-            local_addr.writeTo(out);
+            int addr_size=local_addr.serializedSize();
+            ByteArrayDataOutputStream os=new ByteArrayDataOutputStream(addr_size + Short.BYTES*2 + cookie.length);
+            os.write(cookie, 0, cookie.length);
+            os.writeShort(Version.version);
+            os.writeShort(addr_size); // address size
+            local_addr.writeTo(os);
+            out.write(os.buffer(), 0, os.position());
             out.flush(); // needed ?
-            updateLastAccessed();
         }
         catch(Exception ex) {
             server.socket_factory.close(this.sock);
@@ -239,7 +236,7 @@ public class TcpConnection extends Connection {
      */
     protected Address readPeerAddress(Socket client_sock) throws Exception {
         int timeout=client_sock.getSoTimeout();
-        client_sock.setSoTimeout(server.peerAddressReadTimeout());
+        client_sock.setSoTimeout(((TcpBaseServer)server).peerAddressReadTimeout());
 
         try {
             // read the cookie first
@@ -292,7 +289,6 @@ public class TcpConnection extends Connection {
 
         public boolean isRunning()  {return receiving;}
         public boolean canRun()     {return isRunning() && isConnected();}
-        public int     bufferSize() {return buffer != null? buffer.length : 0;}
 
         public void run() {
             try {
@@ -306,7 +302,19 @@ public class TcpConnection extends Connection {
                 ; // regular use case when a peer closes its connection - we don't want to log this as exception
             }
             catch(Exception e) {
-                server.log.warn("failed handling message from %s: %s", peer_addr, e);
+                //noinspection StatementWithEmptyBody
+                if (e instanceof SSLException && e.getMessage().contains("Socket closed")) {
+                    ; // regular use case when a peer closes its connection - we don't want to log this as exception
+                }
+                else if (e instanceof SSLHandshakeException && e.getCause() instanceof EOFException) {
+                    ; // Ignore SSL handshakes closed early (usually liveness probes)
+                }
+                else {
+                    if(server.logDetails())
+                        server.log.warn("failed handling message", e);
+                    else
+                        server.log.warn("failed handling message: " + e);
+                }
             }
             finally {
                 server.notifyConnectionClosed(TcpConnection.this);
@@ -320,51 +328,41 @@ public class TcpConnection extends Connection {
         if(tmp_sock == null)
             return "<null socket>";
         InetAddress local=tmp_sock.getLocalAddress(), remote=tmp_sock.getInetAddress();
-        String local_str=local != null? Util.shortName(local) : "<null>";
-        String remote_str=remote != null? Util.shortName(remote) : "<null>";
-        return String.format("%s:%s --> %s:%s (%d secs old) [%s] [recv_buf=%d]",
-                             local_str, tmp_sock.getLocalPort(), remote_str, tmp_sock.getPort(),
-                             TimeUnit.SECONDS.convert(getTimestamp() - last_access, TimeUnit.NANOSECONDS),
-                             status(), receiver != null? receiver.bufferSize() : 0);
+        String l=local != null? Util.shortName(local) : "<null>";
+        String r=remote != null? Util.shortName(remote) : "<null>";
+        return String.format("%s:%s --> %s:%s (%d secs old) [%s]%s", l, tmp_sock.getLocalPort(), r, tmp_sock.getPort(),
+                             SECONDS.convert(getTimestamp() - last_access, NANOSECONDS), status(),
+                             use_lock_to_send? "" : " [lockless]");
     }
 
     @Override
     public String status() {
-        if(sock == null)    return "n/a";
-        if(isConnected())   return "connected";
-        if(isOpen())        return "open";
-        return                     "closed";
+        if(sock == null)  return "n/a";
+        if(isClosed())    return "closed";
+        if(isConnected()) return "connected";
+        return                   "open";
     }
 
-    public boolean isExpired(long now) {
-        return server.conn_expire_time > 0 && now - last_access >= server.conn_expire_time;
-    }
-
-    public boolean isConnected() {
+    @Override public boolean isConnected() {
         return connected;
     }
 
-    public boolean isConnectionPending() {
+    @Override public boolean isConnectionPending() {
         return false;
     }
 
-    public boolean isOpen() {
-        return sock != null && !sock.isClosed();
+    @Override public boolean isClosed() {
+        return sock == null || sock.isClosed();
     }
 
-    public void close() throws IOException {
-        Util.close(sock); // fix for https://issues.jboss.org/browse/JGRP-2350
-        send_lock.lock();
-        try {
-            if(receiver != null) {
-                receiver.stop();
-                receiver=null;
-            }
-            Util.close(out,in);
+    @Override public void close() throws IOException {
+        Util.close(sock); // fix for https://issues.redhat.com/browse/JGRP-2350
+        Receiver r=receiver;
+        if(r != null) {
+            r.stop();
+            receiver=null;
         }
-        finally {
-            connected=false;
-            send_lock.unlock();
-        }
+        Util.close(out,in);
+        connected=false;
     }
 }

@@ -8,6 +8,7 @@ import org.jgroups.protocols.UNICAST3;
 import org.jgroups.protocols.pbcast.GMS;
 import org.jgroups.protocols.pbcast.NAKACK2;
 import org.jgroups.protocols.pbcast.STABLE;
+import org.jgroups.util.ResourceManager;
 import org.jgroups.util.Util;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
@@ -21,18 +22,19 @@ import java.util.List;
  * @author Bela Ban
  * @since  3.6.7
  */
-@Test(groups=Global.FUNCTIONAL,singleThreaded=true)
+@Test(groups=Global.TIME_SENSITIVE,singleThreaded=true)
 public class NioServerTest2 {
     protected static final int     NUM_MSGS=10000;
     protected static final int     MSG_SIZE=1000;
-    protected static final int     recv_buf_size=50000, send_buf_size=10000;
+    protected static final int     recv_buf_size=100000, send_buf_size=50000;
     protected JChannel             a, b;
     protected MyReceiver           ra, rb;
 
     @BeforeMethod protected void init() throws Exception {
-        a=create("A");
+        String mcast_addr=ResourceManager.getNextMulticastAddress();
+        a=create("A", mcast_addr);
         a.setReceiver(ra=new MyReceiver());
-        b=create("B");
+        b=create("B", mcast_addr);
         b.setReceiver(rb=new MyReceiver());
         a.connect("NioServerTest2");
         b.connect("NioServerTest2");
@@ -47,7 +49,7 @@ public class NioServerTest2 {
             a.send(msg);
         }
 
-        for(int i=0; i < 20; i++) {
+        for(int i=0; i < 100; i++) {
             if(ra.total() >= NUM_MSGS && rb.total() >= NUM_MSGS)
                 break;
             System.out.printf("A.good=%d | bad=%d, B.good=%d | bad=%d\n", ra.good(), ra.bad(), rb.good(), rb.bad());
@@ -76,10 +78,10 @@ public class NioServerTest2 {
     }
 
 
-    protected static JChannel create(String name) throws Exception {
+    protected static JChannel create(String name, String mcast_addr) throws Exception {
         return new JChannel(
           new TCP_NIO2().setRecvBufSize(recv_buf_size).setSendBufSize(send_buf_size).setBindAddress(Util.getLoopback()),
-          new MPING(),
+          new MPING().setMulticastAddress(mcast_addr),
           new NAKACK2().useMcastXmit(false),
           new UNICAST3(),
           new STABLE(),

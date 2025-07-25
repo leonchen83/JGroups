@@ -11,7 +11,10 @@ import org.jgroups.stack.StateTransferInfo;
 import org.jgroups.util.*;
 
 import java.io.*;
-import java.util.*;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Stream;
@@ -42,12 +45,13 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
     protected Receiver                              receiver;
     protected RequestHandler                        req_handler;
     protected boolean                               async_dispatching;
+    /** When enabled, responses are handled by the common ForkJoinPool (https://issues.redhat.com/browse/JGRP-2644) */
+    protected boolean                               async_rsp_handling=!Util.virtualThreadsAvailable();
     protected boolean                               wrap_exceptions;
     protected ProtocolAdapter                       prot_adapter;
     protected volatile Collection<Address>          members=new HashSet<>();
     protected Address                               local_addr;
     protected final Log                             log=LogFactory.getLog(MessageDispatcher.class);
-    protected final RpcStats                        rpc_stats=new RpcStats(false);
     @SuppressWarnings("rawtypes")
     protected static final RspList                  empty_rsplist;
     @SuppressWarnings("rawtypes")
@@ -70,6 +74,9 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
             channel.addChannelListener(this);
             local_addr=channel.getAddress();
             installUpHandler(prot_adapter, true);
+            Protocol top_prot=channel.stack() != null? channel.stack().getTopProtocol() : null;
+            if(top_prot != null)
+                prot_adapter.setDownProt(top_prot);
         }
         start();
     }
@@ -86,16 +93,15 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
     public RequestCorrelator correlator()                 {return corr;}
     public boolean           getAsyncDispatching()        {return async_dispatching;}
     public boolean           asyncDispatching()           {return async_dispatching;}
+    public boolean           asyncRspHandling()           {return async_rsp_handling;}
+    public MessageDispatcher asyncRspHandling(boolean f)  {async_rsp_handling=f;
+                                                           if(corr != null) corr.asyncRspHandling(async_rsp_handling);
+                                                           return this;}
     public boolean           getWrapExceptions()          {return wrap_exceptions;}
     public boolean           wrapExceptions()             {return wrap_exceptions;}
     public UpHandler         getProtocolAdapter()         {return prot_adapter;}
     public UpHandler         protocolAdapter()            {return prot_adapter;}
-    public RpcStats          getRpcStats()                {return rpc_stats;}
-    public RpcStats          rpcStats()                   {return rpc_stats;}
-    public boolean           getExtendedStats()           {return rpc_stats.extendedStats();}
-    public boolean           extendedStats()              {return rpc_stats.extendedStats();}
-    public <X extends MessageDispatcher> X setExtendedStats(boolean fl) {return extendedStats(fl);}
-    public <X extends MessageDispatcher> X extendedStats(boolean fl)    {rpc_stats.extendedStats(fl); return (X)this;}
+    public RpcStats          rpcStats()                   {return corr.rpc_stats;}
 
     public <X extends MessageDispatcher> X setChannel(JChannel ch) {
         if(ch == null)
@@ -117,7 +123,8 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
             return (X)this;
         stop();
         this.corr=c;
-        corr.asyncDispatching(this.async_dispatching).wrapExceptions(this.wrap_exceptions);
+        corr.asyncDispatching(this.async_dispatching).asyncRspHandling(async_rsp_handling)
+          .wrapExceptions(this.wrap_exceptions);
         start();
         return (X)this;
     }
@@ -129,6 +136,8 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
 
     public <X extends MessageDispatcher> X setRequestHandler(RequestHandler rh) {
         req_handler=rh;
+        if(corr != null)
+            corr.setRequestHandler(rh);
         return (X)this;
     }
 
@@ -158,7 +167,8 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
     public <X extends MessageDispatcher> X start() {
         if(corr == null)
             corr=createRequestCorrelator(prot_adapter, this, local_addr)
-              .asyncDispatching(async_dispatching).wrapExceptions(this.wrap_exceptions);
+              .asyncDispatching(async_dispatching).asyncRspHandling(async_rsp_handling)
+              .wrapExceptions(this.wrap_exceptions);
         corr.start();
 
         if(channel != null) {
@@ -252,11 +262,12 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
 
         List<Address> real_dests;
         // we need to clone because we don't want to modify the original
-        if(dests != null)
-            real_dests=dests.stream().filter(dest -> dest instanceof SiteAddress || this.members.contains(dest))
-              .collect(ArrayList::new, (list,dest) -> {if(!list.contains(dest)) list.add(dest);}, (l,r) -> {});
+        if(dests != null) {
+            real_dests=new FastArray<>(dests);
+            real_dests.removeIf(addr -> !this.members.contains(addr) && !(addr instanceof SiteAddress));
+        }
         else
-            real_dests=new ArrayList<>(members);
+            real_dests=new FastArray<>(members);
 
         // Remove the local member from the target destination set if we should not deliver our own message
         JChannel tmp=channel;
@@ -274,29 +285,14 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
             return empty_group_request;
         }
 
-        boolean sync=options.mode() != ResponseMode.GET_NONE;
-        boolean non_blocking=!sync || !block_for_results, anycast=options.anycasting();
-        if(non_blocking)
-            updateStats(real_dests, anycast, sync, 0);
-
-        if(!sync) {
-            corr.sendRequest(real_dests, msg, null, options);
+        if(options.mode() == ResponseMode.GET_NONE) {
+            corr.sendMulticastRequest(real_dests, msg, null, options);
             return null;
         }
 
         GroupRequest<T> req=new GroupRequest<>(corr, real_dests, options);
-        long start=non_blocking || !rpc_stats.extendedStats()? 0 : System.nanoTime();
         req.execute(msg, block_for_results);
-        long time=non_blocking || !rpc_stats.extendedStats()? 0 : System.nanoTime() - start;
-        if(!non_blocking)
-            updateStats(real_dests, anycast, true, time);
         return req;
-    }
-
-
-
-    public void done(long req_id) {
-        corr.done(req_id);
     }
 
 
@@ -310,32 +306,8 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
      * @throws TimeoutException If the call didn't succeed within the timeout defined in options (if set)
      */
     public <T> T sendMessage(Message msg, RequestOptions opts) throws Exception {
-        Address dest=msg.getDest();
-        if(dest == null)
-            throw new IllegalArgumentException("message destination is null, cannot send message");
-
-        if(opts == null) {
-            log.warn("request options were null, using default of sync");
-            opts=RequestOptions.SYNC();
-        }
-
-        // invoke an async RPC directly and return null, without creating a UnicastRequest instance
-        if(opts.mode() == ResponseMode.GET_NONE) {
-            rpc_stats.add(RpcStats.Type.UNICAST, dest, false, 0);
-            corr.sendUnicastRequest(msg, null, opts);
-            return null;
-        }
-
-        // now it must be a sync RPC
-        UnicastRequest<T> req=new UnicastRequest<>(corr, dest, opts);
-        long start=!rpc_stats.extendedStats()? 0 : System.nanoTime();
-        try {
-            return req.execute(msg, true);
-        }
-        finally {
-            long time=!rpc_stats.extendedStats()? 0 : System.nanoTime() - start;
-            rpc_stats.add(RpcStats.Type.UNICAST, dest, true, time);
-        }
+        UnicastRequest<T> req=_sendMessage(msg, opts);
+        return req != null? req.execute(msg, true) : null;
     }
 
 
@@ -348,24 +320,9 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
      *                   it at the sender. {@link java.util.concurrent.Future#get()} will throw this exception
      */
     public <T> CompletableFuture<T> sendMessageWithFuture(Message msg, RequestOptions opts) throws Exception {
-        Address dest=msg.getDest();
-        if(dest == null)
-            throw new IllegalArgumentException("message destination is null, cannot send message");
-
-        if(opts == null) {
-            log.warn("request options were null, using default of sync");
-            opts=RequestOptions.SYNC();
-        }
-        rpc_stats.add(RpcStats.Type.UNICAST, dest, opts.mode() != ResponseMode.GET_NONE, 0);
-
-        if(opts.mode() == ResponseMode.GET_NONE) {
-            corr.sendUnicastRequest(msg, null, opts);
-            return null;
-        }
-
-        // if we get here, the RPC is synchronous
-        UnicastRequest<T> req=new UnicastRequest<>(corr, dest, opts);
-        req.execute(msg, false);
+        UnicastRequest<T> req=_sendMessage(msg, opts);
+        if(req != null)
+            req.execute(msg, false);
         return req;
     }
 
@@ -399,14 +356,24 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
 
 
 
+    protected <T> UnicastRequest<T> _sendMessage(Message msg, RequestOptions opts) throws Exception {
+        Address dest=msg.getDest();
+        if(dest == null)
+            throw new IllegalArgumentException("message destination is null, cannot send message");
 
+        if(opts == null) {
+            log.warn("request options were null, using default of sync");
+            opts=RequestOptions.SYNC();
+        }
 
-    protected void updateStats(Collection<Address> dests, boolean anycast, boolean sync, long time) {
-        if(anycast)
-            rpc_stats.addAnycast(sync, time, dests);
-        else
-            rpc_stats.add(RpcStats.Type.MULTICAST, null, sync, time);
+        // invoke an async RPC directly and return null, without creating a UnicastRequest instance
+        if(opts.mode() == ResponseMode.GET_NONE) {
+            corr.sendUnicastRequest(msg, null, opts);
+            return null;
+        }
+        return new UnicastRequest<>(corr, dest, opts);
     }
+
 
     protected Object handleUpEvent(Event evt) throws Exception {
         switch(evt.getType()) {
@@ -446,20 +413,6 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
                 if(receiver != null)
                     receiver.viewAccepted(v);
                 break;
-
-            case Event.SET_LOCAL_ADDRESS:
-                log.trace("setting local_addr (%s) to %s", local_addr, evt.getArg());
-                local_addr=evt.getArg();
-                break;
-
-            case Event.BLOCK:
-                if(receiver != null)
-                    receiver.block();
-                break;
-            case Event.UNBLOCK:
-                if(receiver != null)
-                    receiver.unblock();
-                break;
         }
         return null;
     }
@@ -497,7 +450,7 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
     }
 
 
-    class ProtocolAdapter extends Protocol implements UpHandler {
+    protected class ProtocolAdapter extends Protocol implements UpHandler {
 
 
         /* ------------------------- Protocol Interface --------------------------- */
@@ -507,6 +460,23 @@ public class MessageDispatcher implements RequestHandler, Closeable, ChannelList
             return "MessageDispatcher";
         }
 
+        public <T extends Protocol> T setDownProt(Protocol d) {
+            down_prot=d;
+            return (T)this;
+        }
+
+        public <T extends Protocol> T setAddress(Address addr) {
+            local_addr=addr;
+            MessageDispatcher.this.local_addr=addr;
+            if(corr != null)
+                corr.setLocalAddress(addr);
+            return (T)this;
+        }
+
+        public UpHandler setLocalAddress(Address a) {
+            setAddress(a);
+            return this;
+        }
 
         /**
          * Called by channel (we registered before) when event is received. This is the UpHandler interface.

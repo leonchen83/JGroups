@@ -14,61 +14,50 @@ import java.util.stream.StreamSupport;
  * @since  3.3
  */
 public class MessageBatch implements Iterable<Message> {
+    public enum Mode {OOB, REG}
 
     /** The destination address. Null if this is a multicast message batch, non-null if the batch is sent to a specific member */
-    protected Address          dest;
+    protected Address            dest;
 
     /** The sender of the message batch */
-    protected Address          sender;
+    protected Address            sender;
 
     /** The name of the cluster in which the message batch is sent, this is equivalent to TpHeader.cluster_name */
-    protected AsciiString      cluster_name;
+    protected AsciiString        cluster_name;
 
     /** The storage of the messages; removed messages have a null element */
-    protected Message[]        messages;
-
-    /** Index of the next message to be inserted */
-    protected int              index;
+    protected FastArray<Message> messages;
 
     /** Whether all messages have dest == null (multicast) or not */
-    protected boolean          multicast;
+    protected boolean            multicast;
 
     /** Whether this message batch contains only OOB messages, or only regular messages */
-    protected Mode             mode=Mode.REG;
+    protected Mode               mode;
 
-    protected static final int INCR=5; // number of elements to add when resizing
-    protected static final     ToIntBiFunction<Message,MessageBatch>  length_visitor=(msg, batch) -> msg != null? msg.getLength() : 0;
-    protected static final     ToLongBiFunction<Message,MessageBatch> total_size_visitor=(msg, batch) -> msg != null? msg.size() : 0;
+    /** For benchmarking; may get removed without notice */
+    protected long               timestamp; // ns
 
+
+    public MessageBatch() {}
 
     public MessageBatch(int capacity) {
-        this.messages=new Message[capacity];
+        this.messages=new FastArray<>(capacity);
     }
 
     public MessageBatch(Collection<Message> msgs) {
-        messages=new Message[msgs.size()];
-        for(Message msg: msgs)
-            messages[index++]=msg;
-        mode=determineMode();
+        messages=new FastArray<>(msgs.size());
+        messages.addAll(msgs); // todo: check that no resize occurs!
+        determineMode();
     }
 
     public MessageBatch(Address dest, Address sender, AsciiString cluster_name, boolean multicast, Collection<Message> msgs) {
-        this(dest, sender, cluster_name, multicast, msgs, null);
-    }
-
-    public MessageBatch(Address dest, Address sender, AsciiString cluster_name, boolean multicast,
-                        Collection<Message> msgs, Predicate<Message> filter) {
-        messages=new Message[msgs.size()];
-        for(Message msg: msgs) {
-            if(filter != null && !filter.test(msg))
-                continue;
-            messages[index++]=msg;
-        }
+        messages=new FastArray<>(msgs.size());
+        messages.addAll(msgs);
         this.dest=dest;
         this.sender=sender;
         this.cluster_name=cluster_name;
         this.multicast=multicast;
-        this.mode=determineMode();
+        determineMode();
     }
 
     public MessageBatch(Address dest, Address sender, AsciiString cluster_name, boolean multicast, Mode mode, int capacity) {
@@ -92,61 +81,69 @@ public class MessageBatch implements Iterable<Message> {
     public AsciiString  clusterName()                    {return cluster_name;}
     public MessageBatch setClusterName(AsciiString name) {this.cluster_name=name; return this;}
     public MessageBatch clusterName(AsciiString name)    {this.cluster_name=name; return this;}
+    public MessageBatch cluster(AsciiString name)        {this.cluster_name=name; return this;}
     public boolean      isMulticast()                    {return multicast;}
     public boolean      multicast()                      {return multicast;}
     public MessageBatch multicast(boolean flag)          {multicast=flag; return this;}
-    public Mode         getMode()                        {return mode;}
+    public MessageBatch mcast(boolean flag)              {multicast=flag; return this;}
+    public Mode         getMode()                        {return mode();}
     public Mode         mode()                           {return mode;}
-    public MessageBatch setMode(Mode mode)               {this.mode=mode; return this;}
-    public MessageBatch mode(Mode mode)                  {this.mode=mode; return this;}
-    public int          getCapacity()                    {return messages.length;}
-    public int          capacity()                       {return messages.length;}
-    public int          index()                          {return index;}
+    public MessageBatch setMode(Mode m)                  {return mode(m);}
+    public MessageBatch mode(Mode m)                     {if(mode == null) mode=m; return this;}
+    public int          capacity()                       {return messages.capacity();}
+    public long         timestamp()                      {return timestamp;}
+    public MessageBatch timestamp(long ts)               {timestamp=ts; return this;}
+    public MessageBatch increment(int i)                 {messages.increment(i); return this;}
+    public MessageBatch incr(int i)                      {return increment(i);}
 
 
     /** Returns the underlying message array. This is only intended for testing ! */
-    public Message[]    array() {
+    public FastArray<Message> array() {
         return messages;
     }
 
     public <T extends Message> T first() {
-        for(int i=0; i < index; i++)
-            if(messages[i] != null)
-                return (T)messages[i];
-        return null;
+        Iterator<Message> it=iterator();
+        return it.hasNext()? (T)it.next() : null;
     }
 
+    // not very efficient, but this is only used inside a trace log statement
     public <T extends Message> T last() {
-        for(int i=index -1; i >= 0; i--)
-            if(messages[i] != null)
-                return (T)messages[i];
-        return null;
+        Iterator<Message> it=iterator();
+        Message last=null;
+        while(it.hasNext())
+            last=it.next();
+        return (T)last;
     }
 
     public MessageBatch add(final Message msg) {
-        add(msg, true);
+        add(msg, true, true);
         return this;
     }
 
     /** Adds a message to the table
      * @param msg the message
-     * @param resize whether or not to resize the table. If true, the method will always return 1
-     * @return always 1 if resize==true, else 1 if the message was added or 0 if not
+     * @param resize whether or not to resize the table
+     * @return always true if resize==true, else true if the message was added or false if not
      */
-    public int add(final Message msg, boolean resize) {
-        if(msg == null) return 0;
-        if(index >= messages.length) {
-            if(!resize)
-                return 0;
-            resize();
-        }
-        messages[index++]=msg;
-        return 1;
+    public MessageBatch add(final Message msg, boolean resize) {
+        return add(msg, resize, true);
+    }
+
+    /** Adds a message to the table
+     * @param msg the message
+     * @param resize whether or not to resize the table
+     * @return always true if resize==true, else true if the message was added or false if not
+     */
+    public MessageBatch add(final Message msg, boolean resize, boolean determine_mode) {
+        boolean added=messages.add(msg, resize);
+        if(added && determine_mode)
+            determineMode();
+        return this;
     }
 
     public MessageBatch add(final MessageBatch batch) {
-        add(batch, true);
-        return this;
+        return add(batch, true);
     }
 
     /**
@@ -154,77 +151,48 @@ public class MessageBatch implements Iterable<Message> {
      * @param batch the batch to add to this batch
      * @param resize when true, this batch will be resized to accommodate the other batch
      * @return the number of messages from the other batch that were added successfully. Will always be batch.size()
-     * unless resize==0: in this case, the number of messages that were added successfully is returned
+     * unless resize is false: in this case, the number of messages that were added successfully is returned
      */
-    public int add(final MessageBatch batch, boolean resize) {
-        if(batch == null) return 0;
+    public MessageBatch add(final MessageBatch batch, boolean resize) {
+        if(batch == null) return this;
         if(this == batch)
             throw new IllegalArgumentException("cannot add batch to itself");
-        int batch_size=batch.size();
-        if(index+batch_size >= messages.length && resize)
-            resize(messages.length + batch_size + 1);
-
-        int cnt=0;
-        for(Message msg: batch) {
-            if(index >= messages.length)
-                return cnt;
-            messages[index++]=msg;
-            cnt++;
-        }
-        return cnt;
-    }
-
-    /**
-     * Replaces a message in the batch with another one
-     * @param existing_msg The message to be replaced. The message has to be non-null and is found by identity (==)
-     *                     comparison
-     * @param new_msg The message to replace the existing message with, can be null
-     * @return
-     */
-    public MessageBatch replace(Message existing_msg, Message new_msg) {
-        if(existing_msg == null)
-            return this;
-        for(int i=0; i < index; i++) {
-            if(messages[i] != null && messages[i] == existing_msg) {
-                messages[i]=new_msg;
-                break;
-            }
-        }
+        boolean added=messages.addAll(batch.array(), resize);
+        if(added)
+            determineMode();
         return this;
     }
 
     /**
-     * Replaces all messages which match a given filter with a replacement message
-     * @param filter the filter. If null, no changes take place. Note that filter needs to be able to handle null msgs
-     * @param replacement the replacement message. Can be null, which essentially removes all messages matching filter
-     * @param match_all whether to replace the first or all matches
-     * @return the MessageBatch
+     * Adds message to this batch from a message array
+     * @param msgs  the message array
+     * @param num_msgs the number of messages to add, should be <= msgs.length
      */
-    public MessageBatch replace(Predicate<Message> filter, Message replacement, boolean match_all) {
-        replaceIf(filter, replacement, match_all);
+    public MessageBatch add(Message[] msgs, int num_msgs) {
+        boolean added=messages.addAll(msgs, num_msgs);
+        if(added)
+            determineMode();
         return this;
     }
 
-    /**
-     * Replaces all messages that match a given filter with a replacement message
-     * @param filter the filter. If null, no changes take place. Note that filter needs to be able to handle null msgs
-     * @param replacement the replacement message. Can be null, which essentially removes all messages matching filter
-     * @param match_all whether to replace the first or all matches
-     * @return the number of matched messages
-     */
-    public int replaceIf(Predicate<Message> filter, Message replacement, boolean match_all) {
-        if(filter == null)
-            return 0;
-        int matched=0;
-        for(int i=0; i < index; i++) {
-            if(filter.test(messages[i])) {
-                messages[i]=replacement;
-                matched++;
-                if(!match_all)
-                    break;
-            }
-        }
-        return matched;
+    public MessageBatch add(Collection<Message> msgs) {
+        boolean added=messages.addAll(msgs);
+        if(added)
+            determineMode();
+        return this;
+    }
+
+    public MessageBatch set(Address dest, Address sender, Message[] msgs) {
+        this.messages.set(msgs);
+        this.dest=dest;
+        this.sender=sender;
+        determineMode();
+        return this;
+    }
+
+    public MessageBatch removeIf(Predicate<Message> filter, boolean match_all) {
+        messages.removeIf(filter, match_all);
+        return this;
     }
 
     /**
@@ -236,176 +204,98 @@ public class MessageBatch implements Iterable<Message> {
     public int transferFrom(MessageBatch other, boolean clear) {
         if(other == null || this == other)
             return 0;
-        int capacity=messages.length, other_size=other.size();
-        if(other_size == 0)
-            return 0;
-        if(capacity < other_size)
-            messages=new Message[other_size];
-        System.arraycopy(other.messages, 0, this.messages, 0, other_size);
-        if(this.index > other_size)
-            for(int i=other_size; i < this.index; i++)
-                messages[i]=null;
-        this.index=other_size;
-        if(clear)
-            other.clear();
-        return other_size;
-    }
-
-    /**
-     * Removes the current message (found by indentity (==)) by nulling it in the message array
-     * @param msg
-     * @return
-     */
-    public MessageBatch remove(Message msg) {
-        return replace(msg, null);
-    }
-
-    /**
-     * Removes all messages which match filter
-     * @param filter the filter. If null, no removal takes place
-     * @return the MessageBatch
-     */
-    public MessageBatch remove(Predicate<Message> filter) {
-        return replace(filter, null, true);
+        int num=messages.transferFrom(other.messages, clear);
+        if(num > 0)
+            determineMode();
+        return num;
     }
 
     public MessageBatch clear() {
-        for(int i=0; i < index; i++)
-            messages[i]=null;
-        index=0;
+        messages.clear(true);
         return this;
     }
 
     public MessageBatch reset() {
-        index=0;
+        messages.clear(false);
         return this;
     }
 
-    /** Removes and returns all messages which have a header with ID == id */
-    public Collection<Message> getMatchingMessages(final short id, boolean remove) {
-        return map((msg, batch) -> {
-            if(msg != null && msg.getHeader(id) != null) {
-                if(remove)
-                    batch.remove(msg);
-                return msg;
-            }
-            return null;
-        });
+    public boolean anyMatch(Predicate<Message> pred) {
+        return messages.anyMatch(pred);
     }
 
-
-    /** Applies a function to all messages and returns a list of the function results */
-    public <T> Collection<T> map(BiFunction<Message,MessageBatch,T> visitor) {
-        Collection<T> retval=null;
-        for(int i=0; i < index; i++) {
-            try {
-                T result=visitor.apply(messages[i], this);
-                if(result != null) {
-                    if(retval == null)
-                        retval=new ArrayList<>();
-                    retval.add(result);
-                }
-            }
-            catch(Throwable t) {
-            }
-        }
-        return retval;
+    public MessageBatch determineMode() {
+        if(mode != null || messages.isEmpty())
+            return this;
+        Message first=messages.get(0);
+        return mode(first.isFlagSet(Message.Flag.OOB)? Mode.OOB : Mode.REG);
     }
-
-    public void forEach(BiConsumer<Message,MessageBatch> consumer) {
-        for(int i=0; i < index; i++) {
-            try {
-                consumer.accept(messages[i], this);
-            }
-            catch(Throwable t) {
-            }
-        }
-    }
-
 
     /** Returns the number of non-null messages */
     public int size() {
-        int retval=0;
-        for(int i=0; i < index; i++)
-            if(messages[i] != null)
-                retval++;
-        return retval;
+        return messages.size();
     }
 
     public boolean isEmpty() {
-        for(int i=0; i < index; i++)
-            if(messages[i] != null)
-                return false;
-        return true;
+        return messages.isEmpty();
     }
-
-    public Mode determineMode() {
-        int num_oob=0, num_reg=0, num_internal=0;
-        for(int i=0; i < index; i++) {
-            if(messages[i] == null)
-                continue;
-            if(messages[i].isFlagSet(Message.Flag.OOB))
-                num_oob++;
-            else if(messages[i].isFlagSet(Message.Flag.INTERNAL))
-                num_internal++;
-            else
-                num_reg++;
-        }
-        if(num_internal > 0 && num_oob == 0 && num_reg == 0)
-            return Mode.INTERNAL;
-        if(num_oob > 0 && num_internal == 0 && num_reg == 0)
-            return Mode.OOB;
-        if(num_reg > 0 && num_oob == 0 && num_internal == 0)
-            return Mode.REG;
-        return Mode.MIXED;
-    }
-
 
     /** Returns the size of the message batch (by calling {@link Message#size()} on all messages) */
     public long totalSize() {
         long retval=0;
-        for(int i=0; i < index; i++)
-            retval+=total_size_visitor.applyAsLong(messages[i], this);
+        for(Message msg: messages)
+            retval+=msg.size();
         return retval;
     }
 
     /** Returns the total number of bytes of the message batch (by calling {@link Message#getLength()} on all messages) */
     public int length() {
         int retval=0;
-        for(int i=0; i < index; i++)
-            retval+=length_visitor.applyAsInt(messages[i], this);
+        for(Message msg: messages)
+            retval+=msg.getLength();
         return retval;
     }
 
+    public MessageBatch resize(int new_capacity) {
+        messages.resize(new_capacity);
+        return this;
+    }
 
     /** Iterator which iterates only over non-null messages, skipping null messages */
-    public MessageIterator iterator() {
-        return new BatchIterator(index, null);
+    public Iterator<Message> iterator() {
+        return messages.iterator();
     }
 
     /** Iterates over all non-null message which match filter */
-    public MessageIterator iteratorWithFilter(Predicate<Message> filter) {
-        return new BatchIterator(index, filter);
+    public Iterator<Message> iterator(Predicate<Message> filter) {
+        return messages.iterator(filter);
     }
 
     public Stream<Message> stream() {
-        Spliterator<Message> sp=Spliterators.spliterator(iterator(), size(), 0);
-        return StreamSupport.stream(sp, false);
+        return stream(null, false);
     }
 
+    public Stream<Message> stream(Predicate<Message> p) {
+        return stream(p, false);
+    }
+
+    public Stream<Message> stream(Predicate<Message> p, boolean parallel) {
+        Spliterator<Message> sp=Spliterators.spliterator(iterator(p), size(), 0);
+        return StreamSupport.stream(sp, parallel);
+    }
 
     public String toString() {
         StringBuilder sb=new StringBuilder();
         sb.append("dest=" + dest);
         if(sender != null)
             sb.append(", sender=").append(sender);
-        sb.append(", mode=" + mode);
+        if(mode != null)
+            sb.append(", mode=" + mode);
         if(cluster_name != null)
             sb.append(", cluster=").append(cluster_name);
         if(sb.length() > 0)
             sb.append(", ");
-        sb.append(size() + " messages [capacity=" + messages.length + "]");
-
+        sb.append(size() + " messages [capacity=" + messages.capacity() + "]");
         return sb.toString();
     }
 
@@ -418,61 +308,6 @@ public class MessageBatch implements Iterable<Message> {
         for(Message msg: this)
             sb.append("#").append(count++).append(": ").append(msg.printHeaders()).append("\n");
         return sb.toString();
-    }
-
-    protected void resize() {
-        resize(messages.length + INCR);
-    }
-
-    protected void resize(int new_capacity) {
-        if(new_capacity <= messages.length)
-            return;
-        Message[] tmp=new Message[new_capacity];
-        System.arraycopy(messages,0,tmp,0,messages.length);
-        messages=tmp;
-    }
-
-
-    public enum Mode {OOB, REG, INTERNAL, MIXED}
-
-
-    /** Iterates over <em>non-null</em> elements of a batch, skipping null elements */
-    protected class BatchIterator implements MessageIterator {
-        protected int                      current_index=-1;
-        protected final int                saved_index; // index at creation time of the iterator
-        protected final Predicate<Message> filter;
-
-        public BatchIterator(int saved_index, Predicate<Message> filter) {
-            this.saved_index=saved_index;
-            this.filter=filter;
-        }
-
-        public boolean hasNext() {
-            // skip null msgs or msgs that don't match the filter (if set)
-            while(current_index +1 < saved_index && nullOrNoFilterMatch(current_index+1))
-                current_index++;
-            return current_index +1 < saved_index;
-        }
-
-        public Message next() {
-            if(current_index +1 >= messages.length)
-                throw new NoSuchElementException();
-            return messages[++current_index];
-        }
-
-        public void remove() {
-            replace(null);
-        }
-
-        @Override public void replace(Message msg) {
-            if(current_index >= 0)
-                messages[current_index]=msg;
-        }
-
-        protected boolean nullOrNoFilterMatch(int index) {
-            return messages[index] == null ||
-              (filter != null && filter.test(messages[index]) == false);
-        }
     }
 
 

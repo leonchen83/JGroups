@@ -42,8 +42,6 @@ public abstract class FailureDetection extends Protocol {
 
     @ManagedAttribute(description="Shows whether there are currently any suspected members")
     protected volatile boolean                       has_suspected_mbrs;
-
-    protected       Address                          local_addr;
     protected final List<Address>                    members=new ArrayList<>();
     protected final Set<Address>                     suspected_mbrs=new HashSet<>();
     protected final BoundedList<Tuple<Address,Long>> suspect_history=new BoundedList<>(20);
@@ -78,9 +76,6 @@ public abstract class FailureDetection extends Protocol {
     public int                            getSuspectEventsSent()         {return num_suspect_events;}
     protected void                        retainKeys(List<Address> mbrs) {getTimestamps().keySet().retainAll(mbrs);}
     protected Runnable                    createTimeoutChecker()         {return new TimeoutChecker();}
-
-    @ManagedAttribute(description="This member's address")
-    public String getLocalAddress() {return String.format("%s", local_addr);}
 
     @ManagedAttribute(description="The members of the cluster")
     public String getMembers() {return Util.printListWithDelimiter(members, ",");}
@@ -123,7 +118,7 @@ public abstract class FailureDetection extends Protocol {
     public String printSuspectHistory() {
         StringBuilder sb=new StringBuilder();
         for(Tuple<Address,Long> tmp: suspect_history) {
-            sb.append(new Date(tmp.getVal2())).append(": ").append(tmp.getVal1()).append("\n");
+            sb.append(Util.utcEpoch(tmp.getVal2())).append(": ").append(tmp.getVal1()).append("\n");
         }
         return sb.toString();
     }
@@ -155,9 +150,6 @@ public abstract class FailureDetection extends Protocol {
                 View v=evt.getArg();
                 handleViewChange(v);
                 return null;
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                break;
             case Event.UNSUSPECT:
                 Address mbr=evt.getArg();
                 unsuspect(mbr);
@@ -189,10 +181,12 @@ public abstract class FailureDetection extends Protocol {
     }
 
     public void up(MessageBatch batch) {
-        int matched_msgs=batch.replaceIf(HAS_HEADER, null, true);
-        update(batch.sender(), matched_msgs > 0, false);
-        if(matched_msgs > 0)
-            num_heartbeats_received+=matched_msgs;
+        int old_size=batch.size();
+        batch.removeIf(HAS_HEADER, true);
+        int removed=old_size - batch.size();
+        update(batch.sender(), removed > 0, false);
+        if(removed > 0)
+            num_heartbeats_received+=removed;
         if(has_suspected_mbrs)
             unsuspect(batch.sender());
         if(!batch.isEmpty())
@@ -344,7 +338,7 @@ public abstract class FailureDetection extends Protocol {
             if(mcast_sent.compareAndSet(true, false))
                 ; // suppress sending of heartbeat
             else {
-                Message heartbeat=new EmptyMessage().setFlag(Message.Flag.INTERNAL).setFlag(Message.TransientFlag.DONT_LOOPBACK)
+                Message heartbeat=new EmptyMessage().setFlag(Message.TransientFlag.DONT_LOOPBACK)
                   .putHeader(id, new HeartbeatHeader());
                 down_prot.down(heartbeat);
                 num_heartbeats_sent++;
@@ -361,7 +355,7 @@ public abstract class FailureDetection extends Protocol {
 
         public void run() {
             synchronized(this) {
-                retainKeys(members); // remove all non-members (// https://issues.jboss.org/browse/JGRP-2387)
+                retainKeys(members); // remove all non-members (// https://issues.redhat.com/browse/JGRP-2387)
             }
             List<Address> suspects=new LinkedList<>();
             for(Iterator<? extends Map.Entry<Address,?>> it=getTimestamps().entrySet().iterator(); it.hasNext();) {

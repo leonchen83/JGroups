@@ -40,7 +40,6 @@ public class RoundTrip implements RtReceiver {
 
     static {
         TRANSPORTS.put("jg",      JGroupsTransport.class.getName());
-        TRANSPORTS.put("jgroups", JGroupsTransport.class.getName());
         TRANSPORTS.put("tcp",     TcpTransport.class.getName());
         TRANSPORTS.put("nio",     NioTransport.class.getName());
         TRANSPORTS.put("server",  ServerTransport.class.getName());
@@ -135,7 +134,7 @@ public class RoundTrip implements RtReceiver {
     }
 
     protected void sendRequests() throws Exception {
-        List mbrs=tp.clusterMembers();
+        List<Object> mbrs=(List<Object>)tp.clusterMembers();
         if(mbrs != null && mbrs.size() != 2) {
             System.err.printf("Cluster must have exactly 2 members: %s\n", mbrs);
             return;
@@ -149,7 +148,7 @@ public class RoundTrip implements RtReceiver {
             senders[i]=new Sender((short)i, latch, sent_msgs, target);
             senders[i].start();
         }
-
+        System.out.printf("-- sending %d messages to %s\n", num_msgs, target);
         long start=time(use_ms);
         latch.countDown(); // start all sender threads
         for(Sender sender: senders)
@@ -216,7 +215,7 @@ public class RoundTrip implements RtReceiver {
                 e.printStackTrace();
             }
             for(;;) {
-                int num=sent_msgs.getAndIncrement();
+                int num=sent_msgs.incrementAndGet();
                 if(num > num_msgs)
                     break;
                 if(num > 0 && num % print == 0)

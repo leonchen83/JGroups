@@ -1,74 +1,64 @@
 package org.jgroups.protocols;
 
-
 import org.jgroups.Message;
-import org.jgroups.util.AverageMinMax;
+import org.jgroups.annotations.ManagedAttribute;
+import org.jgroups.util.ConcurrentBlockingRingBuffer;
+import org.jgroups.util.ConcurrentLinkedBlockingQueue;
+import org.jgroups.util.FastArray;
 
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 
 /**
  * This bundler adds all (unicast or multicast) messages to a queue until max size has been exceeded, but does send
- * messages immediately when no other messages are available. https://issues.jboss.org/browse/JGRP-1540
+ * messages immediately when no other messages are available. https://issues.redhat.com/browse/JGRP-1540
  */
 public class TransferQueueBundler extends BaseBundler implements Runnable {
     protected BlockingQueue<Message> queue;
     protected List<Message>          remove_queue;
-    protected volatile     Thread    bundler_thread;
+    protected Thread                 bundler_thread;
     protected volatile boolean       running=true;
-    protected int                    num_sends_because_full_queue;
-    protected int                    num_sends_because_no_msgs;
-    protected final AverageMinMax    fill_count=new AverageMinMax(); // avg number of bytes when a batch is sent
     protected static final String    THREAD_NAME="TQ-Bundler";
 
+
     public TransferQueueBundler() {
-        this.remove_queue=new ArrayList<>(16);
     }
 
-    protected TransferQueueBundler(BlockingQueue<Message> queue) {
-        this.queue=queue;
-        this.remove_queue=new ArrayList<>(16);
-    }
+    @ManagedAttribute(description="Size of the queue")
+    public int                   getQueueSize()        {return queue.size();}
 
-    public TransferQueueBundler(int capacity) {
-        this(new ArrayBlockingQueue<>(assertPositive(capacity, "bundler capacity cannot be " + capacity)));
-    }
+    @ManagedAttribute(description="Size of the remove-queue")
+    public int                   removeQueueSize()     {return remove_queue.size();}
 
-    public Thread               getThread()               {return bundler_thread;}
-    public int                  getBufferSize()           {return queue.size();}
-    public int                  removeQueueSize()         {return remove_queue.size();}
-    public TransferQueueBundler removeQueueSize(int size) {this.remove_queue=new ArrayList<>(size); return this;}
+    @ManagedAttribute(description="Capacity of the remove-queue")
+    public int                   removeQueueCapacity() {return ((FastArray<Message>)remove_queue).capacity();}
 
     @Override
-    public Map<String,Object> getStats() {
-        Map<String,Object> retval=super.getStats();
-        if(retval == null)
-            retval=new HashMap<>(3);
-        retval.put("sends_because_full", num_sends_because_full_queue);
-        retval.put("sends_because_no_msgs", num_sends_because_no_msgs);
-        retval.put("avg_fill_count", fill_count);
-        return retval;
-    }
-
-    @Override
-    public void resetStats() {
-        num_sends_because_full_queue=num_sends_because_no_msgs=0;
-        fill_count.clear();
-    }
-
-    public void init(TP tp) {
-        super.init(tp);
-        if(queue == null)
-            queue=new ArrayBlockingQueue<>(assertPositive(tp.getBundlerCapacity(), "bundler capacity cannot be " + tp.getBundlerCapacity()));
+    public void init(TP transport) {
+        super.init(transport);
+        if(transport instanceof TCP) {
+            TCP tcp=(TCP)transport;
+            tcp.useLockToSend(false); // https://issues.redhat.com/browse/JGRP-2901
+            int size=tcp.getBufferedOutputStreamSize();
+            if(size < max_size) { // https://issues.redhat.com/browse/JGRP-2903
+                int new_size=max_size + Integer.BYTES;
+                log.warn("buffered_output_stream_size adjusted from %,d -> %,d", size, new_size);
+                tcp.setBufferedOutputStreamSize(new_size);
+            }
+        }
     }
 
     public synchronized void start() {
         if(running)
             stop();
+        // queue blocks on consumer when empty; producers simply drop the message when full
+        if(use_ringbuffer)
+            queue=new ConcurrentBlockingRingBuffer<>(capacity, true, false);
+        else
+            queue=new ConcurrentLinkedBlockingQueue<>(capacity, true, false);
+        if(remove_queue_capacity == 0)
+            remove_queue_capacity=Math.max(capacity/4, 1024);
+        remove_queue=new FastArray<>(remove_queue_capacity);
         bundler_thread=transport.getThreadFactory().newThread(this, THREAD_NAME);
         running=true;
         bundler_thread.start();
@@ -81,24 +71,31 @@ public class TransferQueueBundler extends BaseBundler implements Runnable {
         if(tmp != null) {
             tmp.interrupt();
             if(tmp.isAlive()) {
-                try {tmp.join(500);} catch(InterruptedException e) {}
+                try {
+                    tmp.join(500);
+                }
+                catch(InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
         drain();
     }
 
-
-    public int size() {
-        return super.size() + removeQueueSize() + getBufferSize();
+    public void renameThread() {
+        transport.getThreadFactory().renameThread(THREAD_NAME, bundler_thread);
     }
 
-    public int getQueueSize() {
-        return queue.size();
+    @ManagedAttribute(description="The number of unsent messages in the bundler")
+    public int size() {
+        return super.size() + removeQueueSize() + getQueueSize();
     }
 
     public void send(Message msg) throws Exception {
-        if(running)
-            queue.put(msg);
+        if(!running)
+            return;
+        if(!queue.offer(msg))
+            num_drops_on_full_queue.increment();
     }
 
     public void run() {
@@ -110,69 +107,46 @@ public class TransferQueueBundler extends BaseBundler implements Runnable {
                 addAndSendIfSizeExceeded(msg);
                 while(true) {
                     remove_queue.clear();
-                    int num_msgs=queue.drainTo(remove_queue);
+                    int num_msgs=queue.drainTo(remove_queue, remove_queue_capacity);
                     if(num_msgs <= 0)
                         break;
-                    for(int i=0; i < remove_queue.size(); i++) {
-                        msg=remove_queue.get(i);
-                        addAndSendIfSizeExceeded(msg);
-                    }
+                    avg_remove_queue_size.add(num_msgs);
+                    remove_queue.forEach(this::addAndSendIfSizeExceeded); // ArrayList.forEach() avoids array bounds check
                 }
                 if(count > 0) {
-                    num_sends_because_no_msgs++;
-                    fill_count.add(count);
-                    _sendBundledMessages();
+                    if(transport.statsEnabled())
+                        avg_fill_count.add(count);
+                    sendBundledMessages();
+                    num_sends_because_no_msgs.increment();
                 }
             }
-            catch(Throwable t) {
+            catch(InterruptedException iex) {
+                Thread.currentThread().interrupt();
             }
         }
     }
-
 
     protected void addAndSendIfSizeExceeded(Message msg) {
         int size=msg.size();
-        if(count + size >= transport.getMaxBundleSize()) {
-            num_sends_because_full_queue++;
-            fill_count.add(count);
-            _sendBundledMessages();
+        if(count + size > max_size) {
+            if(transport.statsEnabled())
+                avg_fill_count.add(count);
+            sendBundledMessages();
+            num_sends_because_full_queue.increment();
         }
-        _addMessage(msg, size);
+        addMessage(msg, size);
     }
-
 
     /** Takes all messages from the queue, adds them to the hashmap and then sends all bundled messages */
     protected void drain() {
         Message msg;
-        while((msg=queue.poll()) != null)
-            addAndSendIfSizeExceeded(msg);
-        _sendBundledMessages();
-    }
-
-
-    // This should not affect perf, as the lock is uncontended most of the time
-    protected void _sendBundledMessages() {
-        lock.lock();
-        try {
+        if(queue != null) {
+            while((msg=queue.poll()) != null)
+                addAndSendIfSizeExceeded(msg);
+        }
+        if(!msgs.isEmpty())
             sendBundledMessages();
-        }
-        finally {
-            lock.unlock();
-        }
     }
 
-    protected void _addMessage(Message msg, int size) {
-        lock.lock();
-        try {
-            addMessage(msg, size);
-        }
-        finally {
-            lock.unlock();
-        }
-    }
 
-    protected static int assertPositive(int value, String message) {
-        if(value <= 0) throw new IllegalArgumentException(message);
-        return value;
-    }
 }

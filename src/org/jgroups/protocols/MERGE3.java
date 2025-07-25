@@ -26,7 +26,7 @@ import java.util.stream.Collectors;
  * Protocol to discover subgroups; e.g., existing due to a network partition (that healed). Example: group
  * {p,q,r,s,t,u,v,w} is split into 3 subgroups {p,q}, {r,s,t,u} and {v,w}. This protocol will eventually send
  * a MERGE event with the views of each subgroup up the stack: {p,r,v}. <p/>
- * Works as follows (https://issues.jboss.org/browse/JGRP-1387): every member periodically broadcasts its address (UUID),
+ * Works as follows (https://issues.redhat.com/browse/JGRP-1387): every member periodically broadcasts its address (UUID),
  * logical name, physical address and ViewID information. Other members collect this information and see if the ViewIds
  * are different (indication of different subpartitions). If they are, the member with the lowest address (first in the
  * sorted list of collected addresses) sends a MERGE event up the stack, which will be handled by GMS.
@@ -62,8 +62,6 @@ public class MERGE3 extends Protocol {
 
     /* --------------------------------------------- Fields ------------------------------------------------------ */
 
-    protected Address                       local_addr;
-
     protected volatile View                 view;
 
     protected TimeScheduler                 timer;
@@ -91,7 +89,7 @@ public class MERGE3 extends Protocol {
     @ManagedAttribute(description="Whether or not the current member is the coordinator")
     protected volatile boolean              is_coord;
     
-    @ManagedAttribute(description="Number of times a MERGE event was sent up the stack")
+    @ManagedAttribute(description="Number of times a MERGE event was sent up the stack",type=AttributeType.SCALAR)
     protected int                           num_merge_events;
 
 
@@ -233,9 +231,7 @@ public class MERGE3 extends Protocol {
         switch(evt.getType()) {
 
             case Event.CONNECT:
-            case Event.CONNECT_USE_FLUSH:
             case Event.CONNECT_WITH_STATE_TRANSFER:
-            case Event.CONNECT_WITH_STATE_TRANSFER_USE_FLUSH:
                 cluster_name=evt.getArg();
                 break;
 
@@ -266,43 +262,29 @@ public class MERGE3 extends Protocol {
                     clearViews();
                 }
                 return ret;
-
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                break;
         }
         return down_prot.down(evt);
     }
-
 
     public Object up(Message msg) {
         MergeHeader hdr=msg.getHeader(getId());
         if(hdr == null)
             return up_prot.up(msg);
-        Address sender=msg.getSrc();
-        switch(hdr.type) {
-            case INFO:
-                addInfo(sender, hdr.view_id, hdr.logical_name, hdr.physical_addr);
-                break;
-            case VIEW_REQ:
-                View viewToSend=view;
-                Message view_rsp=new BytesMessage(sender).setFlag(Message.Flag.INTERNAL)
-                  .putHeader(getId(), MergeHeader.createViewResponse()).setArray(marshal(viewToSend));
-                log.trace("%s: sending view rsp: %s", local_addr, viewToSend);
-                down_prot.down(view_rsp);
-                break;
-            case VIEW_RSP:
-                View tmp_view=readView(msg.getArray(), msg.getOffset(), msg.getLength());
-                log.trace("%s: received view rsp from %s: %s", local_addr, msg.getSrc(), tmp_view);
-                if(tmp_view != null)
-                    view_rsps.add(sender, tmp_view);
-                break;
-            default:
-                log.error("Type %s not known", hdr.type);
-        }
-        return null;
+        return handle(hdr, msg);
     }
 
+    public void up(MessageBatch batch) {
+        for(Iterator<Message> it=batch.iterator(); it.hasNext();) {
+            Message msg=it.next();
+            MergeHeader hdr=msg.getHeader(id);
+            if(hdr != null) {
+                it.remove();
+                handle(hdr, msg);
+            }
+        }
+        if(!batch.isEmpty())
+            up_prot.up(batch);
+    }
 
     public static List<View> detectDifferentViews(Map<Address,View> map) {
         final List<View> ret=new ArrayList<>();
@@ -333,6 +315,31 @@ public class MERGE3 extends Protocol {
             log.error("%s: failed reading View from message: %s", local_addr, ex);
             return null;
         }
+    }
+
+    protected Object handle(MergeHeader hdr, Message msg) {
+        Address sender=msg.getSrc();
+        switch(hdr.type) {
+            case INFO:
+                addInfo(sender, hdr.view_id, hdr.logical_name, hdr.physical_addr);
+                break;
+            case VIEW_REQ:
+                View viewToSend=view;
+                Message view_rsp=new BytesMessage(sender).setFlag(Message.TransientFlag.DONT_BLOCK)
+                  .putHeader(getId(), MergeHeader.createViewResponse()).setArray(marshal(viewToSend));
+                log.trace("%s: sending view rsp: %s", local_addr, viewToSend);
+                down_prot.down(view_rsp);
+                break;
+            case VIEW_RSP:
+                View tmp_view=readView(msg.getArray(), msg.getOffset(), msg.getLength());
+                log.trace("%s: received view rsp from %s: %s", local_addr, msg.getSrc(), tmp_view);
+                if(tmp_view != null)
+                    view_rsps.add(sender, tmp_view);
+                break;
+            default:
+                log.error("Type %s not known", hdr.type);
+        }
+        return null;
     }
 
     protected MergeHeader createInfo() {
@@ -395,7 +402,7 @@ public class MERGE3 extends Protocol {
             return;
         }
         MergeHeader hdr=createInfo();
-        Message info=new EmptyMessage(dest).setFlag(Message.Flag.INTERNAL).putHeader(getId(), hdr);
+        Message info=new EmptyMessage(dest).putHeader(getId(), hdr).setFlag(Message.TransientFlag.DONT_BLOCK);
         down_prot.down(info);
     }
 
@@ -408,8 +415,7 @@ public class MERGE3 extends Protocol {
 
             MergeHeader hdr=createInfo();
             if(transport_supports_multicasting) {
-                Message msg=new EmptyMessage().setFlag(Message.Flag.INTERNAL).putHeader(getId(), hdr)
-                  .setFlag(Message.TransientFlag.DONT_LOOPBACK);
+                Message msg=new EmptyMessage().putHeader(getId(), hdr).setFlag(Message.TransientFlag.DONT_LOOPBACK);
                 down_prot.down(msg);
             }
             else
@@ -433,7 +439,8 @@ public class MERGE3 extends Protocol {
                 MergeHeader hdr=createInfo();
                 addInfo(local_addr, hdr.view_id, hdr.logical_name, hdr.physical_addr);
                 if(!differentViewIds()) {
-                    log.trace("%s: found no inconsistent views: %s", local_addr, dumpViews());
+                    if(log.isTraceEnabled())
+                        log.trace("%s: found no inconsistent views: %s", local_addr, dumpViews());
                     return;
                 }
                 _run();
@@ -473,8 +480,7 @@ public class MERGE3 extends Protocol {
                         view_rsps.add(local_addr, view);
                     continue;
                 }
-                Message view_req=new EmptyMessage(target).setFlag(Message.Flag.INTERNAL)
-                  .putHeader(getId(), MergeHeader.createViewRequest());
+                Message view_req=new EmptyMessage(target).putHeader(getId(), MergeHeader.createViewRequest());
                 down_prot.down(view_req);
             }
             view_rsps.waitForAllResponses(check_interval / 10);

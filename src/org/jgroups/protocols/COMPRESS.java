@@ -7,8 +7,8 @@ import org.jgroups.annotations.Property;
 import org.jgroups.conf.AttributeType;
 import org.jgroups.stack.Protocol;
 import org.jgroups.util.ByteArray;
+import org.jgroups.util.FastArray;
 import org.jgroups.util.MessageBatch;
-import org.jgroups.util.MessageIterator;
 import org.jgroups.util.Util;
 
 import java.io.DataInput;
@@ -47,7 +47,6 @@ public class COMPRESS extends Protocol {
     
     protected BlockingQueue<Deflater> deflater_pool;
     protected BlockingQueue<Inflater> inflater_pool;
-    protected MessageFactory          msg_factory;
     protected final LongAdder         num_compressions=new LongAdder(), num_decompressions=new LongAdder();
 
 
@@ -77,7 +76,6 @@ public class COMPRESS extends Protocol {
         inflater_pool=new ArrayBlockingQueue<>(pool_size);
         for(int i=0; i < pool_size; i++)
             inflater_pool.add(new Inflater());
-        msg_factory=getTransport().getMessageFactory();
     }
 
     public void destroy() {
@@ -159,7 +157,7 @@ public class COMPRESS extends Protocol {
     }
 
     public void up(MessageBatch batch) {
-        MessageIterator it=batch.iterator();
+        FastArray<Message>.FastIterator it=(FastArray<Message>.FastIterator)batch.iterator();
         while(it.hasNext()) {
             Message msg=it.next();
             CompressHeader hdr=msg.getHeader(this.id);
@@ -190,9 +188,9 @@ public class COMPRESS extends Protocol {
                 inflater.setInput(compressed_payload, msg.getOffset(), msg.getLength());
                 try {
                     inflater.inflate(uncompressed_payload);
-                    // we need to copy: https://jira.jboss.org/jira/browse/JGRP-867
+                    // we need to copy: https://issues.redhat.com/browse/JGRP-867
                     if(needs_deserialization) {
-                        return messageFromByteArray(uncompressed_payload, msg_factory);
+                        return messageFromByteArray(uncompressed_payload);
                     }
                     else
                         return msg.copy(false, true).setArray(uncompressed_payload, 0, uncompressed_payload.length);
@@ -221,9 +219,9 @@ public class COMPRESS extends Protocol {
         }
     }
 
-    protected static Message messageFromByteArray(byte[] uncompressed_payload, MessageFactory msg_factory) {
+    protected static Message messageFromByteArray(byte[] uncompressed_payload) {
         try {
-            return Util.messageFromBuffer(uncompressed_payload, 0, uncompressed_payload.length, msg_factory);
+            return Util.messageFromBuffer(uncompressed_payload, 0, uncompressed_payload.length);
         }
         catch(Exception ex) {
             throw new RuntimeException("failed unmarshalling message", ex);

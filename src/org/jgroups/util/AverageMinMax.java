@@ -6,6 +6,9 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import static org.jgroups.util.Util.printTime;
 
 /**
  * Measures min and max in addition to average
@@ -13,20 +16,33 @@ import java.util.List;
  * @since  4.0, 3.6.10
  */
 public class AverageMinMax extends Average {
-    protected long       min=Long.MAX_VALUE, max=0;
-    protected List<Long> values;
+    protected long             min=Long.MAX_VALUE, max=0;
+    protected List<Long>       values;
+    protected volatile boolean sorted;
 
-    public long          min()                        {return min;}
-    public long          max()                        {return max;}
-    public boolean       usePercentiles()             {return values != null;}
-    public AverageMinMax usePercentiles(int capacity) {values=capacity > 0? new ArrayList<>(capacity) : null; return this;}
+    public AverageMinMax() {
+    }
+
+    public AverageMinMax(int capacity) {
+        super(capacity);
+    }
+
+    public long          min()                   {return min;}
+    public long          max()                   {return max;}
+    public boolean       usePercentiles()        {return values != null;}
+    public AverageMinMax usePercentiles(int cap) {values=cap > 0? new ArrayList<>(cap) : null; return this;}
+    public List<Long>    values()                {return values;}
 
     public <T extends Average> T add(long num) {
+        if(num < 0)
+            return (T)this;
         super.add(num);
         min=Math.min(min, num);
         max=Math.max(max, num);
-        if(values != null)
+        if(values != null) {
             values.add(num);
+            sorted=false;
+        }
         return (T)this;
     }
 
@@ -38,8 +54,10 @@ public class AverageMinMax extends Average {
             AverageMinMax o=(AverageMinMax)other;
             this.min=Math.min(min, o.min());
             this.max=Math.max(max, o.max());
-            if(this.values != null)
+            if(this.values != null) {
                 this.values.addAll(o.values);
+                sorted=false;
+            }
         }
         return (T)this;
     }
@@ -53,43 +71,74 @@ public class AverageMinMax extends Average {
 
     public String percentiles() {
         if(values == null) return "n/a";
-        Collections.sort(values);
+        sort();
         double stddev=stddev();
-        return String.format("stddev: %.2f, 50: %d, 90: %d, 99: %d, 99.9: %d, 99.99: %d, 99.999: %d, 100: %d\n",
-                             stddev, p(50), p(90), p(99), p(99.9), p(99.99), p(99.999), p(100));
+        return String.format("stddev: %s, 50: %s, 90: %s, 99: %s, 99.9: %s, 99.99: %s, 99.999: %s, 100: %s\n",
+                             printTime(stddev, unit),
+                             printTime(p(50), unit),
+                             printTime(p(90), unit),
+                             printTime(p(99), unit),
+                             printTime(p(99.9), unit),
+                             printTime(p(99.99), unit),
+                             printTime(p(99.999), unit),
+                             printTime(p(100), unit));
     }
 
-    protected long p(double percentile) {
+    public String toString() {
+        return count() == 0? "n/a" :
+          unit != null? toString(unit) :
+          String.format("min/avg/max=%.2f/%.2f/%.2f%s",
+                        (double)min, average(), (double)max, unit == null? "" : " " + Util.suffix(unit));
+    }
+
+    public String toString(TimeUnit u) {
+        if(count() == 0)
+            return "n/a";
+        return String.format("%s/%s/%s", printTime(min, u), printTime(average(), u), printTime(max, u));
+    }
+
+    public void writeTo(DataOutput out) throws IOException {
+        super.writeTo(out);
+        Bits.writeLongCompressed(min, out);
+        Bits.writeLongCompressed(max, out);
+    }
+
+    public void readFrom(DataInput in) throws IOException {
+        super.readFrom(in);
+        min=Bits.readLongCompressed(in);
+        max=Bits.readLongCompressed(in);
+    }
+
+    public double percentile(double percentile) {
+        return p(percentile);
+    }
+
+    public double p(double percentile) {
         if(values == null)
             return -1;
+        sort();
         int size=values.size();
-        int index=(int)(size * (percentile/100.0));
-        return values.get(index-1);
+        if(size == 0)
+            return -1;
+        int idx=size == 1? 1 : (int)(size * (percentile/100.0));
+        return values.get(idx-1);
     }
 
-    protected double stddev() {
+    public double stddev() {
         if(values == null) return -1.0;
+        sort();
         double av=average();
         int size=values.size();
         double variance=values.stream().map(v -> (v - av)*(v - av)).reduce(0.0, Double::sum) / size;
         return Math.sqrt(variance);
     }
 
-    public String toString() {
-        return count == 0? "n/a" : String.format("min/avg/max=%,d/%,.2f/%,d", min, getAverage(), max);
+    public AverageMinMax sort() {
+        if(values != null && !sorted) {
+            Collections.sort(values);
+            sorted=true;
+        }
+        return this;
     }
-
-    public void writeTo(DataOutput out) throws IOException {
-        super.writeTo(out);
-        Bits.writeLong(min, out);
-        Bits.writeLong(max, out);
-    }
-
-    public void readFrom(DataInput in) throws IOException {
-        super.readFrom(in);
-        min=Bits.readLong(in);
-        max=Bits.readLong(in);
-    }
-
 
 }

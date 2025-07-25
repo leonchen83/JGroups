@@ -3,72 +3,108 @@ package org.jgroups.stack;
 
 import org.jgroups.Address;
 import org.jgroups.PhysicalAddress;
-import org.jgroups.annotations.GuardedBy;
 import org.jgroups.logging.Log;
 import org.jgroups.logging.LogFactory;
+import org.jgroups.util.SocketFactory;
 import org.jgroups.util.TimeScheduler;
 import org.jgroups.util.Util;
 
-import java.io.Serializable;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.net.InetSocketAddress;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 /**
- * Manages a list of RouterStubs (e.g. health checking, reconnecting etc.
+ * Manages a list of RouterStubs (e.g. health checking, reconnecting).
  * @author Vladimir Blagojevic
  * @author Bela Ban
  */
 public class RouterStubManager implements Runnable, RouterStub.CloseListener {
-    @GuardedBy("reconnectorLock")
-    protected final ConcurrentMap<RouterStub,Future<?>> futures=new ConcurrentHashMap<>();
+    protected final List<RouterStub> stubs=new CopyOnWriteArrayList<>();
+    protected final TimeScheduler    timer;
+    protected final String           cluster_name;
+    protected final Address          local_addr;
+    protected final String           logical_name;
+    protected final PhysicalAddress  phys_addr;
+    protected final long             reconnect_interval; // reconnect interval (ms)
+    protected boolean                use_nio=true;       // whether to use TcpClient or NioClient
+    protected Future<?>              reconnector_task, heartbeat_task, timeout_checker_task;
+    protected final Log              log;
+    protected SocketFactory          socket_factory;
+    // Sends a heartbeat to the GossipRouter every heartbeat_interval ms (0 disables this)
+    protected long                   heartbeat_interval;
+    // Max time (ms) with no received message or heartbeat after which the connection to a GossipRouter is closed.
+    // Ignored when heartbeat_interval is 0.
+    protected long                   heartbeat_timeout;
+    protected final Runnable         send_heartbeat=this::sendHeartbeat;
+    protected final Runnable         check_timeouts=this::checkTimeouts;
 
-    // List of currently connected RouterStubs
-    protected volatile List<RouterStub>                 stubs;
+    // Use bounded queues for sending (https://issues.redhat.com/browse/JGRP-2759)") in TCP
+    protected boolean                non_blocking_sends;
 
-    // List of destinations that the reconnect task needs to create and connect
-    protected final Set<Target>                         reconnect_list=new HashSet<>();
-
-    protected final Protocol                            owner;
-    protected final TimeScheduler                       timer;
-    protected final String                              cluster_name;
-    protected final Address                             local_addr;
-    protected final String                              logical_name;
-    protected final PhysicalAddress                     phys_addr;
-    protected final long                                interval;      // reconnect interval (ms)
-    protected boolean                                   use_nio=true;  // whether to use RouterStubTcp or RouterStubNio
-    protected Future<?>                                 reconnector_task;
-    protected final Log                                 log;
+    // When sending and non_blocking, how many messages to queue max
+    protected int                    max_send_queue=128;
 
 
-    public RouterStubManager(Protocol owner, String cluster_name, Address local_addr,
-                             String logical_name, PhysicalAddress phys_addr, long interval) {
-        this.owner = owner;
-        this.stubs = new ArrayList<>();
-        this.log = LogFactory.getLog(owner.getClass());
-        this.timer = owner.getTransport().getTimer();
+    public RouterStubManager(Log log, TimeScheduler timer, String cluster_name, Address local_addr,
+                             String logical_name, PhysicalAddress phys_addr, long reconnect_interval) {
+        this.log=log != null? log : LogFactory.getLog(RouterStubManager.class);
+        this.timer=timer;
         this.cluster_name=cluster_name;
         this.local_addr=local_addr;
         this.logical_name=logical_name;
         this.phys_addr=phys_addr;
-        this.interval = interval;
+        this.reconnect_interval=reconnect_interval;
     }
 
-    public static RouterStubManager emptyGossipClientStubManager(Protocol p) {
-        return new RouterStubManager(p,null,null,null, null,0L);
+    public static RouterStubManager emptyGossipClientStubManager(Log log, TimeScheduler timer) {
+        return new RouterStubManager(log, timer,null,null,null, null,0L);
     }
     
 
     public RouterStubManager useNio(boolean flag) {use_nio=flag; return this;}
+    public boolean           reconnectorRunning() {return reconnector_task != null && !reconnector_task.isDone();}
+    public boolean           heartbeaterRunning() {return heartbeat_task != null && !heartbeat_task.isDone();}
+    public boolean           timeouterRunning()   {return timeout_checker_task != null && !timeout_checker_task.isDone();}
+    public boolean           nonBlockingSends()          {return non_blocking_sends;}
+    public RouterStubManager nonBlockingSends(boolean b) {this.non_blocking_sends=b; return this;}
+    public int               maxSendQueue()              {return max_send_queue;}
+    public RouterStubManager maxSendQueue(int s)         {this.max_send_queue=s; return this;}
 
+
+    public RouterStubManager socketFactory(SocketFactory socket_factory) {
+        this.socket_factory=socket_factory;
+        return this;
+    }
+
+    public RouterStubManager heartbeat(long heartbeat_interval, long heartbeat_timeout) {
+        if(heartbeat_interval <= 0) {
+            // disable heartbeating
+            stopHeartbeatTask();
+            stopTimeoutChecker();
+            stubs.forEach(s -> s.handleHeartbeats(false));
+            this.heartbeat_interval=0;
+            return this;
+        }
+        if(heartbeat_interval >= heartbeat_timeout)
+            throw new IllegalArgumentException(String.format("heartbeat_interval (%d) must be < than heartbeat_timeout (%d)",
+                                                             heartbeat_interval, heartbeat_timeout));
+        // enable heartbeating
+        this.heartbeat_interval=heartbeat_interval;
+        this.heartbeat_timeout=heartbeat_timeout;
+        stubs.forEach(s -> s.handleHeartbeats(true));
+        startHeartbeatTask();
+        startTimeoutChecker();
+        return this;
+    }
 
 
     /**
-     * Applies action to all RouterStubs that are connected
-     * @param action
+     * Applies action to all connected RouterStubs
      */
     public void forEach(Consumer<RouterStub> action) {
         stubs.stream().filter(RouterStub::isConnected).forEach(action);
@@ -79,56 +115,59 @@ public class RouterStubManager implements Runnable, RouterStub.CloseListener {
      * @param action
      */
     public void forAny(Consumer<RouterStub> action) {
-        while(!stubs.isEmpty()) {
-            RouterStub stub=Util.pickRandomElement(stubs);
-            if(stub != null && stub.isConnected()) {
-                action.accept(stub);
-                return;
-            }
-        }
-    }
-
-
-    public RouterStub createAndRegisterStub(IpAddress local, IpAddress router_addr) {
-        RouterStub stub=new RouterStub(local, router_addr, use_nio, this);
-        RouterStub old_stub=unregisterStub(router_addr);
-        if(old_stub != null)
-            old_stub.destroy();
-        add(stub);
-        return stub;
-    }
-
-
-    public RouterStub unregisterStub(IpAddress router_addr) {
-        RouterStub stub=find(router_addr);
+        RouterStub stub=findRandomConnectedStub();
         if(stub != null)
-            remove(stub);
+            action.accept(stub);
+    }
+
+
+    public RouterStub createAndRegisterStub(InetSocketAddress local, InetSocketAddress router_addr) {
+        return createAndRegisterStub(local, router_addr, -1);
+    }
+
+    public RouterStub createAndRegisterStub(InetSocketAddress local, InetSocketAddress router_addr, int linger) {
+        RouterStub stub=new RouterStub(local, router_addr, use_nio, this, socket_factory, linger, non_blocking_sends, max_send_queue)
+          .handleHeartbeats(heartbeat_interval > 0);
+        this.stubs.add(stub);
         return stub;
+    }
+
+    public RouterStub unregisterStub(InetSocketAddress router_addr_sa) {
+        RouterStub s=stubs.stream().filter(st -> Objects.equals(st.remote_sa, router_addr_sa)).findFirst().orElse(null);
+        if(s != null) {
+            s.destroy();
+            stubs.remove(s);
+        }
+        return s;
     }
 
 
     public void connectStubs() {
-        for(RouterStub stub : stubs) {
-            try {
-                if(!stub.isConnected())
+        boolean failed_connect_attempts=false;
+        for(RouterStub stub: stubs) {
+            if(!stub.isConnected()) {
+                try {
                     stub.connect(cluster_name, local_addr, logical_name, phys_addr);
-            }
-            catch (Throwable e) {
-                moveStubToReconnects(stub);
+                }
+                catch(Exception ex) {
+                    failed_connect_attempts=true;
+                }
             }
         }
+        if(failed_connect_attempts)
+            startReconnector();
     }
 
     
     public void disconnectStubs() {
         stopReconnector();
-        for(RouterStub stub : stubs) {
+        for(RouterStub stub: stubs) {
             try {
                 stub.disconnect(cluster_name, local_addr);
             }
-            catch (Throwable e) {
+            catch(Throwable ignored) {
             }
-        }       
+        }
     }
     
     public void destroyStubs() {
@@ -142,7 +181,9 @@ public class RouterStubManager implements Runnable, RouterStub.CloseListener {
     }
 
     public String printReconnectList() {
-        return Util.printListWithDelimiter(reconnect_list, ", ");
+        return stubs.stream().filter(s -> !s.isConnected())
+          .map(s -> String.format("%s:%d", s.remote_sa.getHostString(), s.remote_sa.getPort()))
+          .collect(Collectors.joining(", "));
     }
 
     public String print() {
@@ -150,98 +191,40 @@ public class RouterStubManager implements Runnable, RouterStub.CloseListener {
     }
 
     public void run() {
-        Collection<Target> tmp;
-        boolean            empty;
-
-        synchronized(reconnect_list) {
-            tmp=new ArrayList<>(reconnect_list);
+        int failed_reconnect_attempts=0;
+        for(RouterStub stub: stubs) {
+            if(!stub.isConnected()) {
+                try {
+                    stub.connect(this.cluster_name, this.local_addr, this.logical_name, this.phys_addr);
+                    log.debug("%s: re-established connection to GossipRouter %s (group: %s)",
+                              local_addr, stub.remote(), this.cluster_name);
+                }
+                catch(Exception ex) {
+                    failed_reconnect_attempts++;
+                }
+            }
         }
-        for(Target t: tmp) {
-            if(reconnect(t))
-                remove(t);
-        }
-        synchronized(reconnect_list) {
-            empty=reconnect_list.isEmpty();
-        }
-        if(empty)
+        if(failed_reconnect_attempts == 0)
             stopReconnector();
     }
 
     @Override
     public void closed(RouterStub stub) {
-        moveStubToReconnects(stub);
-    }
-
-    protected boolean reconnect(Target target) {
-        RouterStub stub=new RouterStub(target.bind_addr, target.router_addr, this.use_nio, this).receiver(target.receiver);
-        if(!add(stub))
-            return false;
         try {
-            stub.connect(this.cluster_name, this.local_addr, this.logical_name, this.phys_addr);
-            log.debug("%s: re-established connection to %s successfully for group %s",
-                      local_addr, stub.remote(), this.cluster_name);
-            return true;
+            if(log.isDebugEnabled())
+                log.debug("%s: GossipRouter %s closed connection; starting reconnector task", local_addr, stub.remote());
+            stub.destroy();
         }
-        catch(Throwable t) {
-            remove(stub);
-            return false;
+        catch(Exception ignored) {
+
         }
+        startReconnector();
     }
 
-    protected void moveStubToReconnects(RouterStub stub) {
-        if(stub == null) return;
-        remove(stub);
-        if(add(new Target(stub.local(), stub.remote(), stub.receiver()))) {
-            log.debug("%s: connection to %s closed, trying to re-establish connection", local_addr, stub.remote());
-            startReconnector();
-        }
-    }
-
-    protected boolean add(RouterStub stub) {
-        if(stub == null) return false;
-        List<RouterStub> new_stubs=new ArrayList<>(stubs);
-        boolean retval=!new_stubs.contains(stub) && new_stubs.add(stub);
-        this.stubs=new_stubs;
-        return retval;
-    }
-
-
-    protected boolean add(Target target) {
-        if(target == null) return false;
-        synchronized(reconnect_list) {
-            return reconnect_list.add(target);
-        }
-    }
-
-    protected boolean remove(RouterStub stub) {
-        if(stub == null) return false;
-        stub.destroy();
-        List<RouterStub> new_stubs=new ArrayList<>(stubs);
-        boolean retval=new_stubs.remove(stub);
-        this.stubs=new_stubs;
-        return retval;
-    }
-
-    protected boolean remove(Target target) {
-        if(target == null) return false;
-        synchronized(reconnect_list) {
-            return reconnect_list.remove(target);
-        }
-    }
-
-
-    protected RouterStub find(IpAddress router_addr) {
-        for(RouterStub stub: stubs) {
-            IpAddress addr=stub.gossipRouterAddress();
-            if(Objects.equals(addr, router_addr))
-                return stub;
-        }
-        return null;
-    }
 
     protected synchronized void startReconnector() {
         if(reconnector_task == null || reconnector_task.isDone())
-            reconnector_task=timer.scheduleWithFixedDelay(this, interval, interval, TimeUnit.MILLISECONDS);
+            reconnector_task=timer.scheduleWithFixedDelay(this, reconnect_interval, reconnect_interval, TimeUnit.MILLISECONDS);
     }
 
     protected synchronized void stopReconnector() {
@@ -249,40 +232,69 @@ public class RouterStubManager implements Runnable, RouterStub.CloseListener {
             reconnector_task.cancel(true);
     }
 
+    protected synchronized void startHeartbeatTask() {
+        if(heartbeat_task == null || heartbeat_task.isDone())
+            heartbeat_task=timer.scheduleWithFixedDelay(this.send_heartbeat, heartbeat_interval, heartbeat_interval, TimeUnit.MILLISECONDS);
+    }
 
+    protected synchronized void stopHeartbeatTask() {
+        stopTimeoutChecker();
+        if(heartbeat_task != null)
+            heartbeat_task.cancel(true);
+    }
 
+    protected synchronized void startTimeoutChecker() {
+        if(timeout_checker_task == null || timeout_checker_task.isDone())
+            timeout_checker_task=timer.scheduleWithFixedDelay(this.check_timeouts, heartbeat_timeout, heartbeat_timeout, TimeUnit.MILLISECONDS);
+    }
 
+    protected synchronized void stopTimeoutChecker() {
+        if(timeout_checker_task != null)
+            timeout_checker_task.cancel(true);
+    }
 
-
-
-    protected static class Target implements Comparator<Target>, Serializable {
-        private static final long serialVersionUID = 1L;
-
-        protected final IpAddress               bind_addr, router_addr;
-        protected final RouterStub.StubReceiver receiver;
-
-        public Target(IpAddress bind_addr, IpAddress router_addr, RouterStub.StubReceiver receiver) {
-            this.bind_addr=bind_addr;
-            this.router_addr=router_addr;
-            this.receiver=receiver;
+    protected RouterStub findRandomConnectedStub() {
+        RouterStub stub=null;
+        while(connectedStubs() > 0) {
+            RouterStub tmp=Util.pickRandomElement(stubs);
+            if(tmp != null && tmp.isConnected())
+                return tmp;
         }
+        return stub;
+    }
 
-        @Override
-        public int compare(Target o1, Target o2) {
-            return o1.router_addr.compareTo(o2.router_addr);
-        }
+    protected void sendHeartbeat() {
+        GossipData hb=new GossipData(GossipType.HEARTBEAT);
+        forEach(s -> {
+            try {
+                s.writeRequest(hb);
+            }
+            catch(Exception ex) {
+                log.error("failed sending heartbeat", ex);
+            }
+        });
+    }
 
-        public int hashCode() {
-            return router_addr.hashCode();
-        }
+    protected void checkTimeouts() {
+        forEach(st -> {
+            long timeout=System.currentTimeMillis() - st.lastHeartbeat();
+            if(timeout > heartbeat_timeout) {
+                log.debug("%s: closed connection to GossipRouter %s as no heartbeat has been received for %s",
+                          local_addr, st.remote(),
+                          Util.printTime(timeout, TimeUnit.MILLISECONDS));
+                st.destroy();
+            }
+        });
+        if(disconnectedStubs())
+            startReconnector();
+    }
 
-        public boolean equals(Object obj) {
-            return compare(this, (Target)obj) == 0;
-        }
+    public int connectedStubs() {
+        return (int)stubs.stream().filter(RouterStub::isConnected).count();
+    }
 
-        public String toString() {
-            return String.format("%s -> %s", bind_addr, router_addr);
-        }
+    public boolean disconnectedStubs() {
+        return stubs.stream().anyMatch(st -> !st.isConnected());
     }
 
 }

@@ -19,6 +19,10 @@ public class Runner implements Runnable, Closeable {
     protected long                join_timeout=100;
 
 
+    public Runner(String name, Runnable function, Runnable stop_function) {
+        this(new DefaultThreadFactory(name, true, true), name, function, stop_function);
+    }
+
     public Runner(ThreadFactory factory, String thread_name, Runnable function, Runnable stop_function) {
         this.factory=factory;
         this.thread_name=thread_name;
@@ -34,6 +38,7 @@ public class Runner implements Runnable, Closeable {
     public Runner  threadName(String n)   {thread_name=n; if(thread != null) thread.setName(n); return this;}
     public long    getJoinTimeout()       {return join_timeout;}
     public Runner  setJoinTimeout(long t) {join_timeout=t; return this;}
+    public Runner  joinTimeout(long t)    {return setJoinTimeout(t);}
 
 
     public synchronized Runner start() {
@@ -42,7 +47,8 @@ public class Runner implements Runnable, Closeable {
         if(thread == null || !thread.isAlive()) {
             String name=thread_name != null? thread_name : "runner";
             thread=factory != null? factory.newThread(this, name) : new Thread(this, name);
-            thread.setDaemon(daemon);
+            if(thread.getClass() == Thread.class)
+                thread.setDaemon(daemon);
             running=true;
             thread.start();
         }
@@ -53,9 +59,9 @@ public class Runner implements Runnable, Closeable {
         running=false;
         Thread tmp=thread;
         thread=null;
-        if(tmp != null) {
+        if(tmp != null && tmp.isAlive()) {
             tmp.interrupt();
-            if(tmp.isAlive()) {
+            if(join_timeout > 0 && tmp.isAlive()) {
                 try {tmp.join(join_timeout);} catch(InterruptedException e) {}
             }
         }

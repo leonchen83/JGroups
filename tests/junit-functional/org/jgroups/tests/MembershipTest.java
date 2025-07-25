@@ -26,14 +26,13 @@ public class MembershipTest {
 
     @BeforeMethod
     void setUp() {
-        a1=Util.createRandomAddress();
-        a2=Util.createRandomAddress();
+        a1=Util.createRandomAddress("A1");
+        a2=Util.createRandomAddress("A2");
         a3=a2;
-        a4=Util.createRandomAddress();
-        a5=Util.createRandomAddress();
+        a4=Util.createRandomAddress("A4");
+        a5=Util.createRandomAddress("A5");
         m1=new Membership();
     }
-
 
     public void testConstructor() {
         v1=Arrays.asList(a1, a2, a3);
@@ -43,7 +42,6 @@ public class MembershipTest {
         assert m2.contains(a2);
         assert m2.contains(a3);
     }
-
 
     public void testClone() {
         v1=Arrays.asList(a1, a2, a3);
@@ -56,8 +54,6 @@ public class MembershipTest {
         assert m2.contains(a2);
     }
 
-
-
     public void testCopy() {
         v1=Arrays.asList(a1, a2, a3);
         m2=new Membership(v1);
@@ -69,8 +65,6 @@ public class MembershipTest {
         assert m2.contains(a2);
     }
 
-
-
     public void testAdd() {
         m1.add(a1, a2, a3);
         assert m1.size() == 2;
@@ -79,8 +73,6 @@ public class MembershipTest {
         assert m1.contains(a3);
     }
 
-
-
     public void testAddVector() {
         v1=Arrays.asList(a1, a2, a3);
         m1.add(v1);
@@ -88,7 +80,6 @@ public class MembershipTest {
         assert m1.contains(a1);
         assert m1.contains(a2);
     }
-
 
     public void testAddVectorDupl() {
         v1=Arrays.asList(a1, a2, a3, a4, a5);
@@ -100,12 +91,10 @@ public class MembershipTest {
         assert m1.contains(a5);
     }
 
-
     public void testRemove() {
         m1.add(a1, a2, a3, a4, a5).remove(a2);
         assert m1.size() == 3;
     }
-
 
     public void testGetMembers() {
         testAdd();
@@ -113,7 +102,78 @@ public class MembershipTest {
         assert v.size() == 2;
     }
 
+    public void testGetFirst() {
+        Address next=m1.getFirst();
+        assert next == null;
+        next=m1.getFirst();
+        assert next == null;
+        m1.add(a1);
+        next=m1.getFirst();
+        assert next == a1;
+    }
 
+    public void testIsCoord() {
+        boolean coord=m1.isCoord(a1);
+        assert !coord;
+        coord=m1.isCoord(null);
+        assert !coord;
+        m1.add(a1);
+        coord=m1.isCoord(a1);
+        assert coord;
+        coord=m1.isCoord(a2);
+        assert !coord;
+        m1.add(a2);
+        coord=m1.isCoord(a2);
+        assert !coord;
+    }
+
+    public void testNextCoord() {
+        m1.add(a1,a2);
+        assert m1.isCoord(a1);
+        Address tmp=m1.nextCoord();
+        assert a2.equals(tmp);
+        m1.remove(a2);
+        tmp=m1.nextCoord();
+        assert tmp == null;
+    }
+
+    public void testGetNext() {
+        Address next=m1.getNext(null);
+        assert next == null;
+        next=m1.getNext(a1);
+        assert next == null;
+        m1.add(a1);
+        next=m1.getNext(null);
+        assert next == null;
+        next=m1.getNext(a2);
+        assert next == null;
+        next=m1.getNext(a1);
+        assert next == null;
+        m1.add(a2);
+        next=m1.getNext(a1);
+        assert next == a2;
+        next=m1.getNext(a2);
+        assert next == a1;
+    }
+
+    public void testGetPrevious() {
+        Address next=m1.getPrevious(null);
+        assert next == null;
+        next=m1.getPrevious(a1);
+        assert next == null;
+        m1.add(a1);
+        next=m1.getPrevious(null);
+        assert next == null;
+        next=m1.getPrevious(a2);
+        assert next == null;
+        next=m1.getPrevious(a1);
+        assert next == null;
+        m1.add(a2);
+        next=m1.getPrevious(a1);
+        assert next == a2;
+        next=m1.getPrevious(a2);
+        assert next == a1;
+    }
 
     public void testSet() {
         v1=Arrays.asList(a1, a2);

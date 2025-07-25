@@ -29,7 +29,7 @@ import java.util.Map;
  * <p>
  * The following properties are read by the UDP protocol:
  * <ul>
- * <li> param mcast_addr - the multicast address to use; default is 228.8.8.8.
+ * <li> param mcast_addr - the multicast address to use; default is 239.8.8.8.
  * <li> param mcast_port - (int) the port that the multicast is sent on; default
  * is 7600
  * <li> param ip_mcast - (boolean) flag whether to use IP multicast; default is
@@ -68,7 +68,7 @@ public class UDP extends TP {
     protected static final String MCAST_NAME="mcast-receiver";
 
     @Property(name="mcast_addr", description="The multicast address used for sending and receiving packets",
-              defaultValueIPv4="228.8.8.8", defaultValueIPv6="ff0e::8:8:8",
+              defaultValueIPv4="239.8.8.8", defaultValueIPv6="ff0e::8:8:8",
               systemProperty=Global.UDP_MCAST_ADDR,writable=false)
     protected InetAddress mcast_group_addr;
 
@@ -84,7 +84,7 @@ public class UDP extends TP {
     protected int ip_ttl=8;
 
     @Property(description="Send buffer size of the multicast datagram socket",type=AttributeType.BYTES)
-    protected int mcast_send_buf_size=Global.MAX_DATAGRAM_PACKET_SIZE + MSG_OVERHEAD;
+    protected int mcast_send_buf_size=(Global.MAX_DATAGRAM_PACKET_SIZE + MSG_OVERHEAD) * 100;
 
     @Property(description="Receive buffer size of the multicast datagram socket",type=AttributeType.BYTES)
     protected int mcast_recv_buf_size=5_000_000;
@@ -197,12 +197,6 @@ public class UDP extends TP {
         return ip_ttl;
     }
 
-    @Override public <T extends TP> T setMaxBundleSize(int size) {
-        if(size > Global.MAX_DATAGRAM_PACKET_SIZE)
-            throw new IllegalArgumentException("max_bundle_size (" + size + ") cannot exceed the max datagram " +
-                                                 "packet size of " + Global.MAX_DATAGRAM_PACKET_SIZE);
-        return super.setMaxBundleSize(size);
-    }
 
     @ManagedAttribute(description="Number of messages dropped when sending because of insufficient buffer space"
       ,type=AttributeType.SCALAR)
@@ -261,21 +255,31 @@ public class UDP extends TP {
         return String.format("group_addr=%s:%d\n", mcast_group_addr.getHostName(), mcast_port);
     }
 
-    public void sendMulticast(byte[] data, int offset, int length) throws Exception {
-        if(ip_mcast && mcast_addr != null)
+    @Override
+    public void sendToAll(byte[] data, int offset, int length) throws Exception {
+        if(ip_mcast && mcast_addr != null) {
+            if(local_transport != null) {
+                try {
+                    local_transport.sendToAll(data, offset, length);
+                }
+                catch(Exception ex) {
+                    log.warn("failed sending group message via local transport, sending it via regular transport", ex);
+                }
+            }
             _send(mcast_addr.getIpAddress(), mcast_addr.getPort(), data, offset, length);
+        }
         else
-            sendToMembers(members, data, offset, length);
+            super.sendToAll(data, offset, length);
     }
 
     public void sendUnicast(PhysicalAddress dest, byte[] data, int offset, int length) throws Exception {
-        _send(((IpAddress)dest).getIpAddress(), ((IpAddress)dest).getPort(), data, offset, length);
+        _send(dest.getIpAddress(), dest.getPort(), data, offset, length);
     }
 
 
     protected void _send(InetAddress dest, int port, byte[] data, int offset, int length) throws Exception {
         DatagramPacket packet=new DatagramPacket(data, offset, length, dest, port);
-        // using the datagram socket to send multicasts or unicasts (https://issues.jboss.org/browse/JGRP-1765)
+        // using the datagram socket to send multicasts or unicasts (https://issues.redhat.com/browse/JGRP-1765)
         if(sock != null) {
             try {
                 sock.send(packet);
@@ -303,17 +307,28 @@ public class UDP extends TP {
         if(evt.getType() == Event.VIEW_CHANGE) {
             if(suppress_log_out_of_buffer_space != null)
                 suppress_log_out_of_buffer_space.removeExpired(suppress_time_out_of_buffer_space);
+            if(local_transport != null) {
+                try {
+                    // if we have local members, we send the multicast through the local transport, and do *not* need
+                    // to receive a copy on the local host
+                    sock.setOption(StandardSocketOptions.IP_MULTICAST_LOOP, false);
+                    mcast_sock.setOption(StandardSocketOptions.IP_MULTICAST_LOOP, false);
+                }
+                catch(IOException e) {
+                    log.error("failed enabling loopback-mode to", e);
+                }
+            }
         }
         return retval;
     }
 
     public void init() throws Exception {
         super.init();
-        if(max_bundle_size > Global.MAX_DATAGRAM_PACKET_SIZE)
-            throw new IllegalArgumentException("max_bundle_size (" + max_bundle_size + ") cannot exceed the max datagram " +
-                                                 "packet size of " + Global.MAX_DATAGRAM_PACKET_SIZE);
+        if(bundler.getMaxSize() > Global.MAX_DATAGRAM_PACKET_SIZE)
+            throw new IllegalArgumentException("bundler.max_size (" + bundler.getMaxSize() + ") cannot exceed the max " +
+                                                 "datagram packet size of " + Global.MAX_DATAGRAM_PACKET_SIZE);
         if(is_mac && suppress_time_out_of_buffer_space > 0)
-            suppress_log_out_of_buffer_space=new SuppressLog<>(log, "FailureSendingToPhysAddr", "SuppressMsg");
+            suppress_log_out_of_buffer_space=new SuppressLog<>(log, "FailureSendingToPhysAddr");
     }
 
     /** Creates the unicast and multicast sockets and starts the unicast and multicast receiver threads */
@@ -404,7 +419,7 @@ public class UDP extends TP {
 
         // 3. Create socket for receiving IP multicast packets
         if(ip_mcast) {
-            // https://jira.jboss.org/jira/browse/JGRP-777 - this doesn't work on MacOS, and we don't have
+            // https://issues.redhat.com/browse/JGRP-777 - this doesn't work on MacOS, and we don't have
             // cross talking on Windows anyway, so we just do it for Linux. (How about Solaris ?)
 
             // If possible, the MulticastSocket(SocketAddress) ctor is used which binds to mcast_addr:mcast_port.
@@ -414,13 +429,16 @@ public class UDP extends TP {
             else
                 mcast_sock=getSocketFactory().createMulticastSocket("jgroups.udp.mcast_sock", mcast_port);
 
-            if(disable_loopback)
+            if(disable_loopback) {
                 mcast_sock.setOption(StandardSocketOptions.IP_MULTICAST_LOOP, false);
+                sock.setOption(StandardSocketOptions.IP_MULTICAST_LOOP, false);
+            }
 
             mcast_addr=new IpAddress(mcast_group_addr, mcast_port);
 
             // check that we're not using the same mcast address and port as the diagnostics socket
-            if(enable_diagnostics && diagnostics_addr.equals(mcast_group_addr) && diagnostics_port == mcast_port)
+            if(diag_handler.isEnabled() && diag_handler.getMcastAddress().equals(mcast_group_addr)
+              && diag_handler.getPort() == mcast_port)
                 throw new IllegalArgumentException("diagnostics_addr:diagnostics_port and mcast_addr:mcast_port " +
                                                      "have to be different");
 
@@ -439,7 +457,7 @@ public class UDP extends TP {
                     interfaces=receive_interfaces;
                 else
                     interfaces=Util.getAllAvailableInterfaces();
-                bindToInterfaces(interfaces, mcast_sock, mcast_addr.getIpAddress());
+                joinGroupOnInterfaces(interfaces, mcast_sock, mcast_addr.getSocketAddress());
             }
             else {
                 if(bind_addr != null)
@@ -495,6 +513,9 @@ public class UDP extends TP {
             if(s != null && addr != null) {
                 intf=NetworkInterface.getByInetAddress(addr);
                 s.setNetworkInterface(intf);
+                if (log.isDebugEnabled()) {
+                    log.debug(String.format("multicast_socket on %s", intf.getName()));
+                }
             }
         }
         catch(Throwable ex) {
@@ -509,25 +530,21 @@ public class UDP extends TP {
     }
 
     /**
-     *
-     * @param interfaces List<NetworkInterface>. Guaranteed to have no duplicates
-     * @param s
-     * @param mcastAddr
-     * @throws IOException
+     * Joins a multicast address on all interfaces
+     * @param interfaces List<NetworkInterface>. The interfaces to join mcast_addr:mcast_port
+     * @param s The MulticastSocket to join on
+     * @param mcast_addr The multicast address to join
      */
-    protected void bindToInterfaces(List<NetworkInterface> interfaces,
-                                  MulticastSocket s,
-                                  InetAddress mcastAddr) {
-        SocketAddress tmp_mcast_addr=new InetSocketAddress(mcastAddr, mcast_port);
+    protected void joinGroupOnInterfaces(List<NetworkInterface> interfaces, MulticastSocket s, SocketAddress mcast_addr) {
         for(NetworkInterface intf: interfaces) {
 
             //[ JGRP-680] - receive_on_all_interfaces requires every NIC to be configured
             try {
-                s.joinGroup(tmp_mcast_addr, intf);
-                log.debug("joined %s on %s", tmp_mcast_addr, intf.getName());
+                s.joinGroup(mcast_addr, intf);
+                log.debug("joined %s on %s", mcast_addr, intf.getName());
             }
             catch(IOException e) {
-                log.warn(Util.getMessage("InterfaceJoinFailed"), tmp_mcast_addr, intf.getName());
+                log.warn(Util.getMessage("InterfaceJoinFailed"), mcast_addr, intf.getName());
             }
         }
     }
@@ -557,8 +574,8 @@ public class UDP extends TP {
 
         // Cannot listen at all, throw an Exception
         if(rcv_port >= max_port + 1) // +1 due to the increment above
-            throw new Exception(String.format("failed to open a port in range %d-%d (last exception: %s)",
-                                              bind_port, max_port, saved_exception));
+            throw new Exception(String.format("failed to open a port in range %d-%d (last exception: %s, bind_addr: %s)",
+                                              bind_port, max_port, saved_exception, bind_addr));
         return tmp;
     }
 
@@ -586,10 +603,12 @@ public class UDP extends TP {
             formatter.format("\nmcast_sock: bound to %s:%d, send buffer size=%d, receive buffer size=%d",
                              mcast_sock.getLocalAddress(), mcast_sock.getLocalPort(),
                              mcast_sock.getSendBufferSize(), mcast_sock.getReceiveBufferSize());
+        NetworkInterface nic=bind_addr != null? NetworkInterface.getByInetAddress(bind_addr) : null;
+        String nic_name=nic != null? nic.getName() : "n/a";
         if(bind_port > 0)
-            formatter.format("\n%s: using the network interface '%s' with port range '%s-%s'", bind_addr, NetworkInterface.getByInetAddress(bind_addr).getName(), bind_port, (bind_port + port_range));
+            formatter.format("\n%s: using network interface '%s' with port range '%s-%s'", bind_addr, nic_name, bind_port, (bind_port + port_range));
         else
-            formatter.format("\n%s: using the network interface '%s' to any (ephemeral) port", bind_addr, NetworkInterface.getByInetAddress(bind_addr).getName());
+            formatter.format("\n%s: using network interface '%s' to any (ephemeral) port", bind_addr, nic_name);
         return sb.toString();
     }
 
@@ -668,7 +687,7 @@ public class UDP extends TP {
         if(mcast_sock != null) {
             try {
                 if(mcast_addr != null) {
-                    SocketAddress addr=new InetSocketAddress(mcast_addr.getIpAddress(), mcast_addr.getPort());
+                    SocketAddress addr=mcast_addr.getSocketAddress();
                     mcast_sock.leaveGroup(addr, bind_addr == null? null : NetworkInterface.getByInetAddress(bind_addr));
                 }
                 getSocketFactory().close(mcast_sock); // this will cause the mcast receiver thread to break out of its loop
@@ -786,7 +805,6 @@ public class UDP extends TP {
                     int len=packet.getLength();
                     if(len > receive_buf.length && log.isErrorEnabled())
                         log.error(Util.getMessage("SizeOfTheReceivedPacket"), len, receive_buf.length, receive_buf.length);
-
                     receive(new IpAddress(packet.getAddress(), packet.getPort()),
                             receive_buf, packet.getOffset(), len);
                 }

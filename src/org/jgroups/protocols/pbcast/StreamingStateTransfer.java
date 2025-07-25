@@ -76,16 +76,10 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
     /*
      * --------------------------------------------- Fields ---------------------------------------
      */
-    protected Address             local_addr;
-
     protected volatile Address    state_provider;
 
     @GuardedBy("members")
     protected final List<Address> members=new ArrayList<>();
-
-
-    /* Set to true if the FLUSH protocol is detected in the protocol stack */
-    protected volatile boolean    flushProtocolInStack=false;
 
 
     /** Thread pool (configured with {@link #max_pool} and {@link #pool_thread_keep_alive}) to run
@@ -125,7 +119,8 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
     }
 
     public void destroy() {
-        thread_pool.shutdown();
+        if(thread_pool != null)
+            thread_pool.shutdown();
         super.destroy();
     }
 
@@ -177,10 +172,6 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
             case Event.CONFIG:
                 handleConfig(evt.getArg());
                 break;
-
-            case Event.SET_LOCAL_ADDRESS:
-                local_addr=evt.getArg();
-                break;
         }
 
         return down_prot.down(evt); // pass on to the layer below us
@@ -202,37 +193,53 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
 
     public Object up(Message msg) {
         StateHeader hdr=msg.getHeader(this.id);
-        if(hdr != null) {
-            Address sender=msg.getSrc();
-            switch(hdr.type) {
-                case StateHeader.STATE_REQ:
-                    state_requesters.add(msg.getSrc());
-                    break;
-                case StateHeader.STATE_RSP:
-                    handleStateRsp(sender, hdr);
-                    break;
-                case StateHeader.STATE_PART:
-                    handleStateChunk(sender, msg.getArray(), msg.getOffset(), msg.getLength());
-                    break;
-                case StateHeader.STATE_EOF:
-                    log.trace("%s <-- EOF <-- %s", local_addr, sender);
-                    handleEOF(sender);
-                    break;
-                case StateHeader.STATE_EX:
-                    try {
-                        handleException(Util.exceptionFromBuffer(msg.getArray(), msg.getOffset(), msg.getLength()));
-                    }
-                    catch(Throwable t) {
-                        log.error("failed deserializaing state exception", t);
-                    }
-                    break;
-                default:
-                    log.error("%s: type %d not known in StateHeader", local_addr, hdr.type);
-                    break;
-            }
-            return null;
-        }
+        if(hdr != null)
+            return handle(hdr, msg);
         return up_prot.up(msg);
+    }
+
+    public void up(MessageBatch batch) {
+        for(Iterator<Message> it=batch.iterator(); it.hasNext();) {
+            Message msg=it.next();
+            StateHeader hdr=msg.getHeader(id);
+            if(hdr != null) {
+                it.remove();
+                handle(hdr, msg);
+            }
+        }
+        if(!batch.isEmpty())
+            up_prot.up(batch);
+    }
+
+    protected Object handle(StateHeader hdr, Message msg) {
+        Address sender=msg.getSrc();
+        switch(hdr.type) {
+            case StateHeader.STATE_REQ:
+                state_requesters.add(msg.getSrc());
+                break;
+            case StateHeader.STATE_RSP:
+                handleStateRsp(sender, hdr);
+                break;
+            case StateHeader.STATE_PART:
+                handleStateChunk(sender, msg.getArray(), msg.getOffset(), msg.getLength());
+                break;
+            case StateHeader.STATE_EOF:
+                log.trace("%s <-- EOF <-- %s", local_addr, sender);
+                handleEOF(sender);
+                break;
+            case StateHeader.STATE_EX:
+                try {
+                    handleException(Util.exceptionFromBuffer(msg.getArray(), msg.getOffset(), msg.getLength()));
+                }
+                catch(Throwable t) {
+                    log.error("failed deserializaing state exception", t);
+                }
+                break;
+            default:
+                log.error("%s: type %d not known in StateHeader", local_addr, hdr.type);
+                break;
+        }
+        return null;
     }
 
 
@@ -240,17 +247,7 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
      * --------------------------- Private Methods ------------------------------------------------
      */
 
-    /**
-     * When FLUSH is used we do not need to pass digests between members (see JGroups/doc/design/FLUSH.txt)
-     * @return true if use of digests is required, false otherwise
-     */
-    protected boolean isDigestNeeded() {
-        return !flushProtocolInStack;
-    }
-
     protected void handleConfig(Map<String,Object> config) {
-        if(config != null && config.containsKey("flush_supported"))
-            flushProtocolInStack=true;
         if(config != null && config.containsKey("state_transfer"))
             throw new IllegalArgumentException("Protocol stack must have only one state transfer protocol");
     }
@@ -260,7 +257,7 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
 
     protected void handleEOF(Address sender) {
         state_provider=null;
-        down_prot.down(new Event(Event.GET_VIEW_FROM_COORD)); // https://issues.jboss.org/browse/JGRP-1751
+        down_prot.down(new Event(Event.GET_VIEW_FROM_COORD)); // https://issues.redhat.com/browse/JGRP-1751
     }
 
     protected void handleException(Throwable exception) {
@@ -287,7 +284,7 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
         try {
             up_prot.up(new Event(Event.STATE_TRANSFER_INPUTSTREAM, in));
             up_prot.up(new Event(Event.STATE_TRANSFER_INPUTSTREAM_CLOSED, new StateTransferResult()));
-            down_prot.down(new Event(Event.GET_VIEW_FROM_COORD)); // https://issues.jboss.org/browse/JGRP-1751
+            down_prot.down(new Event(Event.GET_VIEW_FROM_COORD)); // https://issues.redhat.com/browse/JGRP-1751
         }
         catch(Throwable t) {
             handleException(t);
@@ -295,18 +292,14 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
         finally {
             Util.close(in);
             close(resource);
-            if(isDigestNeeded()) {
-                openBarrierAndResumeStable();
-                closeHoleFor(provider);
-            }
+            openBarrierAndResumeStable();
+            closeHoleFor(provider);
         }
     }
 
 
     @ManagedOperation(description="Closes BARRIER and suspends STABLE")
     public void closeBarrierAndSuspendStable() {
-        if(!isDigestNeeded())
-            return;
         log.trace("%s: sending down CLOSE_BARRIER and SUSPEND_STABLE", local_addr);
         down_prot.down(new Event(Event.CLOSE_BARRIER));
         down_prot.down(new Event(Event.SUSPEND_STABLE));
@@ -314,8 +307,6 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
 
     @ManagedOperation(description="Opens BARRIER and resumes STABLE")
     public void openBarrierAndResumeStable() {
-        if(!isDigestNeeded())
-            return;
         log.trace("%s: sending down OPEN_BARRIER and RESUME_STABLE", local_addr);
         openBarrier();
         resumeStable();
@@ -387,11 +378,11 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
         state_requesters.retainAll(new_members); // remove non members from list of members requesting state
     }
 
-    public void handle(Address state_requester) {
+    public void handle(Address state_requester) throws Exception {
         handleStateReq(state_requester);
     }
 
-    protected void handleStateReq(Address requester) {
+    protected void handleStateReq(Address requester) throws Exception {
         if(requester == null)
             return;
 
@@ -399,21 +390,19 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
 
         // 1. Get the digest (if needed)
         Digest digest=null;
-        if(isDigestNeeded()) {
-            try {
-                punchHoleFor(requester);
-                closeBarrierAndSuspendStable();
-                digest=(Digest)down_prot.down(Event.GET_DIGEST_EVT);
-            }
-            catch(Throwable t) {
-                sendException(requester, t);
-                resumeStable();
-                closeHoleFor(requester);
-                return;
-            }
-            finally {
-                openBarrier();
-            }
+        try {
+            punchHoleFor(requester);
+            closeBarrierAndSuspendStable();
+            digest=(Digest)down_prot.down(Event.GET_DIGEST_EVT);
+        }
+        catch(Throwable t) {
+            sendException(requester, t);
+            resumeStable();
+            closeHoleFor(requester);
+            return;
+        }
+        finally {
+            openBarrier();
         }
 
         // 2. Send the STATE_RSP message to the requester
@@ -451,18 +440,16 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
     
     protected void handleStateRsp(final Address provider, StateHeader hdr) {
         // 1: set the digest if needed
-        if(isDigestNeeded()) {
-            try {
-                punchHoleFor(provider);
-                closeBarrierAndSuspendStable(); // fix for https://jira.jboss.org/jira/browse/JGRP-1013
-                down_prot.down(new Event(Event.OVERWRITE_DIGEST, hdr.getDigest())); // set the digest (e.g. in NAKACK)
-            }
-            catch(Throwable t) {
-                handleException(t);
-                openBarrierAndResumeStable();
-                closeHoleFor(provider);
-                return;
-            }
+        try {
+            punchHoleFor(provider);
+            closeBarrierAndSuspendStable(); // fix for https://issues.redhat.com/browse/JGRP-1013
+            down_prot.down(new Event(Event.OVERWRITE_DIGEST, hdr.getDigest())); // set the digest (e.g. in NAKACK)
+        }
+        catch(Throwable t) {
+            handleException(t);
+            openBarrierAndResumeStable();
+            closeHoleFor(provider);
+            return;
         }
 
         // 2: establish the connection to the provider (to fetch the state)
@@ -477,10 +464,8 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
             handleException(t);
             Util.close(in);
             close(resource);
-            if(isDigestNeeded()) {
-                openBarrierAndResumeStable();
-                closeHoleFor(provider);
-            }
+            openBarrierAndResumeStable();
+            closeHoleFor(provider);
             return;
         }
 
@@ -622,11 +607,9 @@ public abstract class StreamingStateTransfer extends Protocol implements Process
                 sendException(requester, e); // send the exception to the remote consumer
             }
             finally {
-                if(isDigestNeeded()) {
-                    resumeStable();
-                    // openBarrier(); // was done after getting the digest
-                    closeHoleFor(requester);
-                }
+                resumeStable();
+                // openBarrier(); // was done after getting the digest
+                closeHoleFor(requester);
             }
         }
     }

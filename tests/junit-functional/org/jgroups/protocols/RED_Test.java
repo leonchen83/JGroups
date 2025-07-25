@@ -7,6 +7,7 @@ import org.jgroups.Message;
 import org.jgroups.protocols.pbcast.GMS;
 import org.jgroups.stack.ProtocolStack;
 import org.jgroups.util.AverageMinMax;
+import org.jgroups.util.ByteArrayDataOutputStream;
 import org.jgroups.util.Util;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
@@ -29,7 +30,7 @@ public class RED_Test {
     protected RED                  red;
     protected TP                   transport;
     protected static final Address TARGET=Util.createRandomAddress("B");
-    protected static final int     NUM_SENDERS=10, NUM_MSGS=1000, TOT_MSGS=NUM_SENDERS*NUM_MSGS;
+    protected static final int     NUM_SENDERS=10, NUM_MSGS=2000, TOT_MSGS=NUM_SENDERS*NUM_MSGS;
 
     @BeforeMethod protected void setup() throws Exception {
         ch=create("A").connect(RED_Test.class.getSimpleName());
@@ -37,6 +38,7 @@ public class RED_Test {
 
     @AfterMethod protected void destroy() {Util.close(ch);}
 
+    @SuppressWarnings("deprecation")
     public void testNoMessageDrops() throws Exception {
         for(int i=1; i <= 10; i++)
             ch.send(TARGET, i);
@@ -46,6 +48,7 @@ public class RED_Test {
                                            bundler.getSentMessages(), red.getDroppedMessages(), 10));
     }
 
+    @SuppressWarnings("deprecation")
     public void testMessageDrops() throws TimeoutException {
         final Thread[] senders=new Thread[NUM_SENDERS];
         for(int i=0; i < senders.length; i++) {
@@ -87,11 +90,10 @@ public class RED_Test {
         JChannel retval=new JChannel(Util.getTestStack()).name(name);
         red=new RED();
         transport=retval.getProtocolStack().getTransport();
-        transport.setBundlerCapacity(1024);
+        ((BaseBundler)transport.getBundler()).setCapacity(1024);
         transport.getProtocolStack().removeProtocol(UNICAST3.class);
         retval.getProtocolStack().insertProtocolInStack(red, transport, ProtocolStack.Position.ABOVE);
         bundler=new DelayBundler();
-        bundler.init(transport);
         transport.setBundler(bundler);
         ((GMS)retval.getProtocolStack().findProtocol(GMS.class)).setJoinTimeout(5);
         return retval;
@@ -104,15 +106,17 @@ public class RED_Test {
         protected long   getSentMessages() {return sent.sum();}
         protected long   getSingle()       {return single.sum();}
         protected long   getBatches()      {return batches.sum();}
-        protected double getAvgBatchSize() {return avg_batch_size.getAverage();}
+        protected double getAvgBatchSize() {return avg_batch_size.average();}
 
-        protected void sendSingleMessage(Message msg) {
+        @Override
+        protected void sendSingleMessage(final Address dest, final Message msg, ByteArrayDataOutputStream out) {
             sent.increment();
             single.increment();
             Util.sleepRandom(5, 100);
         }
 
-        protected void sendMessageList(Address dest, Address src, List<Message> list) {
+        @Override
+        protected void sendMessageList(Address dest, Address src, List<Message> list, ByteArrayDataOutputStream out) {
             if(list != null) {
                 int size=list.size();
                 batches.increment();

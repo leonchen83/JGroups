@@ -21,7 +21,7 @@ public class Credit {
     protected long            credits_left;
     protected int             num_blockings;
     protected long            last_credit_request; // ns
-    protected final Average   avg_blockings=new Average(); // ns
+    protected final Average   avg_blockings=new Average(512); // ns
 
 
     public Credit(long credits) {
@@ -46,7 +46,7 @@ public class Credit {
         }
     }
 
-    public double getAverageBlockTime() {return avg_blockings.getAverage();} // in ns
+    public double getAverageBlockTime() {return avg_blockings.average();} // in ns
     public void   resetStats()          {num_blockings=0; avg_blockings.clear();}
 
     public boolean decrementIfEnoughCredits(final Message msg, int credits, long timeout) {
